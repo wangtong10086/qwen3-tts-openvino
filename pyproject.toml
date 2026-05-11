@@ -1,0 +1,37 @@
+[project]
+name = "qwen3-tts-openvino"
+version = "0.1.0"
+description = "OpenVINO runtime and exporter for Qwen3-TTS 12 Hz models."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Qwen3-TTS OpenVINO contributors" }]
+keywords = ["qwen3-tts", "openvino", "text-to-speech", "tts"]
+dependencies = [
+  "numpy",
+  "openvino",
+  "regex",
+  "soundfile",
+  "librosa",
+]
+
+[project.optional-dependencies]
+export = [
+  "torch",
+  "transformers",
+  "nncf",
+  "modelscope",
+]
+dev = [
+  "pytest",
+]
+
+[project.scripts]
+qwen3-tts-ov = "qwen3_tts_ov.cli:main"
+
+[tool.setuptools]
+packages = ["qwen3_tts_ov"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"

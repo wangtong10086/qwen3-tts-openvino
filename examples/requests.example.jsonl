@@ -1,0 +1,2 @@
+{"mode":"voice_design","text":"你好，这是一个批处理示例。","language":"Chinese","instruct":"A calm young female voice, natural Mandarin pronunciation.","output":"outputs/batch/voice_design_0001.wav","max_new_tokens":64}
+{"mode":"voice_design","text":"OpenVINO inference keeps the runtime path free of PyTorch.","language":"English","instruct":"A bright and clear narrator voice.","output":"outputs/batch/voice_design_0002.wav","max_new_tokens":64}
