@@ -9,8 +9,13 @@ LIKELY_LOCAL_IR_DIRS = (
     "openvino/base",
     "openvino_full",
 )
+AUTO_IR_DIR = "auto"
 DEFAULT_VOICE_DESIGN_IR_DIR = "openvino/voice_design"
 LEGACY_VOICE_DESIGN_IR_DIR = "openvino_full"
+AUTO_VOICE_DESIGN_IR_DIRS = (
+    DEFAULT_VOICE_DESIGN_IR_DIR,
+    LEGACY_VOICE_DESIGN_IR_DIR,
+)
 
 
 def local_manifest_candidates(cwd: str | Path | None = None) -> list[str]:
@@ -35,7 +40,17 @@ def resolve_ir_dir(ir_dir: str | Path, *, fallback_to_local_voice_design: bool =
     path = Path(ir_dir)
     if has_manifest(path):
         return path
-    if fallback_to_local_voice_design and path_text(path) == DEFAULT_VOICE_DESIGN_IR_DIR:
+    normalized = path_text(path)
+    if normalized == AUTO_IR_DIR:
+        search = AUTO_VOICE_DESIGN_IR_DIRS if fallback_to_local_voice_design else LIKELY_LOCAL_IR_DIRS
+        for candidate in search:
+            resolved = Path(candidate)
+            if has_manifest(resolved):
+                if warn:
+                    print(f"warning: resolved --ir-dir auto to {resolved}/manifest.json", file=sys.stderr)
+                return resolved
+        return Path(DEFAULT_VOICE_DESIGN_IR_DIR)
+    if fallback_to_local_voice_design and normalized == DEFAULT_VOICE_DESIGN_IR_DIR:
         fallback = Path(LEGACY_VOICE_DESIGN_IR_DIR)
         if has_manifest(fallback):
             if warn:
@@ -49,12 +64,15 @@ def resolve_ir_dir(ir_dir: str | Path, *, fallback_to_local_voice_design: bool =
 
 def manifest_missing_message(ir_dir: str | Path) -> str:
     ir_dir = Path(ir_dir)
-    manifest_path = ir_dir / "manifest.json"
+    if path_text(ir_dir) == AUTO_IR_DIR:
+        manifest_path = "auto"
+    else:
+        manifest_path = str(ir_dir / "manifest.json")
     candidates = local_manifest_candidates()
     candidate_text = ", ".join(candidates) if candidates else "none found"
     return (
         f"OpenVINO IR manifest not found: {manifest_path}\n"
-        "--ir-dir must point to an exported OpenVINO IR directory that contains manifest.json.\n"
+        "--ir-dir must be auto or point to an exported OpenVINO IR directory that contains manifest.json.\n"
         "This source repository does not include model weights or OpenVINO IR files. "
         "Export first with `uv run python -m qwen3_tts_ov export ...`, or pass an existing local IR directory.\n"
         f"Local manifest candidates: {candidate_text}"

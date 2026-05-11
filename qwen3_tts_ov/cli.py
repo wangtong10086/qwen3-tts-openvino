@@ -16,7 +16,11 @@ def add_runtime_args(
     include_generation: bool = True,
     include_output: bool = True,
 ):
-    parser.add_argument("--ir-dir", default=default_ir_dir)
+    parser.add_argument(
+        "--ir-dir",
+        default=default_ir_dir,
+        help="OpenVINO IR directory. VoiceDesign commands accept auto.",
+    )
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
     parser.add_argument("--mode", default="cache", choices=["no-cache", "cache", "fast-cache", "fused-no-cache"])
@@ -356,7 +360,11 @@ def run_cache_warmup_command(args):
 
 
 def add_cache_warmup_args(parser):
-    parser.add_argument("--ir-dir", default="openvino/voice_design")
+    parser.add_argument(
+        "--ir-dir",
+        default="auto",
+        help="OpenVINO IR directory, or auto to use openvino/voice_design then openvino_full.",
+    )
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
     parser.add_argument("--mode", default="cache", choices=["no-cache", "cache", "fast-cache", "fused-no-cache"])
@@ -398,14 +406,14 @@ def main(argv=None):
     cache_warmup.set_defaults(func=run_cache_warmup_command)
 
     vd = sub.add_parser("voice-design")
-    add_runtime_args(vd)
+    add_runtime_args(vd, default_ir_dir="auto")
     vd.add_argument("--text", default="你好，这是一次完全使用 OpenVINO 的 Qwen 三语音合成测试。")
     vd.add_argument("--instruct", default="A calm young female voice, natural Mandarin pronunciation.")
     vd.add_argument("--language", default="Auto")
     vd.set_defaults(func=run_voice_design)
 
     cv = sub.add_parser("custom-voice")
-    add_runtime_args(cv)
+    add_runtime_args(cv, default_ir_dir="openvino/custom_voice")
     cv.add_argument("--text", required=True)
     cv.add_argument("--speaker", required=True)
     cv.add_argument("--instruct", default="")
@@ -413,7 +421,7 @@ def main(argv=None):
     cv.set_defaults(func=run_custom_voice)
 
     clone = sub.add_parser("voice-clone")
-    add_runtime_args(clone)
+    add_runtime_args(clone, default_ir_dir="openvino/base")
     clone.add_argument("--text", required=True)
     clone.add_argument("--language", default="Auto")
     clone.add_argument("--ref-audio", required=True)
@@ -422,7 +430,7 @@ def main(argv=None):
     clone.set_defaults(func=run_voice_clone)
 
     batch = sub.add_parser("batch")
-    add_runtime_args(batch)
+    add_runtime_args(batch, default_ir_dir="auto")
     batch.add_argument("--batch-jsonl", required=True)
     batch.add_argument("--output-dir", default="outputs/openvino_batch")
     batch.set_defaults(func=run_batch)
@@ -431,7 +439,7 @@ def main(argv=None):
     stream_sub = stream.add_subparsers(dest="stream_command", required=True)
 
     svd = stream_sub.add_parser("voice-design")
-    add_runtime_args(svd)
+    add_runtime_args(svd, default_ir_dir="auto")
     add_stream_args(svd)
     svd.add_argument("--text", default="你好，这是一次流式 OpenVINO 合成测试。")
     svd.add_argument("--instruct", default="A calm young female voice, natural Mandarin pronunciation.")
@@ -439,7 +447,7 @@ def main(argv=None):
     svd.set_defaults(func=run_stream_voice_design)
 
     scv = stream_sub.add_parser("custom-voice")
-    add_runtime_args(scv)
+    add_runtime_args(scv, default_ir_dir="openvino/custom_voice")
     add_stream_args(scv)
     scv.add_argument("--text", required=True)
     scv.add_argument("--speaker", required=True)
@@ -448,7 +456,7 @@ def main(argv=None):
     scv.set_defaults(func=run_stream_custom_voice)
 
     sclone = stream_sub.add_parser("voice-clone")
-    add_runtime_args(sclone)
+    add_runtime_args(sclone, default_ir_dir="openvino/base")
     add_stream_args(sclone)
     sclone.add_argument("--text", required=True)
     sclone.add_argument("--language", default="Auto")

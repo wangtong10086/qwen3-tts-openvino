@@ -68,7 +68,7 @@ CustomVoice 和 Base/VoiceClone 需要分别下载对应模型目录。
 
 ## IR 路径约定
 
-源码仓库不包含 OpenVINO IR。所有 `--ir-dir` 都必须指向一个已经导出的目录，并且该目录下必须存在 `manifest.json`。
+源码仓库不包含 OpenVINO IR。`--ir-dir` 可以显式指向一个包含 `manifest.json` 的导出目录；VoiceDesign 相关命令也支持 `--ir-dir auto`。
 
 推荐新导出目录：
 
@@ -78,7 +78,7 @@ openvino/custom_voice/manifest.json
 openvino/base/manifest.json
 ```
 
-如果你当前机器上只有旧的本地产物 `openvino_full/manifest.json`，可以先用它验证 VoiceDesign，把命令中的 `openvino/voice_design` 替换为 `openvino_full`。长期建议重新导出到 `openvino/voice_design`，这样 sidecar 的多模型目录布局更清晰。
+`auto` 会优先选择 `openvino/voice_design`，缺失时回退到旧的本地产物 `openvino_full`。长期建议重新导出到 `openvino/voice_design`，这样 sidecar 的多模型目录布局更清晰。
 
 ## 导出 OpenVINO IR
 
@@ -187,13 +187,7 @@ JSONL 中每行使用 `mode` 声明推理模式。实际运行时应让 `--ir-di
 首次部署或更新 IR 后，建议先填充 OpenVINO 编译缓存：
 
 ```bash
-VOICE_DESIGN_IR=${VOICE_DESIGN_IR:-openvino/voice_design}
-if [ ! -f "$VOICE_DESIGN_IR/manifest.json" ] && [ -f openvino_full/manifest.json ]; then
-  VOICE_DESIGN_IR=openvino_full
-fi
-test -f "$VOICE_DESIGN_IR/manifest.json" || { echo "未找到 OpenVINO IR，请先导出模型。"; exit 1; }
 uv run python -m qwen3_tts_ov cache-warmup \
-  --ir-dir "$VOICE_DESIGN_IR" \
   --device GPU \
   --mode cache \
   --cache-step fused \
@@ -203,7 +197,7 @@ uv run python -m qwen3_tts_ov cache-warmup \
 ```
 
 缓存默认写入用户缓存目录，而不是 IR 目录。更多细节见 [docs/cache_zh.md](docs/cache_zh.md)。
-如果 `openvino/voice_design` 还不存在，但当前目录存在旧的 `openvino_full/manifest.json`，runtime 会自动回退到 `openvino_full`。
+`cache-warmup` 的 `--ir-dir` 默认是 `auto`，会优先使用 `openvino/voice_design`，缺失时回退到本机旧目录 `openvino_full`。
 
 调试 CLI 会按 chunk 写出 raw PCM，并把拼接结果写为 WAV：
 

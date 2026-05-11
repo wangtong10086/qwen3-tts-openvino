@@ -29,10 +29,9 @@ documentation for complete setup and export instructions:
 uv run python -m qwen3_tts_ov --help
 ```
 
-This is a source-only repository. Commands that use `--ir-dir` require an
-exported IR directory containing `manifest.json`. The examples below use
-`openvino/voice_design`; replace it with an existing local IR path such as
-`openvino_full` if you are testing with an older local export.
+This is a source-only repository. Commands that use `--ir-dir` require either
+`auto` or an exported IR directory containing `manifest.json`. VoiceDesign
+commands resolve `auto` to `openvino/voice_design`, then `openvino_full`.
 
 If you want the `qwen3-tts-ov` console script, install the package first:
 

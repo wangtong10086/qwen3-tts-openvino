@@ -120,9 +120,26 @@ def test_default_voice_design_ir_falls_back_to_legacy_openvino_full(monkeypatch,
         json.dump(manifest, handle)
 
     assert resolve_ir_dir("openvino/voice_design", fallback_to_local_voice_design=True) == legacy.relative_to(tmp_path)
+    assert resolve_ir_dir("auto", fallback_to_local_voice_design=True) == legacy.relative_to(tmp_path)
     tasks, _ = collect_warmup_tasks("openvino/voice_design", graphs="core")
     assert [task.label for task in tasks] == [
         "core:text_embedding",
         "core:codec_embedding",
         "core:code_frame_embedding",
     ]
+
+
+def test_cache_warmup_default_auto_uses_local_voice_design(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    exported = tmp_path / "openvino" / "voice_design"
+    exported.mkdir(parents=True)
+    manifest = {
+        "tts_model_type": "voice_design",
+        "graphs": {"text_embedding": "text_embedding.xml"},
+    }
+    with open(exported / "manifest.json", "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle)
+
+    tasks, _ = collect_warmup_tasks("auto", graphs="core")
+
+    assert [task.label for task in tasks] == ["core:text_embedding"]
