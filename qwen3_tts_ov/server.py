@@ -98,6 +98,11 @@ def stream_kwargs(request: dict) -> dict:
     return kwargs
 
 
+def include_chunk_metadata(request: dict) -> bool:
+    stream = request.get("stream") if isinstance(request.get("stream"), dict) else {}
+    return bool(stream.get("include_chunk_metadata", request.get("include_chunk_metadata", False)))
+
+
 def stream_metadata(request: dict) -> dict:
     stream = request.get("stream") if isinstance(request.get("stream"), dict) else {}
     strategy = normalize_chunk_strategy(stream.get("chunk_strategy", request.get("chunk_strategy")))
@@ -534,11 +539,25 @@ def create_app(
             )
             final_timings = {}
             final_index = 0
+            send_chunk_metadata = include_chunk_metadata(request)
             for chunk in stream_chunks(request):
                 final_timings = chunk.timings
                 final_index = chunk.index
                 if chunk.audio.size:
-                    await websocket.send_bytes(audio_to_pcm16(chunk.audio))
+                    pcm = audio_to_pcm16(chunk.audio)
+                    if send_chunk_metadata:
+                        await websocket.send_json(
+                            {
+                                "type": "audio",
+                                "index": chunk.index,
+                                "sample_rate": chunk.sample_rate,
+                                "format": "pcm_s16le",
+                                "byte_length": len(pcm),
+                                "is_final": chunk.is_final,
+                                "timings": chunk.timings,
+                            }
+                        )
+                    await websocket.send_bytes(pcm)
                 if chunk.is_final:
                     await websocket.send_json(
                         {

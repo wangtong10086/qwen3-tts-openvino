@@ -2329,9 +2329,11 @@ class OpenVINOQwen3TTS:
         chunk_index = 0
         stream_started = time.time()
         codegen_started = stream_started
+        stream_audio_ms = 0.0
+        stream_compute_ms = 0.0
 
         def emit(is_final: bool):
-            nonlocal emitted_frames, pending_frames, chunk_index, codegen_started
+            nonlocal emitted_frames, pending_frames, chunk_index, codegen_started, stream_audio_ms, stream_compute_ms
             total_frames = len(all_codes)
             new_frames = total_frames - emitted_frames
             emit_started = time.time()
@@ -2363,6 +2365,12 @@ class OpenVINOQwen3TTS:
             audio_ms = (float(audio.shape[0]) / float(self.sample_rate) * 1000.0) if audio.size else 0.0
             compute_ms = codegen_ms + decode_ms
             rtf = (compute_ms / audio_ms) if audio_ms > 0 else 0.0
+            if audio_ms > 0:
+                stream_audio_ms += audio_ms
+                stream_compute_ms += compute_ms
+            stream_elapsed_ms = max(0.0, (time.time() - stream_started) * 1000.0)
+            stream_rtf = (stream_elapsed_ms / stream_audio_ms) if stream_audio_ms > 0 else 0.0
+            stream_compute_rtf = (stream_compute_ms / stream_audio_ms) if stream_audio_ms > 0 else 0.0
             queue_hint_ms = max(0.0, audio_ms - compute_ms)
             producer_lag_ms = max(0.0, codegen_ms - audio_ms)
 
@@ -2380,6 +2388,11 @@ class OpenVINOQwen3TTS:
                     "chunk_compute_ms": compute_ms,
                     "chunk_audio_ms": audio_ms,
                     "rtf": rtf,
+                    "stream_audio_ms": stream_audio_ms,
+                    "stream_compute_ms": stream_compute_ms,
+                    "stream_elapsed_ms": stream_elapsed_ms,
+                    "stream_rtf": stream_rtf,
+                    "stream_compute_rtf": stream_compute_rtf,
                     "queue_hint_ms": queue_hint_ms,
                     "queue_wait_ms": 0.0,
                     "producer_lag_ms": producer_lag_ms,
@@ -2451,6 +2464,9 @@ class OpenVINOQwen3TTS:
             pending_frames = 0
             chunk_index = 0
             codegen_started = time.time()
+            stream_started = codegen_started
+            stream_audio_ms = 0.0
+            stream_compute_ms = 0.0
             pending = deque()
 
             def build_decode_job(is_final: bool):
@@ -2479,6 +2495,7 @@ class OpenVINOQwen3TTS:
                 codegen_started = time.time()
 
                 def decode_job():
+                    nonlocal stream_audio_ms, stream_compute_ms
                     decode_job_started = time.time()
                     queue_wait_ms = max(0.0, (decode_job_started - submit_time) * 1000.0)
                     if new_frames > 0:
@@ -2501,6 +2518,12 @@ class OpenVINOQwen3TTS:
                     audio_ms = (float(audio.shape[0]) / float(self.sample_rate) * 1000.0) if audio.size else 0.0
                     effective_compute_ms = max(codegen_ms, decode_ms)
                     rtf = (effective_compute_ms / audio_ms) if audio_ms > 0 else 0.0
+                    if audio_ms > 0:
+                        stream_audio_ms += audio_ms
+                        stream_compute_ms += effective_compute_ms
+                    stream_elapsed_ms = max(0.0, (time.time() - stream_started) * 1000.0)
+                    stream_rtf = (stream_elapsed_ms / stream_audio_ms) if stream_audio_ms > 0 else 0.0
+                    stream_compute_rtf = (stream_compute_ms / stream_audio_ms) if stream_audio_ms > 0 else 0.0
                     queue_hint_ms = max(0.0, audio_ms - effective_compute_ms)
                     producer_lag_ms = max(0.0, codegen_ms - audio_ms)
                     return StreamChunk(
@@ -2517,6 +2540,11 @@ class OpenVINOQwen3TTS:
                             "chunk_compute_ms": effective_compute_ms,
                             "chunk_audio_ms": audio_ms,
                             "rtf": rtf,
+                            "stream_audio_ms": stream_audio_ms,
+                            "stream_compute_ms": stream_compute_ms,
+                            "stream_elapsed_ms": stream_elapsed_ms,
+                            "stream_rtf": stream_rtf,
+                            "stream_compute_rtf": stream_compute_rtf,
                             "queue_hint_ms": queue_hint_ms,
                             "queue_wait_ms": queue_wait_ms,
                             "producer_lag_ms": producer_lag_ms,

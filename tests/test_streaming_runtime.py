@@ -38,6 +38,8 @@ def test_stream_decode_codes_chunks_and_final_audio():
     assert [chunk.audio.shape[0] for chunk in chunks] == [4, 4, 2]
     assert [chunk.is_final for chunk in chunks] == [False, False, True]
     assert chunks[-1].timings["emitted_frames"] == 5
+    assert chunks[-1].timings["stream_audio_ms"] > 0
+    assert "stream_rtf" in chunks[-1].timings
 
 
 def test_stream_decode_codes_emits_final_marker_on_exact_chunk_boundary():
@@ -49,6 +51,7 @@ def test_stream_decode_codes_emits_final_marker_on_exact_chunk_boundary():
     assert [chunk.codes.shape[0] for chunk in chunks] == [2, 2, 0]
     assert chunks[-1].audio.size == 0
     assert chunks[-1].is_final is True
+    assert chunks[-1].timings["stream_audio_ms"] == chunks[-2].timings["stream_audio_ms"]
 
 
 def test_stream_decode_codes_uses_prefix_as_context_without_emitting_it():

@@ -470,6 +470,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
     let minQueueSec = 0.10;
     let maxBufferSec = 0.50;
     let latestRtf = 0;
+    let pendingAudioTiming = null;
     let timer = null;
     const strategyDefaults = {
       low_latency: { initialChunkFrames: 8, chunkFrames: 12, leftContextFrames: 25 },
@@ -546,6 +547,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
           chunk_frames: Number(els.chunkFrames.value),
           left_context_frames: Number(els.leftContextFrames.value),
           format: "pcm_s16le",
+          include_chunk_metadata: true,
         },
       };
       if (mode === "voice_design") {
@@ -756,6 +758,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       underrunCount = 0;
       targetBufferSec = 0.25;
       latestRtf = 0;
+      pendingAudioTiming = null;
       sampleRate = 24000;
       els.downloadBtn.disabled = true;
       els.receiveBar.style.width = "0%";
@@ -813,11 +816,27 @@ WEB_CLIENT_HTML = r"""<!doctype html>
             );
           } else if (data.type === "final") {
             streamFinal = true;
+            if (data.timings) {
+              latestRtf = Number(data.timings.stream_rtf || data.timings.rtf || latestRtf || 0);
+            }
             updateMetrics(true);
-            log(`final index=${data.index}, elapsed=${Number(data.elapsed || 0).toFixed(3)}s`);
+            log(
+              `final index=${data.index}, elapsed=${Number(data.elapsed || 0).toFixed(3)}s, ` +
+              `stream_rtf=${latestRtf ? latestRtf.toFixed(2) : "-"}`
+            );
             setBusy(false);
             els.downloadBtn.disabled = chunks.length === 0;
             if (ws) ws.close();
+          } else if (data.type === "audio") {
+            pendingAudioTiming = data.timings || null;
+            if (pendingAudioTiming) {
+              latestRtf = Number(pendingAudioTiming.stream_rtf || pendingAudioTiming.rtf || latestRtf || 0);
+            }
+            log(
+              `audio meta index=${data.index}, bytes=${data.byte_length}, ` +
+              `chunk_rtf=${pendingAudioTiming && pendingAudioTiming.rtf ? Number(pendingAudioTiming.rtf).toFixed(2) : "-"}, ` +
+              `stream_rtf=${pendingAudioTiming && pendingAudioTiming.stream_rtf ? Number(pendingAudioTiming.stream_rtf).toFixed(2) : "-"}`
+            );
           } else if (data.type === "error") {
             log(`error ${data.message}`);
             setBusy(false);
@@ -835,7 +854,12 @@ WEB_CLIENT_HTML = r"""<!doctype html>
         playPcmChunk(event.data);
         const chunkAudioMs = event.data.byteLength / 2 / sampleRate * 1000;
         const chunkElapsedMs = lastChunkIntervalMs || (now - startedAt);
-        latestRtf = chunkAudioMs > 0 ? chunkElapsedMs / chunkAudioMs : 0;
+        if (pendingAudioTiming) {
+          latestRtf = Number(pendingAudioTiming.stream_rtf || pendingAudioTiming.rtf || latestRtf || 0);
+          pendingAudioTiming = null;
+        } else {
+          latestRtf = chunkAudioMs > 0 ? chunkElapsedMs / chunkAudioMs : 0;
+        }
         log(`audio index=${chunkCount}, bytes=${event.data.byteLength}`);
         chunkCount += 1;
         updateMetrics();
