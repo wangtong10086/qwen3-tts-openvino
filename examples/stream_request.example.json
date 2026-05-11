@@ -1,0 +1,15 @@
+{
+  "mode": "voice_design",
+  "text": "你好，这是一个流式 sidecar 请求示例。",
+  "language": "Chinese",
+  "instruct": "A calm young female voice, natural Mandarin pronunciation.",
+  "generation": {
+    "max_new_tokens": 128,
+    "min_new_tokens": 2,
+    "repetition_penalty": 1.05
+  },
+  "stream": {
+    "chunk_strategy": "low_latency",
+    "format": "pcm_s16le"
+  }
+}

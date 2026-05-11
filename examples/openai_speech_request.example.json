@@ -1,0 +1,13 @@
+{
+  "model": "qwen3-tts-openvino",
+  "voice": "default",
+  "input": "你好，这是兼容 OpenAI Speech API 的流式请求示例。",
+  "language": "Chinese",
+  "task_type": "voice_design",
+  "instructions": "A calm young female voice, natural Mandarin pronunciation.",
+  "stream": true,
+  "response_format": "pcm",
+  "chunk_strategy": "low_latency",
+  "max_new_tokens": 128,
+  "min_new_tokens": 8
+}

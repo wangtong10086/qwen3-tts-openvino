@@ -22,6 +22,11 @@ export = [
   "nncf",
   "modelscope",
 ]
+server = [
+  "fastapi",
+  "uvicorn",
+  "websockets",
+]
 dev = [
   "pytest",
 ]

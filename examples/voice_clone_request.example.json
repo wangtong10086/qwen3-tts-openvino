@@ -1,0 +1,16 @@
+{
+  "mode": "voice_clone",
+  "text": "This is a VoiceClone request example.",
+  "language": "English",
+  "ref_audio": "/path/to/reference.wav",
+  "ref_text": "Reference transcript for the audio.",
+  "x_vector_only": false,
+  "generation": {
+    "max_new_tokens": 128,
+    "min_new_tokens": 8
+  },
+  "stream": {
+    "chunk_strategy": "low_latency",
+    "format": "pcm_s16le"
+  }
+}

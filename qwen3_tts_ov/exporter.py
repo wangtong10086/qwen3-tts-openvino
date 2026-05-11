@@ -509,6 +509,18 @@ class DecodeWrapper(torch.nn.Module):
         return self.decoder(codes).squeeze(1)
 
 
+class DecodeStreamWrapper(torch.nn.Module):
+    def __init__(self, decoder, left_context_frames: int):
+        super().__init__()
+        self.decoder = decoder.eval()
+        self.left_context_samples = int(left_context_frames) * int(getattr(decoder, "total_upsample", 1920))
+
+    def forward(self, audio_codes):
+        codes = torch.clamp(audio_codes, min=0).transpose(1, 2)
+        audio = self.decoder(codes).squeeze(1)
+        return audio[:, self.left_context_samples :]
+
+
 def save_openvino_model(module: torch.nn.Module, example_input, path: Path, input_shapes=None, force: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not force and path.exists() and path.with_suffix(".bin").exists():
@@ -680,6 +692,32 @@ def export_decoder(model_dir: str, out_dir: Path, decoder_tokens: int) -> Path:
     return path
 
 
+def export_stream_decoder(
+    model_dir: str,
+    out_dir: Path,
+    chunk_frames: int,
+    left_context_frames: int,
+    force: bool = False,
+) -> Path:
+    path = out_dir / f"speech_decoder_stream_c{left_context_frames}_t{chunk_frames}.xml"
+    if path.exists() and path.with_suffix(".bin").exists() and not force:
+        return path
+
+    speech_tokenizer = load_speech_tokenizer(model_dir)
+    wrapper = DecodeStreamWrapper(speech_tokenizer.model.decoder, left_context_frames)
+    num_quantizers = speech_tokenizer.model.config.decoder_config.num_quantizers
+    example_len = int(left_context_frames) + int(chunk_frames)
+    example = torch.zeros((1, example_len, num_quantizers), dtype=torch.long)
+    save_openvino_model(
+        wrapper,
+        (example,),
+        path,
+        [ov.PartialShape([1, -1, num_quantizers])],
+        force=force,
+    )
+    return path
+
+
 def load_speech_tokenizer(model_dir: str):
     tokenizer_v2.create_causal_mask = lambda **kwargs: None
     tokenizer_v2.create_sliding_window_causal_mask = lambda **kwargs: None
@@ -756,6 +794,9 @@ def write_manifest(
     cache_buckets: list[int],
     cache_kernels: list[str],
     fused_cache_kernels: list[str],
+    stream_decoder_chunks: list[int],
+    stream_decoder_left_context: int,
+    stream_decoder_first_chunks: list[int],
 ) -> None:
     manifest_path = out_dir / "manifest.json"
     previous_manifest = {}
@@ -770,6 +811,22 @@ def write_manifest(
     max_cache_len = max(cache_buckets) if cache_buckets else 0
     stateful_buckets = cache_graphs("talker_stateful", cache_buckets, cache_kernels)
     fused_cache_buckets = cache_graphs("fused_cache_step", cache_buckets, fused_cache_kernels)
+    stream_decoder_contexts = {}
+    first_context_graphs = {}
+    for chunk_frames in stream_decoder_first_chunks:
+        graph = f"speech_decoder_stream_c0_t{chunk_frames}.xml"
+        if (out_dir / graph).exists():
+            first_context_graphs[str(chunk_frames)] = graph
+    if first_context_graphs:
+        stream_decoder_contexts["0"] = first_context_graphs
+
+    stream_decoder_graphs = {}
+    for chunk_frames in stream_decoder_chunks:
+        graph = f"speech_decoder_stream_c{stream_decoder_left_context}_t{chunk_frames}.xml"
+        if (out_dir / graph).exists():
+            stream_decoder_graphs[str(chunk_frames)] = graph
+    if stream_decoder_graphs:
+        stream_decoder_contexts[str(stream_decoder_left_context)] = stream_decoder_graphs
     manifest = {
         "format": "qwen3_tts_openvino_v3",
         "model_dir": str(Path(model_dir).resolve()),
@@ -819,6 +876,35 @@ def write_manifest(
         "encode_downsample_rate": speech_config.get("encode_downsample_rate", speech_config["decode_upsample_rate"]),
         "decode_upsample_rate": speech_config["decode_upsample_rate"],
     }
+    if stream_decoder_graphs:
+        manifest["graphs"]["streaming_decoder"] = stream_decoder_graphs
+    if stream_decoder_contexts:
+        manifest["streaming_decoder"] = {
+            "left_context_frames": int(stream_decoder_left_context),
+            "chunk_frames": stream_decoder_chunks,
+            "first_chunk_frames": stream_decoder_first_chunks,
+            "default_strategy": "low_latency",
+            "strategies": {
+                "low_latency": {
+                    "initial_chunk_frames": 8,
+                    "chunk_frames": 12,
+                    "left_context_frames": int(stream_decoder_left_context),
+                },
+                "balanced": {
+                    "initial_chunk_frames": 12,
+                    "chunk_frames": 12,
+                    "left_context_frames": int(stream_decoder_left_context),
+                },
+                "stable": {
+                    "initial_chunk_frames": 12,
+                    "chunk_frames": 24,
+                    "left_context_frames": int(stream_decoder_left_context),
+                },
+            },
+            "graphs": stream_decoder_graphs,
+            "contexts": stream_decoder_contexts,
+            "output_format": "pcm_f32",
+        }
     if (out_dir / "speech_encoder.xml").exists():
         manifest["graphs"]["speech_encoder"] = "speech_encoder.xml"
     if (out_dir / "speaker_encoder.xml").exists():
@@ -849,6 +935,9 @@ def main() -> None:
     parser.add_argument("--cache-kernels", default="exact,sdpa", help="Comma-separated stateful attention kernels.")
     parser.add_argument("--fused-cache-kernels", default="exact", help="Comma-separated fused cache kernels.")
     parser.add_argument("--decoder-tokens", default="64,128,256")
+    parser.add_argument("--stream-decoder-chunks", default="8,12,24")
+    parser.add_argument("--stream-decoder-first-chunks", default="6,8,12")
+    parser.add_argument("--stream-decoder-left-context", type=int, default=25)
     parser.add_argument("--force-stateful", action="store_true", help="Re-export stateful talker cache graphs.")
     parser.add_argument("--force-cache-graphs", action="store_true", help="Re-export stateful and fused cache graphs.")
     parser.add_argument("--export-clone-graphs", action="store_true", help="Export speech/speaker encoder graphs when available.")
@@ -862,6 +951,8 @@ def main() -> None:
 
     out_dir = Path(args.out_dir) if args.out_dir else Path("openvino") / detected_model_type
     decoder_tokens = parse_int_list(args.decoder_tokens)
+    stream_decoder_chunks = parse_int_list(args.stream_decoder_chunks)
+    stream_decoder_first_chunks = parse_int_list(args.stream_decoder_first_chunks)
     cache_buckets = parse_int_list(args.cache_buckets) if args.cache_buckets else [int(args.max_cache_len)]
     cache_kernels = parse_str_list(args.cache_kernels)
     fused_cache_kernels = parse_str_list(args.fused_cache_kernels)
@@ -991,8 +1082,34 @@ def main() -> None:
 
     for tokens in decoder_tokens:
         export_decoder(args.model, out_dir, tokens)
+    for chunk_frames in stream_decoder_first_chunks:
+        export_stream_decoder(
+            args.model,
+            out_dir,
+            chunk_frames=chunk_frames,
+            left_context_frames=0,
+            force=force_cache_graphs,
+        )
+    for chunk_frames in stream_decoder_chunks:
+        export_stream_decoder(
+            args.model,
+            out_dir,
+            chunk_frames=chunk_frames,
+            left_context_frames=args.stream_decoder_left_context,
+            force=force_cache_graphs,
+        )
 
-    write_manifest(args.model, out_dir, decoder_tokens, cache_buckets, cache_kernels, fused_cache_kernels)
+    write_manifest(
+        args.model,
+        out_dir,
+        decoder_tokens,
+        cache_buckets,
+        cache_kernels,
+        fused_cache_kernels,
+        stream_decoder_chunks,
+        args.stream_decoder_left_context,
+        stream_decoder_first_chunks,
+    )
     print(f"export complete: {out_dir / 'manifest.json'}", flush=True)
 
 

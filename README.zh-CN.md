@@ -8,8 +8,8 @@
 qwen3_tts_ov/              OpenVINO runtime、导出器和 CLI
 docs/                      中文补充文档
 examples/                  小型输入示例
-compress_openvino_weights.py  OpenVINO 权重量化/压缩辅助脚本
-quantize_openvino_full.py     NNCF PTQ 实验辅助脚本
+scripts/                   开发、压缩、量化和 benchmark 辅助脚本
+tests/                     单元测试
 ```
 
 以下目录由本地生成，默认不进入 git：
@@ -66,7 +66,10 @@ uv run python -m qwen3_tts_ov export \
   --cache-buckets 128,192,256,320,384 \
   --cache-kernels exact,sdpa \
   --fused-cache-kernels exact \
-  --decoder-tokens 64,128,256
+  --decoder-tokens 64,128,256 \
+  --stream-decoder-chunks 8,12,24 \
+  --stream-decoder-first-chunks 6,8,12 \
+  --stream-decoder-left-context 25
 ```
 
 CustomVoice：
@@ -79,7 +82,10 @@ uv run python -m qwen3_tts_ov export \
   --cache-buckets 128,192,256,320,384 \
   --cache-kernels exact,sdpa \
   --fused-cache-kernels exact \
-  --decoder-tokens 64,128,256
+  --decoder-tokens 64,128,256 \
+  --stream-decoder-chunks 8,12,24 \
+  --stream-decoder-first-chunks 6,8,12 \
+  --stream-decoder-left-context 25
 ```
 
 Base/VoiceClone：
@@ -93,6 +99,9 @@ uv run python -m qwen3_tts_ov export \
   --cache-kernels exact,sdpa \
   --fused-cache-kernels exact \
   --decoder-tokens 64,128,256 \
+  --stream-decoder-chunks 8,12,24 \
+  --stream-decoder-first-chunks 6,8,12 \
+  --stream-decoder-left-context 25 \
   --export-clone-graphs
 ```
 
@@ -147,6 +156,78 @@ uv run python -m qwen3_tts_ov batch \
 
 JSONL 中每行使用 `mode` 声明推理模式。实际运行时应让 `--ir-dir` 与 JSONL 中的任务类型匹配；本仓库提供的 `examples/requests.example.jsonl` 是 VoiceDesign 示例。
 
+## 流式合成
+
+首次部署或更新 IR 后，建议先填充 OpenVINO 编译缓存：
+
+```bash
+uv run python -m qwen3_tts_ov cache-warmup \
+  --ir-dir openvino/voice_design \
+  --device GPU \
+  --mode cache \
+  --cache-step fused \
+  --graphs core,stream,buckets \
+  --preload-buckets warmup \
+  --warmup-strategy low_latency
+```
+
+缓存默认写入用户缓存目录，而不是 IR 目录。更多细节见 [docs/cache_zh.md](docs/cache_zh.md)。
+
+调试 CLI 会按 chunk 写出 raw PCM，并把拼接结果写为 WAV：
+
+```bash
+uv run python -m qwen3_tts_ov stream voice-design \
+  --ir-dir openvino/voice_design \
+  --device GPU \
+  --text "你好，这是一次流式 OpenVINO 合成测试。" \
+  --instruct "A calm young female voice." \
+  --language Chinese \
+  --chunk-strategy low_latency \
+  --chunk-dir outputs/stream \
+  --output outputs/stream.wav
+```
+
+本地 sidecar 服务：
+
+```bash
+uv pip install -e ".[server]"
+uv run qwen3-tts-ov serve \
+  --model-root openvino \
+  --host 127.0.0.1 \
+  --port 17860 \
+  --preload-modes voice_design \
+  --preload-buckets warmup \
+  --warmup-strategy low_latency
+```
+
+浏览器测试页：
+
+```text
+http://127.0.0.1:17860/
+```
+
+页面会通过 WebSocket `/v1/tts/stream` 接收 `pcm_s16le` 音频块并实时播放，也可以下载拼接后的 WAV。
+服务默认会预热 VoiceDesign；如需跳过预热可加 `--no-warmup`。
+
+HTTP NDJSON 流式接口：
+
+```bash
+curl -N http://127.0.0.1:17860/v1/tts/stream \
+  -H "content-type: application/json" \
+  -d '{"mode":"voice_design","text":"你好，这是 HTTP 流式合成。","language":"Chinese","instruct":"A calm young female voice.","stream":{"chunk_strategy":"low_latency","format":"pcm_s16le"}}'
+```
+
+OpenAI-compatible Speech API：
+
+```bash
+curl -N http://127.0.0.1:17860/v1/audio/speech \
+  -H "content-type: application/json" \
+  -d '{"model":"qwen3-tts-openvino","voice":"default","input":"你好，这是兼容 OpenAI Speech API 的流式 PCM。","language":"Chinese","task_type":"voice_design","instructions":"A calm young female voice.","stream":true,"response_format":"pcm","chunk_strategy":"low_latency"}' \
+  --output speech.pcm
+```
+
+更多协议细节见 [docs/streaming_zh.md](docs/streaming_zh.md)。
+
 ## Python API
 
 ```python
@@ -159,6 +240,18 @@ wavs, sr = tts.generate_voice_design(
     language="Chinese",
     max_new_tokens=128,
 )
+```
+
+流式 Python API：
+
+```python
+for chunk in tts.stream_voice_design(
+    text="你好，这是 Python 流式 API 测试。",
+    instruct="A calm young female voice.",
+    language="Chinese",
+):
+    if chunk.audio.size:
+        print(chunk.index, chunk.audio.shape, chunk.is_final)
 ```
 
 ## 常见问题

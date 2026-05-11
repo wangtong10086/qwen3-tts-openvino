@@ -1,0 +1,15 @@
+{
+  "mode": "custom_voice",
+  "text": "你好，这是 CustomVoice 请求示例。",
+  "language": "Chinese",
+  "speaker": "Vivian",
+  "instruct": "A warm and clear narrator voice.",
+  "generation": {
+    "max_new_tokens": 128,
+    "min_new_tokens": 8
+  },
+  "stream": {
+    "chunk_strategy": "low_latency",
+    "format": "pcm_s16le"
+  }
+}

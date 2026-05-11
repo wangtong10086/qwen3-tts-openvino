@@ -38,7 +38,10 @@ uv run python -m qwen3_tts_ov export \
   --cache-buckets 128,192,256,320,384 \
   --cache-kernels exact,sdpa \
   --fused-cache-kernels exact \
-  --decoder-tokens 64,128,256
+  --decoder-tokens 64,128,256 \
+  --stream-decoder-chunks 8,12,24 \
+  --stream-decoder-first-chunks 6,8,12 \
+  --stream-decoder-left-context 25
 ```
 
 ## 3. 导出 CustomVoice
@@ -51,7 +54,10 @@ uv run python -m qwen3_tts_ov export \
   --cache-buckets 128,192,256,320,384 \
   --cache-kernels exact,sdpa \
   --fused-cache-kernels exact \
-  --decoder-tokens 64,128,256
+  --decoder-tokens 64,128,256 \
+  --stream-decoder-chunks 8,12,24 \
+  --stream-decoder-first-chunks 6,8,12 \
+  --stream-decoder-left-context 25
 ```
 
 ## 4. 导出 Base/VoiceClone
@@ -67,13 +73,18 @@ uv run python -m qwen3_tts_ov export \
   --cache-kernels exact,sdpa \
   --fused-cache-kernels exact \
   --decoder-tokens 64,128,256 \
+  --stream-decoder-chunks 8,12,24 \
+  --stream-decoder-first-chunks 6,8,12 \
+  --stream-decoder-left-context 25 \
   --export-clone-graphs
 ```
+
+`--stream-decoder-first-chunks 6,8,12` 会导出首块专用图，例如 `speech_decoder_stream_c0_t8.xml`；`--stream-decoder-chunks 8,12,24 --stream-decoder-left-context 25` 会导出后续 chunk 图，例如 `speech_decoder_stream_c25_t12.xml`。Runtime 会优先使用策略精确匹配图；如果旧 IR 没有这些图，会自动 fallback 到已有流式 decoder 或普通 decoder 分块解码。
 
 ## 5. 可选 INT8 权重压缩
 
 ```bash
-uv run python compress_openvino_weights.py \
+uv run python scripts/compress_openvino_weights.py \
   --ir-dir openvino/voice_design \
   --variant int8 \
   --mode int8_asym \

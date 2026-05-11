@@ -1,8 +1,12 @@
 import argparse
 import json
 import os
+import queue
 import sys
+import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -19,10 +23,28 @@ import regex as re
 import soundfile as sf
 
 from .audio import load_audio, speaker_mel_spectrogram
+from .cache import build_ov_cache_config, merge_compile_config_with_cache_mode, normalize_ov_cache_mode, resolve_ov_cache_dir
 
 
 PRETOKENIZE_REGEX = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
 NEG_INF = -3.4028234663852886e38
+DEFAULT_STREAM_CHUNK_STRATEGIES = {
+    "low_latency": {
+        "initial_chunk_frames": 8,
+        "chunk_frames": 12,
+        "left_context_frames": 25,
+    },
+    "balanced": {
+        "initial_chunk_frames": 12,
+        "chunk_frames": 12,
+        "left_context_frames": 25,
+    },
+    "stable": {
+        "initial_chunk_frames": 12,
+        "chunk_frames": 24,
+        "left_context_frames": 25,
+    },
+}
 
 
 @dataclass
@@ -32,6 +54,16 @@ class VoiceClonePromptItem:
     x_vector_only_mode: bool
     icl_mode: bool
     ref_text: str | None = None
+
+
+@dataclass
+class StreamChunk:
+    index: int
+    audio: np.ndarray
+    sample_rate: int
+    codes: np.ndarray
+    is_final: bool
+    timings: dict
 
 
 @lru_cache
@@ -173,16 +205,20 @@ def compile_model(
     core: ov.Core,
     model_path: Path,
     device: str,
-    cache_dir: Path,
+    cache_dir: Path | None,
     allow_cpu_fallback: bool = False,
     ov_profile: bool = False,
     precision_hint: str = "f16",
     extra_config: dict | None = None,
+    ov_cache_mode: str | None = "optimize_speed",
+    disable_ov_cache: bool = False,
 ):
     config = {
         "INFERENCE_PRECISION_HINT": precision_hint,
-        "CACHE_DIR": str(cache_dir),
     }
+    config.update(build_ov_cache_config(cache_dir, ov_cache_mode=ov_cache_mode, disable_ov_cache=disable_ov_cache))
+    if cache_dir is not None and not disable_ov_cache:
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
     if extra_config:
         config.update({key: value for key, value in extra_config.items() if value is not None})
     if ov_profile:
@@ -200,7 +236,11 @@ def compile_model(
                 reason = next((line.strip() for line in str(first_error).splitlines() if line.strip()), repr(first_error))
                 print(f"warning: failed to compile {model_path.name} on {device}; falling back to CPU", flush=True)
                 print(f"warning: OpenVINO GPU error: {reason}", flush=True)
-                fallback_config = {"CACHE_DIR": str(cache_dir)}
+                fallback_config = build_ov_cache_config(
+                    cache_dir,
+                    ov_cache_mode=ov_cache_mode,
+                    disable_ov_cache=disable_ov_cache,
+                )
                 if ov_profile:
                     fallback_config["PERF_COUNT"] = "YES"
                 return core.compile_model(str(model_path), "CPU", fallback_config)
@@ -338,6 +378,9 @@ class OpenVINOQwen3TTS:
         graph_variant: str = "fp16",
         precision_hint: str = "f16",
         compile_config: dict | None = None,
+        ov_cache_dir: str | Path | None = None,
+        ov_cache_mode: str | None = "optimize_speed",
+        disable_ov_cache: bool = False,
         calibration_dir: str | None = None,
         calibration_limit: int = 64,
         profile: bool = False,
@@ -355,6 +398,18 @@ class OpenVINOQwen3TTS:
         self.encode_downsample_rate = int(self.manifest.get("encode_downsample_rate", self.decode_upsample_rate))
         self.speaker_encoder_sample_rate = int(self.manifest.get("speaker_encoder_sample_rate", 24000))
         graphs = self.manifest["graphs"]
+        stream_config = self.manifest.get("streaming_decoder", {})
+        self.streaming_decoder_left_context = int(stream_config.get("left_context_frames", 25))
+        self.default_chunk_strategy = self._normalize_chunk_strategy_name(
+            stream_config.get("default_strategy") or "low_latency"
+        )
+        self.streaming_decoder_strategies = self._load_streaming_decoder_strategies(stream_config)
+        self.streaming_decoder_graphs_by_context = self._load_streaming_decoder_graphs(stream_config, graphs)
+        self.streaming_decoder_graphs = self.streaming_decoder_graphs_by_context.get(self.streaming_decoder_left_context, {})
+        self.streaming_decoders = {}
+        self.streaming_decoder_requests = {}
+        self.last_stream_decode_info = {}
+        self.stream_pipeline_decode = True
         self.requested_mode = mode
         if mode == "fast-cache":
             mode = "cache"
@@ -375,7 +430,27 @@ class OpenVINOQwen3TTS:
         self.decoder_device = decoder_device or device
         self.allow_cpu_fallback = allow_cpu_fallback
         self.precision_hint = precision_hint
-        self.compile_config = compile_config or {}
+        self.disable_ov_cache = bool(disable_ov_cache)
+        self.ov_cache_mode = normalize_ov_cache_mode(ov_cache_mode)
+        self.compile_config = merge_compile_config_with_cache_mode(
+            compile_config,
+            ov_cache_mode=self.ov_cache_mode,
+            disable_ov_cache=self.disable_ov_cache,
+        )
+        self.cache_dir = resolve_ov_cache_dir(
+            self.ir_dir,
+            self.manifest,
+            device=self.device,
+            decoder_device=self.decoder_device,
+            mode=self.mode,
+            cache_kernel=self.cache_kernel,
+            cache_step=self.cache_step,
+            graph_variant=self.graph_variant,
+            precision_hint=self.precision_hint,
+            compile_config=self.compile_config,
+            ov_cache_dir=ov_cache_dir,
+            disable_ov_cache=self.disable_ov_cache,
+        )
         self.calibration_dir = Path(calibration_dir) if calibration_dir else None
         self.calibration_limit = int(calibration_limit)
         self.calibration_counts = {}
@@ -393,7 +468,6 @@ class OpenVINOQwen3TTS:
 
         self.core = ov.Core()
         print(f"OpenVINO available devices: {self.core.available_devices}", flush=True)
-        self.cache_dir = self.ir_dir / "ov_cache"
         started = time.time()
         self.text_embedding = compile_model(
             self.core, self.ir_dir / graphs["text_embedding"], device, self.cache_dir, allow_cpu_fallback, ov_profile, self.precision_hint, self.compile_config
@@ -541,6 +615,88 @@ class OpenVINOQwen3TTS:
         bucket_graphs.update(self._load_bucket_graphs((variant_graphs or {}).get("fused_cache_step_buckets", {}), kernel))
         return dict(sorted(bucket_graphs.items()))
 
+    def _load_streaming_decoder_graphs(self, stream_config: dict, graphs: dict) -> dict[int, dict[int, str]]:
+        contexts = stream_config.get("contexts")
+        if contexts:
+            return {
+                int(context): {int(chunk): graph for chunk, graph in chunk_graphs.items() if graph}
+                for context, chunk_graphs in contexts.items()
+                if chunk_graphs
+            }
+
+        stream_graphs = stream_config.get("graphs") or graphs.get("streaming_decoder", {})
+        if not stream_graphs:
+            return {}
+
+        if all(str(key).isdigit() and isinstance(value, dict) for key, value in stream_graphs.items()):
+            return {
+                int(context): {int(chunk): graph for chunk, graph in chunk_graphs.items() if graph}
+                for context, chunk_graphs in stream_graphs.items()
+                if chunk_graphs
+            }
+
+        left_context = int(stream_config.get("left_context_frames", 25))
+        return {left_context: {int(chunk): graph for chunk, graph in stream_graphs.items() if graph}}
+
+    @staticmethod
+    def _normalize_chunk_strategy_name(strategy: str | None) -> str:
+        return str(strategy or "low_latency").strip().replace("-", "_").lower()
+
+    def _load_streaming_decoder_strategies(self, stream_config: dict) -> dict[str, dict[str, int]]:
+        strategies = {name: dict(config) for name, config in DEFAULT_STREAM_CHUNK_STRATEGIES.items()}
+        for name, config in (stream_config.get("strategies") or {}).items():
+            normalized = self._normalize_chunk_strategy_name(name)
+            if not isinstance(config, dict):
+                continue
+            merged = dict(strategies.get(normalized, {}))
+            merged.update(config)
+            strategies[normalized] = merged
+        for name, config in strategies.items():
+            chunk_frames = int(config.get("chunk_frames", 12))
+            strategies[name] = {
+                "initial_chunk_frames": int(config.get("initial_chunk_frames", chunk_frames)),
+                "chunk_frames": chunk_frames,
+                "left_context_frames": int(config.get("left_context_frames", self.streaming_decoder_left_context)),
+            }
+        if self.default_chunk_strategy not in strategies:
+            self.default_chunk_strategy = "low_latency"
+        return strategies
+
+    def _resolve_stream_chunk_config(
+        self,
+        chunk_strategy: str | None = None,
+        chunk_frames: int | None = None,
+        initial_chunk_frames: int | None = None,
+        left_context_frames: int | None = None,
+    ) -> dict:
+        strategy = self._normalize_chunk_strategy_name(chunk_strategy or self.default_chunk_strategy)
+        if strategy not in self.streaming_decoder_strategies:
+            supported = ", ".join(sorted(self.streaming_decoder_strategies))
+            raise ValueError(f"unsupported chunk_strategy={chunk_strategy!r}; supported strategies: {supported}")
+
+        explicit_fixed_chunk = chunk_strategy is None and chunk_frames is not None and initial_chunk_frames is None
+        config = dict(self.streaming_decoder_strategies[strategy])
+        if chunk_frames is not None:
+            config["chunk_frames"] = int(chunk_frames)
+        if initial_chunk_frames is not None:
+            config["initial_chunk_frames"] = int(initial_chunk_frames)
+        elif explicit_fixed_chunk:
+            config["initial_chunk_frames"] = int(chunk_frames)
+        if left_context_frames is not None:
+            config["left_context_frames"] = int(left_context_frames)
+
+        config["strategy"] = strategy
+        config["initial_chunk_frames"] = int(config["initial_chunk_frames"])
+        config["chunk_frames"] = int(config["chunk_frames"])
+        config["left_context_frames"] = int(config["left_context_frames"])
+        if config["initial_chunk_frames"] <= 0:
+            raise ValueError("initial_chunk_frames must be positive")
+        if config["chunk_frames"] <= 0:
+            raise ValueError("chunk_frames must be positive")
+        if config["left_context_frames"] < 0:
+            raise ValueError("left_context_frames must be non-negative")
+        return config
+
     def assert_gpu_execution(self, compiled_models):
         for compiled in compiled_models:
             devices = compiled.get_property("EXECUTION_DEVICES")
@@ -606,6 +762,28 @@ class OpenVINOQwen3TTS:
             self.fused_cache_request_by_bucket[bucket] = compiled.create_infer_request()
             print(f"compiled fused cache bucket {bucket} on {self.device} in {time.time() - started:.1f}s", flush=True)
         return bucket, self.fused_cache_step_by_bucket[bucket], self.fused_cache_request_by_bucket[bucket]
+
+    def ensure_subcode_greedy(self):
+        if self.subcode_greedy is not None:
+            return
+        graphs = self.manifest["graphs"]
+        subcode_graph = self.graph_name(graphs, "subcode_greedy")
+        started = time.time()
+        self.subcode_graph_name = subcode_graph
+        self.subcode_greedy = compile_model(
+            self.core,
+            self.ir_dir / subcode_graph,
+            self.device,
+            self.cache_dir,
+            self.allow_cpu_fallback,
+            self.ov_profiler.enabled,
+            self.precision_hint,
+            self.compile_config,
+        )
+        self.subcode_request = self.subcode_greedy.create_infer_request()
+        if not self.allow_cpu_fallback and self.device == "GPU":
+            self.assert_gpu_execution([self.subcode_greedy])
+        print(f"compiled subcode greedy on {self.device} in {time.time() - started:.1f}s", flush=True)
 
     def embed_text(self, token_ids):
         ids = np.asarray([token_ids], dtype=np.int64)
@@ -878,9 +1056,54 @@ class OpenVINOQwen3TTS:
         top_p: float = 1.0,
         temperature: float = 0.9,
     ):
+        frames = list(
+            self.generate_codes_iter(
+                text=text,
+                instruct=instruct,
+                language=language,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                repetition_penalty=repetition_penalty,
+                max_prompt_tokens=max_prompt_tokens,
+                progress_interval=progress_interval,
+                speaker=speaker,
+                voice_clone_prompt=voice_clone_prompt,
+                ref_text=ref_text,
+                do_sample=do_sample,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+            )
+        )
+        if not frames:
+            raise RuntimeError("generation stopped before producing any codec token")
+        return np.stack(frames, axis=0)
+
+    def generate_codes_iter(
+        self,
+        text: str,
+        instruct: str,
+        language: str,
+        max_new_tokens: int,
+        min_new_tokens: int,
+        repetition_penalty: float,
+        max_prompt_tokens: int,
+        progress_interval: int,
+        speaker: str | None = None,
+        voice_clone_prompt: VoiceClonePromptItem | None = None,
+        ref_text: str | None = None,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+    ):
         if self.mode == "cache":
-            cache_generator = self.generate_codes_cache_fused if self.cache_step == "fused" else self.generate_codes_cache_split
-            return cache_generator(
+            cache_generator = (
+                self.generate_codes_cache_fused_iter
+                if self.cache_step == "fused" and not do_sample
+                else self.generate_codes_cache_split_iter
+            )
+            yield from cache_generator(
                 text=text,
                 instruct=instruct,
                 language=language,
@@ -897,8 +1120,9 @@ class OpenVINOQwen3TTS:
                 top_p=top_p,
                 temperature=temperature,
             )
+            return
         if self.mode == "fused-no-cache":
-            return self.generate_codes_fused_no_cache(
+            yield from self.generate_codes_fused_no_cache_iter(
                 text=text,
                 instruct=instruct,
                 language=language,
@@ -915,7 +1139,8 @@ class OpenVINOQwen3TTS:
                 top_p=top_p,
                 temperature=temperature,
             )
-        return self.generate_codes_no_cache(
+            return
+        yield from self.generate_codes_no_cache_iter(
             text=text,
             instruct=instruct,
             language=language,
@@ -932,6 +1157,356 @@ class OpenVINOQwen3TTS:
             top_p=top_p,
             temperature=temperature,
         )
+
+    def generate_codes_no_cache_iter(
+        self,
+        text: str,
+        instruct: str,
+        language: str,
+        max_new_tokens: int,
+        min_new_tokens: int,
+        repetition_penalty: float,
+        max_prompt_tokens: int,
+        progress_interval: int,
+        speaker: str | None = None,
+        voice_clone_prompt: VoiceClonePromptItem | None = None,
+        ref_text: str | None = None,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+    ):
+        sequence, tts_pad_embed = self.build_prompt(
+            text,
+            instruct,
+            language,
+            max_prompt_tokens,
+            speaker=speaker,
+            voice_clone_prompt=voice_clone_prompt,
+            ref_text=ref_text,
+        )
+        generated_count = 0
+        generated_first_codes = []
+        started = time.time()
+        for step in range(max_new_tokens):
+            talker_started = time.time()
+            talker_inputs = [sequence.astype(np.float32, copy=False)]
+            self.dump_calibration("talker_no_cache", talker_inputs)
+            logits, past_hidden = run_request(
+                self.talker_request,
+                self.talker,
+                talker_inputs,
+                self.ov_profiler,
+                "talker_no_cache",
+            )
+            self.timings.add("talker", time.time() - talker_started)
+            first_code = self.select_first_code(
+                logits,
+                generated_first_codes,
+                step,
+                min_new_tokens,
+                repetition_penalty,
+                do_sample=do_sample,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+            )
+            if first_code == int(self.ids["codec_eos_token_id"]):
+                break
+
+            code_input = np.asarray([[first_code]], dtype=np.int64)
+            subcode_started = time.time()
+            subcode_inputs = [past_hidden.astype(np.float32), code_input]
+            self.dump_calibration("subcode_greedy", subcode_inputs)
+            codes, sum_embed = run_request(
+                self.subcode_request,
+                self.subcode_greedy,
+                subcode_inputs,
+                self.ov_profiler,
+                "subcode_greedy",
+            )
+            self.timings.add("subcode", time.time() - subcode_started)
+            codes = codes.astype(np.int64, copy=False)
+            generated_count += 1
+            generated_first_codes.append(first_code)
+
+            frame_embed = sum_embed.astype(np.float32, copy=False) + tts_pad_embed
+            sequence = np.concatenate([sequence, frame_embed], axis=1)
+            if progress_interval and generated_count % progress_interval == 0:
+                elapsed = time.time() - started
+                print(f"generated {generated_count}/{max_new_tokens} codec tokens in {elapsed:.1f}s", flush=True)
+            yield codes[0]
+
+        if generated_count == 0:
+            raise RuntimeError("generation stopped before producing any codec token")
+
+    def generate_codes_fused_no_cache_iter(
+        self,
+        text: str,
+        instruct: str,
+        language: str,
+        max_new_tokens: int,
+        min_new_tokens: int,
+        repetition_penalty: float,
+        max_prompt_tokens: int,
+        progress_interval: int,
+        speaker: str | None = None,
+        voice_clone_prompt: VoiceClonePromptItem | None = None,
+        ref_text: str | None = None,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+    ):
+        if do_sample:
+            raise ValueError("do_sample=True is not supported by fused-no-cache OpenVINO graphs; use --mode no-cache")
+        sequence, tts_pad_embed = self.build_prompt(
+            text,
+            instruct,
+            language,
+            max_prompt_tokens,
+            speaker=speaker,
+            voice_clone_prompt=voice_clone_prompt,
+            ref_text=ref_text,
+        )
+        generated_count = 0
+        generated_first_codes = []
+        started = time.time()
+        for step in range(max_new_tokens):
+            repeated_mask = np.zeros((1, int(self.ids["vocab_size"])), dtype=np.float32)
+            for token_id in set(generated_first_codes):
+                repeated_mask[0, token_id] = 1.0
+            allow_eos = np.asarray([1.0 if step >= min_new_tokens else 0.0], dtype=np.float32)
+            penalty = np.asarray([repetition_penalty], dtype=np.float32)
+
+            step_started = time.time()
+            first_code, codes, frame_embed = run_request(
+                self.fused_request,
+                self.fused_step,
+                [
+                    sequence.astype(np.float32, copy=False),
+                    tts_pad_embed.astype(np.float32, copy=False),
+                    repeated_mask,
+                    allow_eos,
+                    penalty,
+                ],
+                self.ov_profiler,
+                "fused_no_cache_step",
+            )
+            self.timings.add("fused_step", time.time() - step_started)
+            first_code_int = int(first_code.reshape(-1)[0])
+            if first_code_int == int(self.ids["codec_eos_token_id"]):
+                break
+
+            codes = codes.astype(np.int64, copy=False)
+            generated_count += 1
+            generated_first_codes.append(first_code_int)
+            sequence = np.concatenate([sequence, frame_embed.astype(np.float32, copy=False)], axis=1)
+            if progress_interval and generated_count % progress_interval == 0:
+                elapsed = time.time() - started
+                print(f"generated {generated_count}/{max_new_tokens} codec tokens in {elapsed:.1f}s", flush=True)
+            yield codes[0]
+
+        if generated_count == 0:
+            raise RuntimeError("generation stopped before producing any codec token")
+
+    def generate_codes_cache_split_iter(
+        self,
+        text: str,
+        instruct: str,
+        language: str,
+        max_new_tokens: int,
+        min_new_tokens: int,
+        repetition_penalty: float,
+        max_prompt_tokens: int,
+        progress_interval: int,
+        speaker: str | None = None,
+        voice_clone_prompt: VoiceClonePromptItem | None = None,
+        ref_text: str | None = None,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+    ):
+        sequence, tts_pad_embed = self.build_prompt(
+            text,
+            instruct,
+            language,
+            max_prompt_tokens,
+            speaker=speaker,
+            voice_clone_prompt=voice_clone_prompt,
+            ref_text=ref_text,
+        )
+        self.ensure_subcode_greedy()
+        prompt_len = int(sequence.shape[1])
+        required_len = prompt_len + max_new_tokens
+        cache_len, talker_stateful, talker_request = self.get_talker_stateful(required_len)
+
+        talker_request.reset_state()
+        prompt_positions = np.arange(prompt_len, dtype=np.int64)
+        prompt_mask = self.make_attention_mask(prompt_positions, prompt_len, prompt_len)
+
+        started = time.time()
+        talker_started = time.time()
+        logits, past_hidden = run_request(
+            talker_request,
+            talker_stateful,
+            {
+                "inputs_embeds": sequence.astype(np.float32, copy=False),
+                "cache_position": prompt_positions,
+                "attention_mask": prompt_mask,
+            },
+            self.ov_profiler,
+            "talker_cache_prefill",
+        )
+        self.timings.add("talker", time.time() - talker_started)
+
+        generated_count = 0
+        generated_first_codes = []
+        for step in range(max_new_tokens):
+            first_code = self.select_first_code(
+                logits,
+                generated_first_codes,
+                step,
+                min_new_tokens,
+                repetition_penalty,
+                do_sample=do_sample,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+            )
+            if first_code == int(self.ids["codec_eos_token_id"]):
+                break
+
+            code_input = np.asarray([[first_code]], dtype=np.int64)
+            subcode_started = time.time()
+            codes, sum_embed = run_request(
+                self.subcode_request,
+                self.subcode_greedy,
+                [past_hidden.astype(np.float32, copy=False), code_input],
+                self.ov_profiler,
+                "subcode_greedy",
+            )
+            self.timings.add("subcode", time.time() - subcode_started)
+            codes = codes.astype(np.int64, copy=False)
+            generated_count += 1
+            generated_first_codes.append(first_code)
+
+            if progress_interval and generated_count % progress_interval == 0:
+                elapsed = time.time() - started
+                print(f"generated {generated_count}/{max_new_tokens} codec tokens in {elapsed:.1f}s", flush=True)
+            yield codes[0]
+
+            if step + 1 >= max_new_tokens:
+                break
+
+            frame_embed = sum_embed.astype(np.float32, copy=False) + tts_pad_embed
+            cache_position = np.asarray([prompt_len + step], dtype=np.int64)
+            attention_mask = self.make_attention_mask(cache_position, 1, prompt_len + step + 1)
+            talker_started = time.time()
+            logits, past_hidden = run_request(
+                talker_request,
+                talker_stateful,
+                {
+                    "inputs_embeds": frame_embed.astype(np.float32, copy=False),
+                    "cache_position": cache_position,
+                    "attention_mask": attention_mask,
+                },
+                self.ov_profiler,
+                "talker_cache_decode",
+            )
+            self.timings.add("talker", time.time() - talker_started)
+
+        if generated_count == 0:
+            raise RuntimeError("generation stopped before producing any codec token")
+
+    def generate_codes_cache_fused_iter(
+        self,
+        text: str,
+        instruct: str,
+        language: str,
+        max_new_tokens: int,
+        min_new_tokens: int,
+        repetition_penalty: float,
+        max_prompt_tokens: int,
+        progress_interval: int,
+        speaker: str | None = None,
+        voice_clone_prompt: VoiceClonePromptItem | None = None,
+        ref_text: str | None = None,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+    ):
+        if do_sample:
+            raise ValueError("do_sample=True is not supported by fused cache OpenVINO graphs; use --cache-step split")
+        sequence, tts_pad_embed = self.build_prompt(
+            text,
+            instruct,
+            language,
+            max_prompt_tokens,
+            speaker=speaker,
+            voice_clone_prompt=voice_clone_prompt,
+            ref_text=ref_text,
+        )
+        prompt_len = int(sequence.shape[1])
+        required_len = prompt_len + max_new_tokens
+        cache_len, fused_cache_step, fused_cache_request = self.get_fused_cache_step(required_len)
+
+        fused_cache_request.reset_state()
+        generated_count = 0
+        generated_first_codes = []
+        repeated_mask = np.zeros((1, int(self.ids["vocab_size"])), dtype=np.float32)
+        penalty = np.asarray([repetition_penalty], dtype=np.float32)
+        started = time.time()
+
+        next_inputs_embeds = sequence.astype(np.float32, copy=False)
+        next_cache_position = np.arange(prompt_len, dtype=np.int64)
+        next_attention_mask = self.make_attention_mask(next_cache_position, prompt_len, prompt_len)
+
+        for step in range(max_new_tokens):
+            allow_eos = np.asarray([1.0 if step >= min_new_tokens else 0.0], dtype=np.float32)
+            step_started = time.time()
+            first_code, codes, frame_embed = run_request(
+                fused_cache_request,
+                fused_cache_step,
+                {
+                    "inputs_embeds": next_inputs_embeds,
+                    "cache_position": next_cache_position,
+                    "attention_mask": next_attention_mask,
+                    "tts_pad_embed": tts_pad_embed.astype(np.float32, copy=False),
+                    "repeated_mask": repeated_mask,
+                    "allow_eos": allow_eos,
+                    "repetition_penalty": penalty,
+                },
+                self.ov_profiler,
+                "fused_cache_step",
+            )
+            self.timings.add("fused_step", time.time() - step_started)
+
+            first_code_int = int(first_code.reshape(-1)[0])
+            if first_code_int == int(self.ids["codec_eos_token_id"]):
+                break
+
+            codes = codes.astype(np.int64, copy=False)
+            generated_count += 1
+            generated_first_codes.append(first_code_int)
+            repeated_mask[0, first_code_int] = 1.0
+
+            if progress_interval and generated_count % progress_interval == 0:
+                elapsed = time.time() - started
+                print(f"generated {generated_count}/{max_new_tokens} codec tokens in {elapsed:.1f}s", flush=True)
+            yield codes[0]
+
+            if step + 1 >= max_new_tokens:
+                break
+
+            next_inputs_embeds = frame_embed.astype(np.float32, copy=False)
+            next_cache_position = np.asarray([prompt_len + step], dtype=np.int64)
+            next_attention_mask = self.make_attention_mask(next_cache_position, 1, prompt_len + step + 1)
+
+        if generated_count == 0:
+            raise RuntimeError("generation stopped before producing any codec token")
 
     def generate_codes_no_cache(
         self,
@@ -1521,6 +2096,770 @@ class OpenVINOQwen3TTS:
             wavs.append(wav)
         return wavs, self.sample_rate
 
+    @staticmethod
+    def _ensure_scalar(value, name: str):
+        if isinstance(value, list):
+            if len(value) != 1:
+                raise ValueError(f"streaming {name} only supports a single item")
+            return value[0]
+        return value
+
+    def _stream_decoder_key(
+        self,
+        context_frames: int,
+        new_frames: int,
+        preferred_chunk_frames: int,
+        left_context_frames: int,
+    ):
+        candidates = self._stream_decoder_key_candidates(
+            context_frames=context_frames,
+            new_frames=new_frames,
+            preferred_chunk_frames=preferred_chunk_frames,
+            left_context_frames=left_context_frames,
+        )
+        return candidates[0] if candidates else None
+
+    def _stream_decoder_key_candidates(
+        self,
+        context_frames: int,
+        new_frames: int,
+        preferred_chunk_frames: int,
+        left_context_frames: int,
+    ) -> list[tuple[int, int]]:
+        if not self.streaming_decoder_graphs_by_context:
+            return []
+
+        context_candidates = []
+        if context_frames in self.streaming_decoder_graphs_by_context:
+            context_candidates.append(context_frames)
+        if context_frames == 0 and 0 in self.streaming_decoder_graphs_by_context:
+            context_candidates.append(0)
+        if context_frames > 0 and left_context_frames in self.streaming_decoder_graphs_by_context:
+            context_candidates.append(left_context_frames)
+        if context_frames > 0:
+            context_candidates.extend(
+                context
+                for context in sorted(self.streaming_decoder_graphs_by_context)
+                if context >= context_frames
+            )
+            context_candidates.extend(sorted(self.streaming_decoder_graphs_by_context))
+
+        seen_contexts = set()
+        results = []
+        for context in context_candidates:
+            if context in seen_contexts:
+                continue
+            seen_contexts.add(context)
+            chunk_graphs = self.streaming_decoder_graphs_by_context.get(context, {})
+            if not chunk_graphs:
+                continue
+            chunk_candidates = self._stream_decoder_chunk_key_candidates(chunk_graphs, new_frames, preferred_chunk_frames)
+            results.extend((context, chunk) for chunk in chunk_candidates)
+        return results
+
+    @staticmethod
+    def _stream_decoder_chunk_key(chunk_graphs: dict[int, str], new_frames: int, preferred_chunk_frames: int):
+        candidates = OpenVINOQwen3TTS._stream_decoder_chunk_key_candidates(
+            chunk_graphs,
+            new_frames,
+            preferred_chunk_frames,
+        )
+        return candidates[0] if candidates else None
+
+    @staticmethod
+    def _stream_decoder_chunk_key_candidates(
+        chunk_graphs: dict[int, str],
+        new_frames: int,
+        preferred_chunk_frames: int,
+    ) -> list[int]:
+        candidates = []
+        if preferred_chunk_frames in chunk_graphs and preferred_chunk_frames >= new_frames:
+            candidates.append(preferred_chunk_frames)
+        candidates.extend(key for key in sorted(chunk_graphs) if key >= new_frames and key not in candidates)
+        if chunk_graphs:
+            largest = max(chunk_graphs)
+            if largest not in candidates:
+                candidates.append(largest)
+        return candidates
+
+    def _get_stream_decoder(self, context_frames: int, chunk_frames: int):
+        key = (int(context_frames), int(chunk_frames))
+        if key not in self.streaming_decoders:
+            started = time.time()
+            graph = self.streaming_decoder_graphs_by_context[int(context_frames)][int(chunk_frames)]
+            compiled = compile_model(
+                self.core,
+                self.ir_dir / graph,
+                self.decoder_device,
+                self.cache_dir,
+                self.allow_cpu_fallback,
+                self.ov_profiler.enabled,
+                self.precision_hint,
+                self.compile_config,
+            )
+            if not self.allow_cpu_fallback and self.decoder_device == "GPU":
+                self.assert_gpu_execution([compiled])
+            self.streaming_decoders[key] = compiled
+            self.streaming_decoder_requests[key] = compiled.create_infer_request()
+            print(
+                f"compiled streaming decoder context {context_frames} chunk {chunk_frames} "
+                f"on {self.decoder_device} in {time.time() - started:.1f}s",
+                flush=True,
+            )
+        return self.streaming_decoders[key], self.streaming_decoder_requests[key]
+
+    def _pad_stream_context(self, window_codes: np.ndarray, context_frames: int, target_context_frames: int):
+        if target_context_frames <= context_frames:
+            return window_codes, context_frames
+        if context_frames <= 0:
+            return window_codes, context_frames
+        pad_count = target_context_frames - context_frames
+        pad_frame = window_codes[:1]
+        padding = np.repeat(pad_frame, pad_count, axis=0)
+        return np.concatenate([padding, window_codes], axis=0), target_context_frames
+
+    def decode_stream_window(
+        self,
+        window_codes: np.ndarray,
+        context_frames: int,
+        new_frames: int,
+        chunk_frames: int = 12,
+        left_context_frames: int = 25,
+    ) -> np.ndarray:
+        if new_frames <= 0:
+            return np.zeros((0,), dtype=np.float32)
+
+        stream_keys = self._stream_decoder_key_candidates(
+            context_frames=context_frames,
+            new_frames=new_frames,
+            preferred_chunk_frames=chunk_frames,
+            left_context_frames=left_context_frames,
+        )
+        last_stream_error = None
+        for stream_key in stream_keys:
+            target_context, target_chunk = stream_key
+            padded_window, effective_context = self._pad_stream_context(window_codes, context_frames, target_context)
+            started = time.time()
+            try:
+                compiled, request = self._get_stream_decoder(target_context, target_chunk)
+                audio = run_request(
+                    request,
+                    compiled,
+                    [np.asarray(padded_window, dtype=np.int64).reshape(1, -1, self.num_code_groups)],
+                    self.ov_profiler,
+                    f"speech_decoder_stream_c{target_context}_t{target_chunk}",
+                )[0][0].astype(np.float32, copy=False)
+                elapsed = time.time() - started
+                self.timings.add("decode", elapsed)
+                self.last_stream_decode_info = {
+                    "decode_path": f"stream:c{target_context}_t{target_chunk}",
+                    "decode_context_frames": int(effective_context),
+                    "decode_chunk_graph_frames": int(target_chunk),
+                    "decode_ms": elapsed * 1000.0,
+                    "fallback": False,
+                }
+                return audio[: new_frames * self.decode_upsample_rate]
+            except Exception as exc:
+                last_stream_error = exc
+                failed_key = (int(target_context), int(target_chunk))
+                self.streaming_decoders.pop(failed_key, None)
+                self.streaming_decoder_requests.pop(failed_key, None)
+                print(
+                    f"warning: streaming decoder c{target_context}_t{target_chunk} failed; "
+                    f"trying fallback path: {exc}",
+                    flush=True,
+                )
+
+        started = time.time()
+        audio = self.decode(window_codes)
+        elapsed = time.time() - started
+        start = context_frames * self.decode_upsample_rate
+        end = start + new_frames * self.decode_upsample_rate
+        self.last_stream_decode_info = {
+            "decode_path": "fallback:speech_decoder",
+            "decode_context_frames": int(context_frames),
+            "decode_chunk_graph_frames": None,
+            "decode_ms": elapsed * 1000.0,
+            "fallback": True,
+            "stream_decoder_error": str(last_stream_error) if last_stream_error is not None else None,
+        }
+        return audio[start:end]
+
+    def stream_decode_codes(
+        self,
+        code_iter,
+        prefix_codes: np.ndarray | None = None,
+        chunk_frames: int | None = None,
+        left_context_frames: int | None = None,
+        initial_chunk_frames: int | None = None,
+        chunk_strategy: str | None = None,
+    ):
+        stream_config = self._resolve_stream_chunk_config(
+            chunk_strategy=chunk_strategy,
+            chunk_frames=chunk_frames,
+            initial_chunk_frames=initial_chunk_frames,
+            left_context_frames=left_context_frames,
+        )
+        strategy = stream_config["strategy"]
+        initial_chunk_frames = int(stream_config["initial_chunk_frames"])
+        chunk_frames = int(stream_config["chunk_frames"])
+        left_context_frames = int(stream_config["left_context_frames"])
+        if getattr(self, "stream_pipeline_decode", False):
+            yield from self._stream_decode_codes_pipelined(
+                code_iter,
+                prefix_codes=prefix_codes,
+                chunk_frames=chunk_frames,
+                left_context_frames=left_context_frames,
+                initial_chunk_frames=initial_chunk_frames,
+                chunk_strategy=strategy,
+            )
+            return
+
+        all_codes = []
+        if prefix_codes is not None:
+            prefix = np.asarray(prefix_codes, dtype=np.int64)
+            if prefix.ndim == 1:
+                prefix = prefix.reshape(1, -1)
+            if prefix.shape[-1] != self.num_code_groups:
+                raise ValueError(f"prefix_codes must have {self.num_code_groups} code groups")
+            all_codes.extend(prefix.reshape(-1, self.num_code_groups))
+        prefix_frames = len(all_codes)
+        emitted_frames = prefix_frames
+        pending_frames = 0
+        chunk_index = 0
+        stream_started = time.time()
+        codegen_started = stream_started
+
+        def emit(is_final: bool):
+            nonlocal emitted_frames, pending_frames, chunk_index, codegen_started
+            total_frames = len(all_codes)
+            new_frames = total_frames - emitted_frames
+            emit_started = time.time()
+            codegen_ms = max(0.0, (emit_started - codegen_started) * 1000.0)
+            if new_frames > 0:
+                context_start = max(0, emitted_frames - left_context_frames)
+                context_frames = emitted_frames - context_start
+                window = np.stack(all_codes[context_start:total_frames], axis=0).astype(np.int64, copy=False)
+                decode_started = time.time()
+                audio = self.decode_stream_window(
+                    window,
+                    context_frames=context_frames,
+                    new_frames=new_frames,
+                    chunk_frames=chunk_frames,
+                    left_context_frames=left_context_frames,
+                )
+                decode_ms = (time.time() - decode_started) * 1000.0
+                decode_info = dict(getattr(self, "last_stream_decode_info", {}) or {})
+                decode_ms = float(decode_info.get("decode_ms", decode_ms))
+                codes = np.stack(all_codes[emitted_frames:total_frames], axis=0).astype(np.int64, copy=False)
+                emitted_frames = total_frames
+                pending_frames = 0
+            else:
+                audio = np.zeros((0,), dtype=np.float32)
+                codes = np.empty((0, self.num_code_groups), dtype=np.int64)
+                decode_ms = 0.0
+                decode_info = {"decode_path": "none", "fallback": False}
+
+            audio_ms = (float(audio.shape[0]) / float(self.sample_rate) * 1000.0) if audio.size else 0.0
+            compute_ms = codegen_ms + decode_ms
+            rtf = (compute_ms / audio_ms) if audio_ms > 0 else 0.0
+            queue_hint_ms = max(0.0, audio_ms - compute_ms)
+            producer_lag_ms = max(0.0, codegen_ms - audio_ms)
+
+            chunk = StreamChunk(
+                index=chunk_index,
+                audio=audio,
+                sample_rate=self.sample_rate,
+                codes=codes,
+                is_final=is_final,
+                timings={
+                    **self.timings.snapshot(max(emitted_frames - prefix_frames, 0)),
+                    **decode_info,
+                    "codegen_ms": codegen_ms,
+                    "decode_ms": decode_ms,
+                    "chunk_compute_ms": compute_ms,
+                    "chunk_audio_ms": audio_ms,
+                    "rtf": rtf,
+                    "queue_hint_ms": queue_hint_ms,
+                    "queue_wait_ms": 0.0,
+                    "producer_lag_ms": producer_lag_ms,
+                    "strategy": strategy,
+                    "initial_chunk_frames": int(initial_chunk_frames),
+                    "configured_chunk_frames": int(chunk_frames),
+                    "chunk_frames": int(codes.shape[0]),
+                    "emitted_frames": int(max(emitted_frames - prefix_frames, 0)),
+                    "prefix_frames": int(prefix_frames),
+                    "is_final": bool(is_final),
+                },
+            )
+            chunk_index += 1
+            codegen_started = time.time()
+            return chunk
+
+        def current_target_frames() -> int:
+            return initial_chunk_frames if chunk_index == 0 else chunk_frames
+
+        for code in code_iter:
+            frame = np.asarray(code, dtype=np.int64).reshape(-1)
+            if frame.shape[0] != self.num_code_groups:
+                raise ValueError(f"stream code frame must have {self.num_code_groups} code groups")
+            all_codes.append(frame)
+            pending_frames += 1
+            if pending_frames >= current_target_frames():
+                yield emit(False)
+
+        if pending_frames > 0:
+            yield emit(True)
+        else:
+            yield emit(True)
+
+    def _stream_decode_codes_pipelined(
+        self,
+        code_iter,
+        prefix_codes: np.ndarray | None = None,
+        chunk_frames: int | None = None,
+        left_context_frames: int | None = None,
+        initial_chunk_frames: int | None = None,
+        chunk_strategy: str | None = None,
+    ):
+        stream_config = self._resolve_stream_chunk_config(
+            chunk_strategy=chunk_strategy,
+            chunk_frames=chunk_frames,
+            initial_chunk_frames=initial_chunk_frames,
+            left_context_frames=left_context_frames,
+        )
+        strategy = stream_config["strategy"]
+        initial_chunk_frames = int(stream_config["initial_chunk_frames"])
+        chunk_frames = int(stream_config["chunk_frames"])
+        left_context_frames = int(stream_config["left_context_frames"])
+
+        out_queue = queue.Queue(maxsize=4)
+        sentinel = object()
+
+        def producer():
+            all_codes = []
+            if prefix_codes is not None:
+                prefix = np.asarray(prefix_codes, dtype=np.int64)
+                if prefix.ndim == 1:
+                    prefix = prefix.reshape(1, -1)
+                if prefix.shape[-1] != self.num_code_groups:
+                    raise ValueError(f"prefix_codes must have {self.num_code_groups} code groups")
+                all_codes.extend(prefix.reshape(-1, self.num_code_groups))
+
+            prefix_frames = len(all_codes)
+            emitted_frames = prefix_frames
+            pending_frames = 0
+            chunk_index = 0
+            codegen_started = time.time()
+            pending = deque()
+
+            def build_decode_job(is_final: bool):
+                nonlocal emitted_frames, pending_frames, chunk_index, codegen_started
+                total_frames = len(all_codes)
+                new_frames = total_frames - emitted_frames
+                submit_time = time.time()
+                codegen_ms = max(0.0, (submit_time - codegen_started) * 1000.0)
+                current_index = chunk_index
+                preferred_chunk_frames = initial_chunk_frames if current_index == 0 else chunk_frames
+                chunk_index += 1
+
+                if new_frames > 0:
+                    context_start = max(0, emitted_frames - left_context_frames)
+                    context_frames = emitted_frames - context_start
+                    window = np.stack(all_codes[context_start:total_frames], axis=0).astype(np.int64, copy=True)
+                    codes = np.stack(all_codes[emitted_frames:total_frames], axis=0).astype(np.int64, copy=True)
+                    emitted_frames = total_frames
+                    pending_frames = 0
+                else:
+                    context_frames = 0
+                    window = np.empty((0, self.num_code_groups), dtype=np.int64)
+                    codes = np.empty((0, self.num_code_groups), dtype=np.int64)
+                emitted_relative = int(max(emitted_frames - prefix_frames, 0))
+
+                codegen_started = time.time()
+
+                def decode_job():
+                    decode_job_started = time.time()
+                    queue_wait_ms = max(0.0, (decode_job_started - submit_time) * 1000.0)
+                    if new_frames > 0:
+                        decode_started = time.time()
+                        audio = self.decode_stream_window(
+                            window,
+                            context_frames=context_frames,
+                            new_frames=new_frames,
+                            chunk_frames=preferred_chunk_frames,
+                            left_context_frames=left_context_frames,
+                        )
+                        decode_ms = (time.time() - decode_started) * 1000.0
+                        decode_info = dict(getattr(self, "last_stream_decode_info", {}) or {})
+                        decode_ms = float(decode_info.get("decode_ms", decode_ms))
+                    else:
+                        audio = np.zeros((0,), dtype=np.float32)
+                        decode_ms = 0.0
+                        decode_info = {"decode_path": "none", "fallback": False}
+
+                    audio_ms = (float(audio.shape[0]) / float(self.sample_rate) * 1000.0) if audio.size else 0.0
+                    effective_compute_ms = max(codegen_ms, decode_ms)
+                    rtf = (effective_compute_ms / audio_ms) if audio_ms > 0 else 0.0
+                    queue_hint_ms = max(0.0, audio_ms - effective_compute_ms)
+                    producer_lag_ms = max(0.0, codegen_ms - audio_ms)
+                    return StreamChunk(
+                        index=current_index,
+                        audio=audio,
+                        sample_rate=self.sample_rate,
+                        codes=codes,
+                        is_final=is_final,
+                        timings={
+                            **self.timings.snapshot(emitted_relative),
+                            **decode_info,
+                            "codegen_ms": codegen_ms,
+                            "decode_ms": decode_ms,
+                            "chunk_compute_ms": effective_compute_ms,
+                            "chunk_audio_ms": audio_ms,
+                            "rtf": rtf,
+                            "queue_hint_ms": queue_hint_ms,
+                            "queue_wait_ms": queue_wait_ms,
+                            "producer_lag_ms": producer_lag_ms,
+                            "strategy": strategy,
+                            "initial_chunk_frames": int(initial_chunk_frames),
+                            "configured_chunk_frames": int(chunk_frames),
+                            "pipeline_decode": True,
+                            "chunk_frames": int(codes.shape[0]),
+                            "emitted_frames": emitted_relative,
+                            "prefix_frames": int(prefix_frames),
+                            "is_final": bool(is_final),
+                        },
+                    )
+
+                return decode_job
+
+            def drain_ready(wait: bool = False):
+                while pending and (wait or pending[0].done()):
+                    out_queue.put(pending.popleft().result())
+
+            def current_target_frames() -> int:
+                return initial_chunk_frames if chunk_index == 0 else chunk_frames
+
+            try:
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="qwen3_tts_decode") as executor:
+                    for code in code_iter:
+                        frame = np.asarray(code, dtype=np.int64).reshape(-1)
+                        if frame.shape[0] != self.num_code_groups:
+                            raise ValueError(f"stream code frame must have {self.num_code_groups} code groups")
+                        all_codes.append(frame)
+                        pending_frames += 1
+                        drain_ready(False)
+
+                        if pending_frames >= current_target_frames():
+                            future = executor.submit(build_decode_job(False))
+                            pending.append(future)
+                            if chunk_index == 1:
+                                out_queue.put(future.result())
+                                pending.pop()
+                            elif len(pending) >= 2:
+                                drain_ready(True)
+
+                    if pending_frames > 0:
+                        pending.append(executor.submit(build_decode_job(True)))
+                    else:
+                        pending.append(executor.submit(build_decode_job(True)))
+                    drain_ready(True)
+            except Exception as exc:
+                out_queue.put(exc)
+            finally:
+                out_queue.put(sentinel)
+
+        thread = threading.Thread(target=producer, name="qwen3_tts_stream_producer", daemon=True)
+        thread.start()
+        while True:
+            item = out_queue.get()
+            if item is sentinel:
+                break
+            if isinstance(item, Exception):
+                thread.join(timeout=0.1)
+                raise item
+            yield item
+        thread.join(timeout=0.1)
+
+    def stream_voice_design(
+        self,
+        text,
+        instruct,
+        language=None,
+        chunk_frames: int | None = None,
+        left_context_frames: int | None = None,
+        initial_chunk_frames: int | None = None,
+        chunk_strategy: str | None = None,
+        max_new_tokens: int = 512,
+        min_new_tokens: int = 2,
+        repetition_penalty: float = 1.05,
+        max_prompt_tokens: int = 512,
+        progress_interval: int = 8,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+    ):
+        codes = self.generate_codes_iter(
+            text=self._ensure_scalar(text, "text"),
+            instruct=self._ensure_scalar(instruct, "instruct") or "",
+            language=self._ensure_scalar(language if language is not None else "Auto", "language"),
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            repetition_penalty=repetition_penalty,
+            max_prompt_tokens=max_prompt_tokens,
+            progress_interval=progress_interval,
+            do_sample=do_sample,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+        )
+        yield from self.stream_decode_codes(
+            codes,
+            chunk_frames=chunk_frames,
+            left_context_frames=left_context_frames,
+            initial_chunk_frames=initial_chunk_frames,
+            chunk_strategy=chunk_strategy,
+        )
+
+    def stream_custom_voice(
+        self,
+        text,
+        speaker,
+        language=None,
+        instruct=None,
+        chunk_frames: int | None = None,
+        left_context_frames: int | None = None,
+        initial_chunk_frames: int | None = None,
+        chunk_strategy: str | None = None,
+        max_new_tokens: int = 512,
+        min_new_tokens: int = 2,
+        repetition_penalty: float = 1.05,
+        max_prompt_tokens: int = 512,
+        progress_interval: int = 8,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+    ):
+        codes = self.generate_codes_iter(
+            text=self._ensure_scalar(text, "text"),
+            instruct=self._ensure_scalar(instruct if instruct is not None else "", "instruct") or "",
+            language=self._ensure_scalar(language if language is not None else "Auto", "language"),
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            repetition_penalty=repetition_penalty,
+            max_prompt_tokens=max_prompt_tokens,
+            progress_interval=progress_interval,
+            speaker=self._ensure_scalar(speaker, "speaker"),
+            do_sample=do_sample,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+        )
+        yield from self.stream_decode_codes(
+            codes,
+            chunk_frames=chunk_frames,
+            left_context_frames=left_context_frames,
+            initial_chunk_frames=initial_chunk_frames,
+            chunk_strategy=chunk_strategy,
+        )
+
+    def stream_voice_clone(
+        self,
+        text,
+        language=None,
+        ref_audio=None,
+        ref_text=None,
+        x_vector_only_mode: bool = False,
+        voice_clone_prompt=None,
+        chunk_frames: int | None = None,
+        left_context_frames: int | None = None,
+        initial_chunk_frames: int | None = None,
+        chunk_strategy: str | None = None,
+        max_new_tokens: int = 512,
+        min_new_tokens: int = 2,
+        repetition_penalty: float = 1.05,
+        max_prompt_tokens: int = 512,
+        progress_interval: int = 8,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+    ):
+        text = self._ensure_scalar(text, "text")
+        language = self._ensure_scalar(language if language is not None else "Auto", "language")
+        if voice_clone_prompt is None:
+            if ref_audio is None:
+                raise ValueError("either voice_clone_prompt or ref_audio is required")
+            prompt = self.create_voice_clone_prompt(ref_audio, ref_text=ref_text, x_vector_only_mode=x_vector_only_mode)[0]
+        else:
+            prompt = self._normalize_voice_clone_prompt(voice_clone_prompt, 1)[0]
+        item_ref_text = prompt.ref_text if prompt.ref_text is not None else ref_text
+        codes = self.generate_codes_iter(
+            text=text,
+            instruct="",
+            language=language,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            repetition_penalty=repetition_penalty,
+            max_prompt_tokens=max_prompt_tokens,
+            progress_interval=progress_interval,
+            voice_clone_prompt=prompt,
+            ref_text=item_ref_text,
+            do_sample=do_sample,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+        )
+        prefix = np.asarray(prompt.ref_code, dtype=np.int64) if prompt.ref_code is not None else None
+        yield from self.stream_decode_codes(
+            codes,
+            prefix_codes=prefix,
+            chunk_frames=chunk_frames,
+            left_context_frames=left_context_frames,
+            initial_chunk_frames=initial_chunk_frames,
+            chunk_strategy=chunk_strategy,
+        )
+
+    def prewarm_streaming(
+        self,
+        text: str = "你好，这是一次流式预热。",
+        instruct: str = "用自然、清晰的中文女声朗读。",
+        language: str = "Chinese",
+        chunk_frames: int | None = None,
+        initial_chunk_frames: int | None = None,
+        chunk_strategy: str | None = None,
+        left_context_frames: int | None = None,
+        max_new_tokens: int | None = None,
+        preload_buckets: str = "warmup",
+        run_generation: bool = True,
+    ) -> dict:
+        started = time.time()
+        stream_config = self._resolve_stream_chunk_config(
+            chunk_strategy=chunk_strategy,
+            chunk_frames=chunk_frames,
+            initial_chunk_frames=initial_chunk_frames,
+            left_context_frames=left_context_frames,
+        )
+        strategy = stream_config["strategy"]
+        initial_chunk_frames = int(stream_config["initial_chunk_frames"])
+        chunk_frames = int(stream_config["chunk_frames"])
+        left_context_frames = int(stream_config["left_context_frames"])
+        max_new_tokens = int(max_new_tokens or (initial_chunk_frames + chunk_frames))
+        status = {
+            "enabled": True,
+            "status": "running",
+            "mode": self.mode,
+            "cache_step": self.cache_step,
+            "chunk_strategy": strategy,
+            "initial_chunk_frames": initial_chunk_frames,
+            "chunk_frames": chunk_frames,
+            "left_context_frames": left_context_frames,
+            "preload_buckets": preload_buckets,
+            "compiled_buckets": [],
+            "bucket_errors": {},
+            "compiled_stream_decoders": [],
+            "stream_decoder_errors": {},
+            "streaming_decoder_available": bool(self.streaming_decoder_graphs_by_context),
+        }
+
+        def compile_stream_candidates(label: str, candidates: list[tuple[int, int]]):
+            for context, chunk in candidates:
+                try:
+                    self._get_stream_decoder(context, chunk)
+                    item = {"context_frames": int(context), "chunk_frames": int(chunk), "label": label}
+                    if item not in status["compiled_stream_decoders"]:
+                        status["compiled_stream_decoders"].append(item)
+                    return True
+                except Exception as exc:
+                    status["stream_decoder_errors"][f"{label}:c{context}_t{chunk}"] = str(exc)
+            return False
+
+        compile_stream_candidates(
+            "initial",
+            self._stream_decoder_key_candidates(
+                context_frames=0,
+                new_frames=initial_chunk_frames,
+                preferred_chunk_frames=initial_chunk_frames,
+                left_context_frames=left_context_frames,
+            ),
+        )
+        compile_stream_candidates(
+            "steady",
+            self._stream_decoder_key_candidates(
+                context_frames=min(initial_chunk_frames, left_context_frames),
+                new_frames=chunk_frames,
+                preferred_chunk_frames=chunk_frames,
+                left_context_frames=left_context_frames,
+            ),
+        )
+
+        if self.mode == "cache":
+            available_buckets = self.fused_cache_bucket_graphs if self.cache_step == "fused" else self.cache_bucket_graphs
+            bucket_mode = str(preload_buckets or "warmup").strip().lower()
+            if bucket_mode == "all":
+                buckets = list(available_buckets)
+            elif bucket_mode in {"", "none", "off", "false", "0"}:
+                buckets = []
+            elif bucket_mode in {"warmup", "auto", "required", "first"}:
+                buckets = [min(available_buckets)] if available_buckets else []
+            else:
+                requested = [int(item.strip()) for item in bucket_mode.split(",") if item.strip()]
+                buckets = [bucket for bucket in requested if bucket in available_buckets]
+            for bucket in buckets:
+                try:
+                    if self.cache_step == "fused":
+                        self.get_fused_cache_step(bucket)
+                    else:
+                        self.get_talker_stateful(bucket)
+                    status["compiled_buckets"].append(int(bucket))
+                except Exception as exc:
+                    status["bucket_errors"][str(bucket)] = str(exc)
+                    break
+
+        if self.decoder_graphs:
+            try:
+                self.decode(np.zeros((1, self.num_code_groups), dtype=np.int64))
+                status["fallback_decoder_compiled"] = True
+            except Exception as exc:
+                status["fallback_decoder_error"] = str(exc)
+
+        if run_generation:
+            try:
+                chunks = list(
+                    self.stream_voice_design(
+                        text=text,
+                        instruct=instruct,
+                        language=language,
+                        chunk_frames=chunk_frames,
+                        initial_chunk_frames=initial_chunk_frames,
+                        chunk_strategy=strategy,
+                        left_context_frames=left_context_frames,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=1,
+                        progress_interval=0,
+                    )
+                )
+                status["warmup_chunks"] = len(chunks)
+            except Exception as exc:
+                status["warmup_generation_error"] = str(exc)
+                status["warmup_chunks"] = 0
+        else:
+            status["warmup_chunks"] = 0
+        has_errors = any(
+            [
+                status["bucket_errors"],
+                status["stream_decoder_errors"],
+                status.get("fallback_decoder_error"),
+                status.get("warmup_generation_error"),
+            ]
+        )
+        status["status"] = "ready_with_errors" if has_errors else "ready"
+        status["elapsed"] = time.time() - started
+        self.prewarm_status = status
+        return status
+
     def decode(self, codes: np.ndarray):
         token_count = int(codes.shape[0])
         available = sorted(self.decoder_graphs)
@@ -1536,7 +2875,7 @@ class OpenVINOQwen3TTS:
                 self.core,
                 self.ir_dir / self.decoder_graphs[bucket],
                 self.decoder_device,
-                self.ir_dir / "ov_cache",
+                self.cache_dir,
                 self.allow_cpu_fallback,
                 self.ov_profiler.enabled,
                 self.precision_hint,
@@ -1611,6 +2950,9 @@ def main() -> None:
     parser.add_argument("--cache-step", default="split", choices=["split", "fused"])
     parser.add_argument("--graph-variant", default="fp16")
     parser.add_argument("--precision-hint", default="f16", choices=["f16", "f32"])
+    parser.add_argument("--ov-cache-dir", default=None)
+    parser.add_argument("--ov-cache-mode", default="optimize_speed", choices=["optimize_speed", "optimize_size"])
+    parser.add_argument("--disable-ov-cache", action="store_true")
     parser.add_argument("--gpu-performance-profile", default="default", choices=["default", "latency-high", "throughput"])
     parser.add_argument("--performance-hint", default="default", choices=["default", "latency", "throughput"])
     parser.add_argument("--num-streams", type=int, default=None)
@@ -1661,6 +3003,9 @@ def main() -> None:
         graph_variant=args.graph_variant,
         precision_hint=args.precision_hint,
         compile_config=compile_config,
+        ov_cache_dir=args.ov_cache_dir,
+        ov_cache_mode=args.ov_cache_mode,
+        disable_ov_cache=args.disable_ov_cache,
         calibration_dir=args.calibration_dir,
         calibration_limit=args.calibration_limit,
         profile=args.profile,
@@ -1726,6 +3071,9 @@ def main() -> None:
             graph_variant=args.compare_graph_variant,
             precision_hint=args.precision_hint,
             compile_config=compile_config,
+            ov_cache_dir=args.ov_cache_dir,
+            ov_cache_mode=args.ov_cache_mode,
+            disable_ov_cache=args.disable_ov_cache,
             calibration_dir=None,
             profile=False,
             ov_profile=False,
