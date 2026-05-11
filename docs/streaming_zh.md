@@ -12,6 +12,8 @@
 ```python
 from qwen3_tts_ov import OpenVINOQwen3TTS
 
+# 这里的路径必须是包含 manifest.json 的导出目录。
+# 如果只使用本机旧 VoiceDesign IR，可临时改成 "openvino_full"。
 tts = OpenVINOQwen3TTS.from_ir("openvino/voice_design", device="GPU", mode="cache", cache_step="fused")
 
 for chunk in tts.stream_voice_design(
@@ -63,8 +65,10 @@ uv pip install -e ".[server]"
 首次启动前建议先填充 OpenVINO 编译缓存：
 
 ```bash
+export VOICE_DESIGN_IR=openvino/voice_design
+test -f "$VOICE_DESIGN_IR/manifest.json"
 uv run python -m qwen3_tts_ov cache-warmup \
-  --ir-dir openvino/voice_design \
+  --ir-dir "$VOICE_DESIGN_IR" \
   --device GPU \
   --mode cache \
   --cache-step fused \
@@ -76,7 +80,7 @@ uv run python -m qwen3_tts_ov cache-warmup \
 启动：
 
 ```bash
-uv run qwen3-tts-ov serve \
+uv run python -m qwen3_tts_ov serve \
   --model-root openvino \
   --host 127.0.0.1 \
   --port 17860 \
@@ -92,9 +96,21 @@ uv run qwen3-tts-ov serve \
 
 ```text
 openvino/
-  voice_design/
-  custom_voice/
-  base/
+  voice_design/manifest.json
+  custom_voice/manifest.json
+  base/manifest.json
+```
+
+如果当前只有单个旧 VoiceDesign IR，例如 `openvino_full/manifest.json`，可以临时使用：
+
+```bash
+uv run python -m qwen3_tts_ov serve \
+  --ir-dir openvino_full \
+  --host 127.0.0.1 \
+  --port 17860 \
+  --preload-modes voice_design \
+  --preload-buckets warmup \
+  --warmup-strategy low_latency
 ```
 
 浏览器测试页：

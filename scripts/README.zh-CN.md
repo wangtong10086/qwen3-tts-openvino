@@ -4,8 +4,9 @@
 
 ```bash
 uv run python -m qwen3_tts_ov --help
-uv run qwen3-tts-ov --help
 ```
+
+如果已执行 `uv pip install -e .`，也可以使用 `uv run qwen3-tts-ov --help`。
 
 本目录只保留开发和实验辅助脚本：
 

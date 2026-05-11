@@ -1315,7 +1315,7 @@ wheels = [
 [[package]]
 name = "qwen3-tts-openvino"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "librosa" },
     { name = "numpy" },

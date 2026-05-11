@@ -10,8 +10,13 @@ import soundfile as sf
 from .runtime import OpenVINOQwen3TTS
 
 
-def add_runtime_args(parser):
-    parser.add_argument("--ir-dir", default="openvino/voice_design")
+def add_runtime_args(
+    parser,
+    default_ir_dir: str | None = "openvino/voice_design",
+    include_generation: bool = True,
+    include_output: bool = True,
+):
+    parser.add_argument("--ir-dir", default=default_ir_dir)
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
     parser.add_argument("--mode", default="cache", choices=["no-cache", "cache", "fast-cache", "fused-no-cache"])
@@ -23,6 +28,8 @@ def add_runtime_args(parser):
     parser.add_argument("--disable-ov-cache", action="store_true")
     parser.add_argument("--allow-cpu-fallback", action="store_true")
     parser.add_argument("--profile", action="store_true")
+    if not include_generation:
+        return
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--min-new-tokens", type=int, default=2)
     parser.add_argument("--repetition-penalty", type=float, default=1.05)
@@ -32,6 +39,8 @@ def add_runtime_args(parser):
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=0.9)
+    if not include_output:
+        return
     parser.add_argument("--output", default="outputs/openvino.wav")
     parser.add_argument("--skip-decode", action="store_true")
 
@@ -301,7 +310,7 @@ def run_serve(args):
     from .server import serve
 
     serve(
-        model_root=args.model_root,
+        model_root=args.ir_dir or args.model_root,
         host=args.host,
         port=args.port,
         device=args.device,
@@ -449,7 +458,7 @@ def main(argv=None):
     sclone.set_defaults(func=run_stream_voice_clone)
 
     serve_parser = sub.add_parser("serve")
-    add_runtime_args(serve_parser)
+    add_runtime_args(serve_parser, default_ir_dir=None, include_generation=False, include_output=False)
     serve_parser.add_argument("--model-root", default="openvino")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=17860)
@@ -461,7 +470,14 @@ def main(argv=None):
     serve_parser.set_defaults(func=run_serve)
 
     args = parser.parse_args(argv)
-    args.func(args)
+    try:
+        args.func(args)
+    except (FileNotFoundError, ValueError) as exc:
+        message = str(exc)
+        if "OpenVINO IR manifest not found" in message:
+            print(f"error: {message}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        raise
 
 
 if __name__ == "__main__":

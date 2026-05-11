@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from qwen3_tts_ov.cache import build_ov_cache_config, default_ov_cache_root, normalize_ov_cache_mode, resolve_ov_cache_dir
 from qwen3_tts_ov.cache_warmup import collect_warmup_tasks
 
@@ -94,3 +96,8 @@ def test_collect_warmup_tasks_uses_strategy_stream_decoders(tmp_path):
     assert "stream:c0_t8" in labels
     assert "stream:c25_t12" in labels
     assert "bucket:fused_cache_step_buckets:128" in labels
+
+
+def test_collect_warmup_tasks_reports_missing_manifest(tmp_path):
+    with pytest.raises(FileNotFoundError, match="OpenVINO IR manifest not found"):
+        collect_warmup_tasks(tmp_path / "missing-ir")

@@ -36,6 +36,18 @@ uv run python -m qwen3_tts_ov --help
 uv pip install -e .
 ```
 
+安装后可以使用 console script：
+
+```bash
+uv run qwen3-tts-ov --help
+```
+
+未安装项目包时，请使用本文档默认采用的模块入口：
+
+```bash
+uv run python -m qwen3_tts_ov --help
+```
+
 需要导出模型时安装 export 依赖：
 
 ```bash
@@ -53,6 +65,20 @@ uv run modelscope download \
 ```
 
 CustomVoice 和 Base/VoiceClone 需要分别下载对应模型目录。
+
+## IR 路径约定
+
+源码仓库不包含 OpenVINO IR。所有 `--ir-dir` 都必须指向一个已经导出的目录，并且该目录下必须存在 `manifest.json`。
+
+推荐新导出目录：
+
+```text
+openvino/voice_design/manifest.json
+openvino/custom_voice/manifest.json
+openvino/base/manifest.json
+```
+
+如果你当前机器上只有旧的本地产物 `openvino_full/manifest.json`，可以先用它验证 VoiceDesign，把命令中的 `openvino/voice_design` 替换为 `openvino_full`。长期建议重新导出到 `openvino/voice_design`，这样 sidecar 的多模型目录布局更清晰。
 
 ## 导出 OpenVINO IR
 
@@ -161,8 +187,10 @@ JSONL 中每行使用 `mode` 声明推理模式。实际运行时应让 `--ir-di
 首次部署或更新 IR 后，建议先填充 OpenVINO 编译缓存：
 
 ```bash
+export VOICE_DESIGN_IR=openvino/voice_design
+test -f "$VOICE_DESIGN_IR/manifest.json"
 uv run python -m qwen3_tts_ov cache-warmup \
-  --ir-dir openvino/voice_design \
+  --ir-dir "$VOICE_DESIGN_IR" \
   --device GPU \
   --mode cache \
   --cache-step fused \
@@ -191,7 +219,7 @@ uv run python -m qwen3_tts_ov stream voice-design \
 
 ```bash
 uv pip install -e ".[server]"
-uv run qwen3-tts-ov serve \
+uv run python -m qwen3_tts_ov serve \
   --model-root openvino \
   --host 127.0.0.1 \
   --port 17860 \
@@ -208,6 +236,16 @@ http://127.0.0.1:17860/
 
 页面会通过 WebSocket `/v1/tts/stream` 接收 `pcm_s16le` 音频块并实时播放，也可以下载拼接后的 WAV。
 服务默认会预热 VoiceDesign；如需跳过预热可加 `--no-warmup`。
+
+如果只想临时使用单个 VoiceDesign IR 目录，也可以直接用 `--ir-dir` 指向该 IR，例如：
+
+```bash
+uv run python -m qwen3_tts_ov serve \
+  --ir-dir openvino_full \
+  --host 127.0.0.1 \
+  --port 17860 \
+  --preload-modes voice_design
+```
 
 HTTP NDJSON 流式接口：
 

@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from .manifest import manifest_missing_message
 from .runtime import DEFAULT_STREAM_CHUNK_STRATEGIES, OpenVINOQwen3TTS
 from .web_client import WEB_CLIENT_HTML
 
@@ -210,9 +211,18 @@ def create_app(
         "runtimes": {},
     }
 
+    def resolve_mode_ir_dir(mode_name: str) -> Path:
+        model_dir_name = MODE_DIR[mode_name]
+        nested = model_root / model_dir_name
+        if (nested / "manifest.json").exists():
+            return nested
+        if (model_root / "manifest.json").exists():
+            return model_root
+        raise ValueError(manifest_missing_message(nested))
+
     def runtime_for_ir_dir(ir_dir: Path, do_sample: bool = False):
-        if not ir_dir.exists():
-            raise ValueError(f"IR directory does not exist: {ir_dir}")
+        if not (ir_dir / "manifest.json").exists():
+            raise ValueError(manifest_missing_message(ir_dir))
         effective_cache_step = "split" if do_sample and mode == "cache" and cache_step == "fused" else cache_step
         key = (str(ir_dir.resolve()), effective_cache_step, str(ov_cache_dir or "auto"), ov_cache_mode, bool(disable_ov_cache))
         if key not in runtimes:
@@ -233,7 +243,7 @@ def create_app(
 
     def get_runtime(request_mode: str, do_sample: bool = False):
         normalized = normalize_mode(request_mode)
-        ir_dir = model_root / MODE_DIR[normalized]
+        ir_dir = resolve_mode_ir_dir(normalized)
         return normalized, runtime_for_ir_dir(ir_dir, do_sample=do_sample)
 
     @app.on_event("startup")
@@ -244,15 +254,11 @@ def create_app(
         app.state.warmup["started_at"] = time.time()
         for preload_mode in parse_csv(preload_modes):
             key = preload_mode.replace("-", "_")
-            model_dir_name = MODE_DIR.get(key)
-            if model_dir_name is None:
+            if key not in MODE_DIR:
                 app.state.warmup["errors"][preload_mode] = f"unsupported preload mode: {preload_mode}"
                 continue
-            ir_dir = model_root / model_dir_name
-            if not ir_dir.exists():
-                app.state.warmup["errors"][preload_mode] = f"IR directory does not exist: {ir_dir}"
-                continue
             try:
+                ir_dir = resolve_mode_ir_dir(key)
                 runtime = runtime_for_ir_dir(ir_dir, do_sample=False)
                 status = runtime.prewarm_streaming(
                     text=warmup_text,
@@ -427,8 +433,12 @@ def create_app(
         voices = []
         voice_details = []
         seen = set()
+        manifest_paths = []
+        if (model_root / "manifest.json").exists():
+            manifest_paths.append(("direct", model_root / "manifest.json"))
         for model_name in sorted(set(MODE_DIR.values())):
-            manifest_path = model_root / model_name / "manifest.json"
+            manifest_paths.append((model_name, model_root / model_name / "manifest.json"))
+        for model_name, manifest_path in manifest_paths:
             if not manifest_path.exists():
                 continue
             try:

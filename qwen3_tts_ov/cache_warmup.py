@@ -10,6 +10,7 @@ from pathlib import Path
 import openvino as ov
 
 from .cache import merge_compile_config_with_cache_mode, normalize_ov_cache_mode, resolve_ov_cache_dir
+from .manifest import load_manifest
 from .runtime import compile_model
 
 
@@ -124,8 +125,7 @@ def collect_warmup_tasks(
     warmup_strategy: str = "low_latency",
 ) -> tuple[list[WarmupTask], dict]:
     ir_dir = Path(ir_dir)
-    with open(ir_dir / "manifest.json", "r", encoding="utf-8") as f:
-        manifest = json.load(f)
+    manifest = load_manifest(ir_dir)
     effective_mode, effective_kernel, effective_step, effective_variant = effective_runtime_options(
         mode,
         cache_kernel,
@@ -274,8 +274,7 @@ def compile_warmup_task(
 
 def run_single_task(args: argparse.Namespace) -> dict:
     ir_dir = Path(args.ir_dir)
-    with open(ir_dir / "manifest.json", "r", encoding="utf-8") as f:
-        manifest = json.load(f)
+    manifest = load_manifest(ir_dir)
     task = WarmupTask(**json.loads(args.single_task_json))
     compile_config = json.loads(args.compile_config_json or "{}")
     return compile_warmup_task(
