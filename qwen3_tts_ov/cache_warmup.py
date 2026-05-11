@@ -10,7 +10,7 @@ from pathlib import Path
 import openvino as ov
 
 from .cache import merge_compile_config_with_cache_mode, normalize_ov_cache_mode, resolve_ov_cache_dir
-from .manifest import load_manifest
+from .manifest import load_manifest, resolve_ir_dir
 from .runtime import compile_model
 
 
@@ -124,7 +124,7 @@ def collect_warmup_tasks(
     stream_decoders: str = "strategy",
     warmup_strategy: str = "low_latency",
 ) -> tuple[list[WarmupTask], dict]:
-    ir_dir = Path(ir_dir)
+    ir_dir = resolve_ir_dir(ir_dir, fallback_to_local_voice_design=True, warn=True)
     manifest = load_manifest(ir_dir)
     effective_mode, effective_kernel, effective_step, effective_variant = effective_runtime_options(
         mode,
@@ -273,7 +273,7 @@ def compile_warmup_task(
 
 
 def run_single_task(args: argparse.Namespace) -> dict:
-    ir_dir = Path(args.ir_dir)
+    ir_dir = resolve_ir_dir(args.ir_dir, fallback_to_local_voice_design=True, warn=True)
     manifest = load_manifest(ir_dir)
     task = WarmupTask(**json.loads(args.single_task_json))
     compile_config = json.loads(args.compile_config_json or "{}")
@@ -334,6 +334,7 @@ def subprocess_base_args(args: argparse.Namespace, compile_config: dict) -> list
 
 
 def run_cache_warmup(args: argparse.Namespace, compile_config: dict) -> dict:
+    args.ir_dir = resolve_ir_dir(args.ir_dir, fallback_to_local_voice_design=True, warn=True)
     tasks, manifest = collect_warmup_tasks(
         args.ir_dir,
         graphs=args.graphs,

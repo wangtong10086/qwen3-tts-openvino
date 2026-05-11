@@ -500,7 +500,14 @@ WEB_CLIENT_HTML = r"""<!doctype html>
         const res = await fetch("/health", { cache: "no-store" });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        setHealth(true, `服务正常 ${data.model_root}`);
+        const errors = data.warmup && data.warmup.errors ? data.warmup.errors : {};
+        const errorKeys = Object.keys(errors);
+        if (errorKeys.length) {
+          setHealth(false, `预热异常 ${data.warmup.status || ""}`);
+          log(`health warmup errors: ${JSON.stringify(errors)}`);
+        } else {
+          setHealth(true, `服务正常 ${data.model_root}`);
+        }
       } catch (err) {
         setHealth(false, "服务未连接");
       }
@@ -613,12 +620,16 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       }
 
       append(arrayBuffer) {
+        if (this.context.state !== "running") {
+          this.context.resume().catch(() => {});
+        }
         const floats = resampleLinear(pcm16ToFloat32(arrayBuffer), this.inputSampleRate, this.outputSampleRate);
         this.queue.push(floats);
         this.queuedSamples += floats.length;
         if (!this.started && this.queuedSamples >= this.targetBufferSamples) {
           this.started = true;
           this.underrunActive = false;
+          if (this.callbacks.onStarted) this.callbacks.onStarted();
         }
         return this.queueSeconds();
       }
@@ -688,6 +699,9 @@ WEB_CLIENT_HTML = r"""<!doctype html>
             firstAudibleAt = performance.now();
             updateMetrics(false);
           }
+        },
+        onStarted: () => {
+          els.playState.textContent = "播放中";
         },
         onUnderrun: () => {
           if (!streamFinal && chunkCount > 0) {
@@ -764,6 +778,9 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       player = new PcmQueuePlayer(sampleRate, targetBufferSec, playerCallbacks());
       audioContext = player.context;
       await player.resume();
+      if (audioContext.state !== "running") {
+        log(`AudioContext 状态=${audioContext.state}，如果浏览器阻止播放，请再次点击开始合成。`);
+      }
       const payload = requestPayload();
       log(`连接 ${els.wsUrl.value}`);
       ws = new WebSocket(els.wsUrl.value);

@@ -4,6 +4,7 @@ import pytest
 
 from qwen3_tts_ov.cache import build_ov_cache_config, default_ov_cache_root, normalize_ov_cache_mode, resolve_ov_cache_dir
 from qwen3_tts_ov.cache_warmup import collect_warmup_tasks
+from qwen3_tts_ov.manifest import resolve_ir_dir
 
 
 def test_default_ov_cache_root_uses_xdg_cache_home(monkeypatch, tmp_path):
@@ -101,3 +102,27 @@ def test_collect_warmup_tasks_uses_strategy_stream_decoders(tmp_path):
 def test_collect_warmup_tasks_reports_missing_manifest(tmp_path):
     with pytest.raises(FileNotFoundError, match="OpenVINO IR manifest not found"):
         collect_warmup_tasks(tmp_path / "missing-ir")
+
+
+def test_default_voice_design_ir_falls_back_to_legacy_openvino_full(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    legacy = tmp_path / "openvino_full"
+    legacy.mkdir()
+    manifest = {
+        "tts_model_type": "voice_design",
+        "graphs": {
+            "text_embedding": "text_embedding.xml",
+            "codec_embedding": "codec_embedding.xml",
+            "code_frame_embedding": "code_frame_embedding.xml",
+        },
+    }
+    with open(legacy / "manifest.json", "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle)
+
+    assert resolve_ir_dir("openvino/voice_design", fallback_to_local_voice_design=True) == legacy.relative_to(tmp_path)
+    tasks, _ = collect_warmup_tasks("openvino/voice_design", graphs="core")
+    assert [task.label for task in tasks] == [
+        "core:text_embedding",
+        "core:codec_embedding",
+        "core:code_frame_embedding",
+    ]

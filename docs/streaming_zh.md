@@ -65,8 +65,11 @@ uv pip install -e ".[server]"
 首次启动前建议先填充 OpenVINO 编译缓存：
 
 ```bash
-export VOICE_DESIGN_IR=openvino/voice_design
-test -f "$VOICE_DESIGN_IR/manifest.json"
+VOICE_DESIGN_IR=${VOICE_DESIGN_IR:-openvino/voice_design}
+if [ ! -f "$VOICE_DESIGN_IR/manifest.json" ] && [ -f openvino_full/manifest.json ]; then
+  VOICE_DESIGN_IR=openvino_full
+fi
+test -f "$VOICE_DESIGN_IR/manifest.json" || { echo "未找到 OpenVINO IR，请先导出模型。"; exit 1; }
 uv run python -m qwen3_tts_ov cache-warmup \
   --ir-dir "$VOICE_DESIGN_IR" \
   --device GPU \
@@ -91,6 +94,7 @@ uv run python -m qwen3_tts_ov serve \
 
 服务默认会预热当前策略所需的首块/稳态 decoder 和最小 cache bucket。`--preload-buckets all` 会尝试常驻编译所有 cache bucket，iGPU 显存/共享内存较小时不建议作为默认值。如果只想快速启动服务，可加 `--no-warmup`。
 如果需要提前编译所有 bucket 到磁盘，请使用 `cache-warmup --preload-buckets all --stream-decoders all`，不要把它作为 sidecar resident warmup。
+如果 `openvino/voice_design` 尚未导出，但当前目录有旧的 `openvino_full/manifest.json`，服务端会对 VoiceDesign 自动回退到 `openvino_full`。
 
 目录约定：
 

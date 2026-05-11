@@ -187,8 +187,11 @@ JSONL 中每行使用 `mode` 声明推理模式。实际运行时应让 `--ir-di
 首次部署或更新 IR 后，建议先填充 OpenVINO 编译缓存：
 
 ```bash
-export VOICE_DESIGN_IR=openvino/voice_design
-test -f "$VOICE_DESIGN_IR/manifest.json"
+VOICE_DESIGN_IR=${VOICE_DESIGN_IR:-openvino/voice_design}
+if [ ! -f "$VOICE_DESIGN_IR/manifest.json" ] && [ -f openvino_full/manifest.json ]; then
+  VOICE_DESIGN_IR=openvino_full
+fi
+test -f "$VOICE_DESIGN_IR/manifest.json" || { echo "未找到 OpenVINO IR，请先导出模型。"; exit 1; }
 uv run python -m qwen3_tts_ov cache-warmup \
   --ir-dir "$VOICE_DESIGN_IR" \
   --device GPU \
@@ -200,6 +203,7 @@ uv run python -m qwen3_tts_ov cache-warmup \
 ```
 
 缓存默认写入用户缓存目录，而不是 IR 目录。更多细节见 [docs/cache_zh.md](docs/cache_zh.md)。
+如果 `openvino/voice_design` 还不存在，但当前目录存在旧的 `openvino_full/manifest.json`，runtime 会自动回退到 `openvino_full`。
 
 调试 CLI 会按 chunk 写出 raw PCM，并把拼接结果写为 WAV：
 

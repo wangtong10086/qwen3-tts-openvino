@@ -7,7 +7,14 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from .manifest import manifest_missing_message
+from .manifest import (
+    DEFAULT_VOICE_DESIGN_IR_DIR,
+    has_manifest,
+    load_manifest,
+    manifest_missing_message,
+    path_text,
+    resolve_ir_dir,
+)
 from .runtime import DEFAULT_STREAM_CHUNK_STRATEGIES, OpenVINOQwen3TTS
 from .web_client import WEB_CLIENT_HTML
 
@@ -211,17 +218,35 @@ def create_app(
         "runtimes": {},
     }
 
+    def manifest_supports_mode(ir_dir: Path, mode_name: str) -> bool:
+        try:
+            manifest = load_manifest(ir_dir)
+        except Exception:
+            return False
+        model_type = str(manifest.get("tts_model_type") or "").replace("-", "_").lower()
+        if mode_name == "voice_design":
+            return model_type in {"", "voice_design"}
+        if mode_name == "custom_voice":
+            return model_type == "custom_voice"
+        if mode_name == "voice_clone":
+            return model_type in {"base", "voice_clone"}
+        return False
+
     def resolve_mode_ir_dir(mode_name: str) -> Path:
         model_dir_name = MODE_DIR[mode_name]
         nested = model_root / model_dir_name
-        if (nested / "manifest.json").exists():
+        if has_manifest(nested):
             return nested
-        if (model_root / "manifest.json").exists():
+        if has_manifest(model_root) and manifest_supports_mode(model_root, mode_name):
             return model_root
+        if mode_name == "voice_design" and path_text(model_root) == "openvino":
+            fallback = resolve_ir_dir(DEFAULT_VOICE_DESIGN_IR_DIR, fallback_to_local_voice_design=True, warn=True)
+            if has_manifest(fallback) and fallback != nested:
+                return fallback
         raise ValueError(manifest_missing_message(nested))
 
     def runtime_for_ir_dir(ir_dir: Path, do_sample: bool = False):
-        if not (ir_dir / "manifest.json").exists():
+        if not has_manifest(ir_dir):
             raise ValueError(manifest_missing_message(ir_dir))
         effective_cache_step = "split" if do_sample and mode == "cache" and cache_step == "fused" else cache_step
         key = (str(ir_dir.resolve()), effective_cache_step, str(ov_cache_dir or "auto"), ov_cache_mode, bool(disable_ov_cache))
@@ -434,10 +459,13 @@ def create_app(
         voice_details = []
         seen = set()
         manifest_paths = []
-        if (model_root / "manifest.json").exists():
+        if has_manifest(model_root):
             manifest_paths.append(("direct", model_root / "manifest.json"))
         for model_name in sorted(set(MODE_DIR.values())):
             manifest_paths.append((model_name, model_root / model_name / "manifest.json"))
+        fallback = resolve_ir_dir(DEFAULT_VOICE_DESIGN_IR_DIR, fallback_to_local_voice_design=True)
+        if path_text(model_root) == "openvino" and has_manifest(fallback):
+            manifest_paths.append(("voice_design", fallback / "manifest.json"))
         for model_name, manifest_path in manifest_paths:
             if not manifest_path.exists():
                 continue

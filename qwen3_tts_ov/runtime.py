@@ -24,7 +24,7 @@ import soundfile as sf
 
 from .audio import load_audio, speaker_mel_spectrogram
 from .cache import build_ov_cache_config, merge_compile_config_with_cache_mode, normalize_ov_cache_mode, resolve_ov_cache_dir
-from .manifest import load_manifest
+from .manifest import load_manifest, resolve_ir_dir
 
 
 PRETOKENIZE_REGEX = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
@@ -387,7 +387,7 @@ class OpenVINOQwen3TTS:
         profile: bool = False,
         ov_profile: bool = False,
     ):
-        self.ir_dir = Path(ir_dir)
+        self.ir_dir = resolve_ir_dir(ir_dir, fallback_to_local_voice_design=True, warn=True)
         self.manifest = load_manifest(self.ir_dir)
         self.model_dir = self.manifest["model_dir"]
         self.ids = self.manifest["ids"]
