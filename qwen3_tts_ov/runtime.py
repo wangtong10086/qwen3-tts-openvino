@@ -420,6 +420,8 @@ class OpenVINOQwen3TTS:
         ov_cache_dir: str | Path | None = None,
         ov_cache_mode: str | None = "optimize_speed",
         disable_ov_cache: bool = False,
+        native_codegen: str | None = None,
+        native_pipeline: str | None = None,
         calibration_dir: str | None = None,
         calibration_limit: int = 64,
         profile: bool = False,
@@ -448,6 +450,14 @@ class OpenVINOQwen3TTS:
         self.streaming_decoder_requests = {}
         self.last_stream_decode_info = {}
         self.stream_pipeline_decode = True
+        self.native_codegen_override = None if native_codegen is None else str(native_codegen).strip().lower()
+        self.native_pipeline_override = None if native_pipeline is None else str(native_pipeline).strip().lower()
+        self.paged_kv_enabled = False
+        self.paged_kv_backend = "stateful_bucket"
+        self.paged_kv_unavailable_reason = (
+            "current exported Qwen3-TTS IR uses OpenVINO ReadValue/Assign stateful KV "
+            "instead of GenAI key_cache/value_cache/block_indices inputs"
+        )
         if mode == "fastest":
             fastest = fastest_runtime_defaults()
             codegen_unroll = fastest["codegen_unroll"]
@@ -1082,9 +1092,13 @@ class OpenVINOQwen3TTS:
         return False
 
     def _native_codegen_mode(self) -> str:
+        if self.native_codegen_override is not None:
+            return self.native_codegen_override
         return str(os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN", "")).strip().lower()
 
     def _native_pipeline_mode(self) -> str:
+        if self.native_pipeline_override is not None:
+            return self.native_pipeline_override
         return str(os.environ.get("QWEN3_TTS_OV_NATIVE_PIPELINE", "")).strip().lower()
 
     def _try_generate_codes_native_unroll4_statefulmask(

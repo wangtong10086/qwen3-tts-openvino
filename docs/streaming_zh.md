@@ -75,6 +75,16 @@ http://127.0.0.1:17860/
 
 metadata 中包含 `realtime_profile=fastest`、`chunk_strategy=smooth`、`recommended_playback_buffer_ms` 和当前 graph/native 状态。
 
+## 长文本连续输出
+
+`fastest` profile 的默认短句路径使用 native C++ pipeline 和 `cache96`，用于最低首包延迟。对于超过短句阈值的 VoiceDesign 请求，sidecar 会自动切到单 prompt 连续输出路径：
+
+- 不再把文本拆成多个独立短段，因此语气和上下文不会在段间重置。
+- 优先使用 `int8_sym_fused_cachedsub` + `cache384`，旧 IR 缺少该图时回退到 `int8_sym_fused` + `cache384`；该路径会关闭 native fixed-bucket pipeline。
+- WebSocket/NDJSON 的 metadata 和每个 chunk 的 `timings` 会标记 `continuous_long_output=true`。
+
+当前仓库的已导出 IR 仍是 OpenVINO `ReadValue/Assign` stateful KV，不包含 OpenVINO GenAI `key_cache.*`、`value_cache.*`、`block_indices` 输入，因此还不是 GenAI paged KV。接口会显式返回 `paged_kv=false` 和原因；后续要接入真正 paged KV，需要重新导出/转换 codegen 图，使 KV cache 变为 GenAI continuous batching 可管理的分页 cache 输入。
+
 ## HTTP / OpenAI-compatible API
 
 NDJSON：

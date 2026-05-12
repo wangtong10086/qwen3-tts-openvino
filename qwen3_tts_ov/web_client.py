@@ -860,7 +860,8 @@ WEB_CLIENT_HTML = r"""<!doctype html>
             log(
               `metadata sample_rate=${sampleRate}, format=${data.format}, ` +
               `strategy=${data.chunk_strategy || "-"}, initial=${data.initial_chunk_frames || "-"}, chunk=${data.chunk_frames || "-"}, ` +
-              `profile=${data.realtime_profile || "-"}, variant=${data.graph_variant || "-"}, unroll=${data.codegen_unroll || 1}, schedule=${data.codegen_schedule || "current"}`
+              `profile=${data.realtime_profile || "-"}, variant=${data.graph_variant || "-"}, unroll=${data.codegen_unroll || 1}, schedule=${data.codegen_schedule || "current"}, ` +
+              `continuous=${data.continuous_long_output ? "yes" : "no"}, paged_kv=${data.paged_kv ? "yes" : "no"}`
             );
           } else if (data.type === "final") {
             streamFinal = true;
@@ -886,6 +887,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
               `unroll=${pendingAudioTiming && pendingAudioTiming.codegen_unroll ? pendingAudioTiming.codegen_unroll : 1}, ` +
               `schedule=${pendingAudioTiming && pendingAudioTiming.codegen_schedule ? pendingAudioTiming.codegen_schedule : "current"}, ` +
               `unroll_fallback=${pendingAudioTiming && pendingAudioTiming.unroll_fallback ? "yes" : "no"}, ` +
+              `continuous=${pendingAudioTiming && pendingAudioTiming.continuous_long_output ? "yes" : "no"}, ` +
               `chunk_rtf=${pendingAudioTiming && pendingAudioTiming.rtf ? Number(pendingAudioTiming.rtf).toFixed(2) : "-"}, ` +
               `stream_rtf=${pendingAudioTiming && pendingAudioTiming.stream_rtf ? Number(pendingAudioTiming.stream_rtf).toFixed(2) : "-"}`
             );

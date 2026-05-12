@@ -49,9 +49,16 @@ MODE_DIR = {
     "voice-clone": "base",
     "base": "base",
 }
-FASTEST_SEGMENT_MAX_NEW_TOKENS = 48
+FASTEST_SHORT_OUTPUT_MAX_NEW_TOKENS = 48
 TEXT_TOKEN_RE = re.compile(r"\s+|[A-Za-z0-9]+|[\u3400-\u9fff]|[^\s]")
 SOFT_SPLIT_PUNCT = set("。！？!?；;，,、")
+CONTINUOUS_LONG_OUTPUT_BUCKET = 384
+CONTINUOUS_LONG_OUTPUT_VARIANT = "int8_sym_fused"
+CONTINUOUS_LONG_OUTPUT_PREFERRED_VARIANTS = ("int8_sym_fused_cachedsub", "int8_sym_fused")
+PAGED_KV_UNAVAILABLE_REASON = (
+    "current exported Qwen3-TTS IR uses OpenVINO ReadValue/Assign stateful KV "
+    "instead of GenAI key_cache/value_cache/block_indices inputs"
+)
 
 
 def speech_text_units(token: str) -> int:
@@ -64,33 +71,36 @@ def speech_text_units(token: str) -> int:
     return 0 if token in SOFT_SPLIT_PUNCT or token in set(".:：") else 1
 
 
-def split_text_for_fastest_stream(text: str, max_new_tokens: int = FASTEST_SEGMENT_MAX_NEW_TOKENS) -> list[str]:
-    raw = str(text or "").strip()
-    if not raw:
-        return []
-    token_budget = max(10, min(24, int(max_new_tokens) // 3))
-    hard_budget = max(token_budget + 4, int(token_budget * 1.4))
-    segments: list[str] = []
-    current: list[str] = []
-    units = 0
+def speech_text_unit_count(text: str) -> int:
+    return sum(speech_text_units(token) for token in TEXT_TOKEN_RE.findall(str(text or "")))
 
-    def flush():
-        nonlocal current, units
-        piece = "".join(current).strip()
-        if piece:
-            segments.append(piece)
-        current = []
-        units = 0
 
-    for token in TEXT_TOKEN_RE.findall(raw):
-        current.append(token)
-        units += speech_text_units(token)
-        if units >= token_budget and token in SOFT_SPLIT_PUNCT:
-            flush()
-        elif units >= hard_budget:
-            flush()
-    flush()
-    return segments or [raw]
+def needs_continuous_long_output(text: str, max_new_tokens: int) -> bool:
+    return int(max_new_tokens) > FASTEST_SHORT_OUTPUT_MAX_NEW_TOKENS or speech_text_unit_count(text) > 24
+
+
+def continuous_long_output_metadata(enabled: bool) -> dict:
+    return {
+        "continuous_long_output": bool(enabled),
+        "continuous_backend": "single_prompt_stateful_bucket" if enabled else "fastest_native_bucket",
+        "continuous_bucket": CONTINUOUS_LONG_OUTPUT_BUCKET if enabled else None,
+        "paged_kv": False,
+        "paged_kv_backend": "unavailable",
+        "paged_kv_unavailable_reason": PAGED_KV_UNAVAILABLE_REASON,
+    }
+
+
+def select_continuous_long_output_variant(manifest: dict) -> str:
+    variants = manifest.get("graph_variants") or {}
+    for variant_name in CONTINUOUS_LONG_OUTPUT_PREFERRED_VARIANTS:
+        exact_buckets = (
+            ((variants.get(variant_name) or {}).get("graphs") or {})
+            .get("fused_cache_step_buckets", {})
+            .get("exact", {})
+        )
+        if isinstance(exact_buckets, dict) and str(CONTINUOUS_LONG_OUTPUT_BUCKET) in {str(key) for key in exact_buckets}:
+            return variant_name
+    return CONTINUOUS_LONG_OUTPUT_VARIANT
 
 
 def audio_to_pcm16(audio) -> bytes:
@@ -482,6 +492,11 @@ def create_app(
         "native_ov_profile": os.environ.get("QWEN3_TTS_OV_NATIVE_PERF_COUNT") or "off",
         "unroll_available": effective_unroll > 1,
         "unroll_fallback": False,
+        "long_output_policy": "single_prompt_stateful_bucket",
+        "long_output_bucket": CONTINUOUS_LONG_OUTPUT_BUCKET,
+        "paged_kv": False,
+        "paged_kv_backend": "unavailable",
+        "paged_kv_unavailable_reason": PAGED_KV_UNAVAILABLE_REASON,
     }
 
     def manifest_supports_mode(ir_dir: Path, mode_name: str) -> bool:
@@ -522,17 +537,43 @@ def create_app(
                 return fallback
         raise ValueError(manifest_missing_message(nested))
 
-    def runtime_for_ir_dir(ir_dir: Path, do_sample: bool = False):
+    def runtime_for_ir_dir(ir_dir: Path, do_sample: bool = False, continuous_long_output: bool = False):
         if not has_manifest(ir_dir):
             raise ValueError(manifest_missing_message(ir_dir))
-        effective_cache_step = "split" if do_sample and mode == "cache" and cache_step == "fused" else cache_step
+        runtime_mode = mode
+        runtime_cache_kernel = cache_kernel
+        runtime_cache_step = "split" if do_sample and mode == "cache" and cache_step == "fused" else cache_step
+        runtime_graph_variant = graph_variant
+        runtime_codegen_unroll = int(effective_unroll)
+        runtime_codegen_schedule = codegen_schedule
+        runtime_codegen_decode_unroll = codegen_decode_unroll
+        runtime_preferred_cache_bucket = preferred_cache_bucket
+        runtime_native_codegen = None
+        runtime_native_pipeline = None
+        if continuous_long_output:
+            runtime_manifest = load_manifest(ir_dir)
+            runtime_mode = "cache"
+            runtime_cache_kernel = "exact"
+            runtime_cache_step = "fused"
+            runtime_graph_variant = select_continuous_long_output_variant(runtime_manifest)
+            runtime_codegen_unroll = 1
+            runtime_codegen_schedule = "current"
+            runtime_codegen_decode_unroll = "off"
+            runtime_preferred_cache_bucket = CONTINUOUS_LONG_OUTPUT_BUCKET
+            runtime_native_codegen = "off"
+            runtime_native_pipeline = "off"
         key = (
             str(ir_dir.resolve()),
-            effective_cache_step,
-            int(effective_unroll),
-            codegen_schedule,
-            codegen_decode_unroll,
-            str(preferred_cache_bucket),
+            runtime_mode,
+            runtime_cache_kernel,
+            runtime_cache_step,
+            runtime_graph_variant,
+            runtime_codegen_unroll,
+            runtime_codegen_schedule,
+            runtime_codegen_decode_unroll,
+            str(runtime_preferred_cache_bucket),
+            str(runtime_native_codegen or "auto"),
+            str(runtime_native_pipeline or "auto"),
             str(ov_cache_dir or "auto"),
             ov_cache_mode,
             bool(disable_ov_cache),
@@ -543,24 +584,41 @@ def create_app(
                 device=device,
                 decoder_device=decoder_device,
                 allow_cpu_fallback=allow_cpu_fallback,
-                mode=mode,
-                cache_kernel=cache_kernel,
-                cache_step=effective_cache_step,
-                graph_variant=graph_variant,
-                codegen_unroll=effective_unroll,
-                codegen_schedule=codegen_schedule,
-                codegen_decode_unroll=codegen_decode_unroll,
-                preferred_cache_bucket=preferred_cache_bucket,
+                mode=runtime_mode,
+                cache_kernel=runtime_cache_kernel,
+                cache_step=runtime_cache_step,
+                graph_variant=runtime_graph_variant,
+                codegen_unroll=runtime_codegen_unroll,
+                codegen_schedule=runtime_codegen_schedule,
+                codegen_decode_unroll=runtime_codegen_decode_unroll,
+                preferred_cache_bucket=runtime_preferred_cache_bucket,
                 ov_cache_dir=ov_cache_dir,
                 ov_cache_mode=ov_cache_mode,
                 disable_ov_cache=disable_ov_cache,
+                native_codegen=runtime_native_codegen,
+                native_pipeline=runtime_native_pipeline,
             )
         return runtimes[key]
 
-    def get_runtime(request_mode: str, do_sample: bool = False):
+    def get_runtime(request_mode: str, do_sample: bool = False, continuous_long_output: bool = False):
         normalized = normalize_mode(request_mode)
         ir_dir = resolve_mode_ir_dir(normalized)
-        return normalized, runtime_for_ir_dir(ir_dir, do_sample=do_sample)
+        return normalized, runtime_for_ir_dir(ir_dir, do_sample=do_sample, continuous_long_output=continuous_long_output)
+
+    def request_uses_continuous_long_output(request: dict, gen_kwargs: dict | None = None) -> bool:
+        if forced_stream_strategy != FASTEST_CHUNK_STRATEGY:
+            return False
+        try:
+            mode_name = normalize_mode(request.get("mode"))
+            if mode_name != "voice_design":
+                return False
+            generation = gen_kwargs if gen_kwargs is not None else generation_kwargs(
+                request,
+                default_repetition_penalty=default_repetition_penalty,
+            )
+            return needs_continuous_long_output(request.get("text") or "", int(generation["max_new_tokens"]))
+        except Exception:
+            return False
 
     @app.on_event("startup")
     def warmup_on_startup():
@@ -603,7 +661,14 @@ def create_app(
 
     def stream_chunks(request: dict):
         gen_kwargs = generation_kwargs(request, default_repetition_penalty=default_repetition_penalty)
-        mode_name, runtime = get_runtime(request.get("mode"), do_sample=bool(gen_kwargs["do_sample"]))
+        mode_name = normalize_mode(request.get("mode"))
+        text = request.get("text")
+        long_output = request_uses_continuous_long_output(request, gen_kwargs)
+        mode_name, runtime = get_runtime(
+            mode_name,
+            do_sample=bool(gen_kwargs["do_sample"]),
+            continuous_long_output=long_output,
+        )
         kwargs = {**gen_kwargs, **stream_kwargs(request, default_stream_strategy, forced_strategy=forced_stream_strategy)}
         text = request.get("text")
         language = request.get("language", "Auto")
@@ -611,55 +676,28 @@ def create_app(
             raise ValueError("text is required")
         if mode_name == "voice_design":
             instruct = request.get("instruct", "")
-            if forced_stream_strategy == FASTEST_CHUNK_STRATEGY:
-                segments = split_text_for_fastest_stream(text, FASTEST_SEGMENT_MAX_NEW_TOKENS)
-                if len(segments) > 1 or int(kwargs.get("max_new_tokens", 0)) > FASTEST_SEGMENT_MAX_NEW_TOKENS:
-                    segment_kwargs = dict(kwargs)
-                    segment_kwargs["max_new_tokens"] = min(
-                        int(segment_kwargs.get("max_new_tokens", FASTEST_SEGMENT_MAX_NEW_TOKENS)),
-                        FASTEST_SEGMENT_MAX_NEW_TOKENS,
-                    )
+            if long_output:
+                continuous_meta = continuous_long_output_metadata(True)
 
-                    def iter_segmented_voice_design():
-                        output_index = 0
-                        last_empty_final: StreamChunk | None = None
-                        for segment_index, segment in enumerate(segments):
-                            is_last_segment = segment_index == len(segments) - 1
-                            for chunk in runtime.stream_voice_design(
-                                text=segment,
-                                instruct=instruct,
-                                language=language,
-                                **segment_kwargs,
-                            ):
-                                timings = dict(chunk.timings or {})
-                                timings.update(
-                                    {
-                                        "text_segmented": True,
-                                        "text_segment_index": segment_index,
-                                        "text_segment_count": len(segments),
-                                        "segment_max_new_tokens": int(segment_kwargs["max_new_tokens"]),
-                                    }
-                                )
-                                is_final = bool(is_last_segment and chunk.is_final)
-                                if not chunk.audio.size and not is_final:
-                                    continue
-                                out = StreamChunk(
-                                    index=output_index,
-                                    audio=chunk.audio,
-                                    sample_rate=chunk.sample_rate,
-                                    codes=chunk.codes,
-                                    is_final=is_final,
-                                    timings=timings,
-                                )
-                                if out.audio.size:
-                                    output_index += 1
-                                    yield out
-                                elif is_final:
-                                    last_empty_final = out
-                        if last_empty_final is not None:
-                            yield last_empty_final
+                def iter_continuous_voice_design():
+                    for chunk in runtime.stream_voice_design(
+                        text=text,
+                        instruct=instruct,
+                        language=language,
+                        **kwargs,
+                    ):
+                        timings = dict(chunk.timings or {})
+                        timings.update(continuous_meta)
+                        yield StreamChunk(
+                            index=chunk.index,
+                            audio=chunk.audio,
+                            sample_rate=chunk.sample_rate,
+                            codes=chunk.codes,
+                            is_final=chunk.is_final,
+                            timings=timings,
+                        )
 
-                    return iter_segmented_voice_design()
+                return iter_continuous_voice_design()
             return runtime.stream_voice_design(text=text, instruct=instruct, language=language, **kwargs)
         if mode_name == "custom_voice":
             speaker = request.get("speaker")
@@ -683,7 +721,12 @@ def create_app(
 
     def full_audio(request: dict):
         kwargs = generation_kwargs(request, default_repetition_penalty=default_repetition_penalty)
-        mode_name, runtime = get_runtime(request.get("mode"), do_sample=bool(kwargs["do_sample"]))
+        long_output = request_uses_continuous_long_output(request, kwargs)
+        mode_name, runtime = get_runtime(
+            request.get("mode"),
+            do_sample=bool(kwargs["do_sample"]),
+            continuous_long_output=long_output,
+        )
         text = request.get("text")
         language = request.get("language", "Auto")
         if not text:
@@ -716,7 +759,8 @@ def create_app(
     def health():
         runtime_status = {}
         for key, runtime in runtimes.items():
-            ir_dir, effective_cache_step, runtime_unroll = key[0], key[1], key[2]
+            ir_dir = key[0]
+            runtime_id = "|".join(str(item) for item in key[:8])
             variant_fused_buckets = (getattr(runtime, "variant_graphs", {}) or {}).get("fused_cache_step_buckets", {})
             cache_kernel = getattr(runtime, "cache_kernel", None)
             fused_variant_active = False
@@ -725,16 +769,22 @@ def create_app(
                     fused_variant_active = bool(variant_fused_buckets[cache_kernel])
                 elif all(str(bucket).isdigit() for bucket in variant_fused_buckets):
                     fused_variant_active = bool(variant_fused_buckets)
-            runtime_status[ir_dir] = {
-                "cache_step": effective_cache_step,
+            runtime_status[runtime_id] = {
+                "ir_dir": ir_dir,
+                "cache_step": getattr(runtime, "cache_step", None),
                 "mode": getattr(runtime, "mode", None),
                 "requested_mode": getattr(runtime, "requested_mode", None),
                 "cache_kernel": cache_kernel,
                 "graph_variant": getattr(runtime, "graph_variant", None),
-                "codegen_unroll": getattr(runtime, "codegen_unroll", runtime_unroll),
+                "codegen_unroll": getattr(runtime, "codegen_unroll", effective_unroll),
                 "codegen_schedule": getattr(runtime, "codegen_schedule", codegen_schedule),
                 "codegen_decode_unroll": getattr(runtime, "codegen_decode_unroll", codegen_decode_unroll),
                 "preferred_cache_bucket": getattr(runtime, "preferred_cache_bucket", preferred_cache_bucket),
+                "native_codegen": getattr(runtime, "native_codegen_override", None) or os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN") or "off",
+                "native_pipeline": getattr(runtime, "native_pipeline_override", None) or os.environ.get("QWEN3_TTS_OV_NATIVE_PIPELINE") or "off",
+                "paged_kv": bool(getattr(runtime, "paged_kv_enabled", False)),
+                "paged_kv_backend": getattr(runtime, "paged_kv_backend", "stateful_bucket"),
+                "paged_kv_unavailable_reason": getattr(runtime, "paged_kv_unavailable_reason", PAGED_KV_UNAVAILABLE_REASON),
                 "unroll_available": bool(getattr(runtime, "fused_cache_unroll_bucket_graphs", {}))
                 or bool(getattr(runtime, "fused_cache_unroll_bucket_graphs_by_step", {})),
                 "unroll_fallback": bool(getattr(runtime, "codegen_unroll_fallback", False)),
@@ -797,6 +847,7 @@ def create_app(
                         "started_at": started,
                         **metadata,
                         **runtime_stream_metadata,
+                        **continuous_long_output_metadata(request_uses_continuous_long_output(request)),
                         "recommended_playback_buffer_ms": int(playback_buffer_ms),
                     },
                     ensure_ascii=False,
@@ -903,6 +954,7 @@ def create_app(
                     "started_at": started,
                     **metadata,
                     **runtime_stream_metadata,
+                    **continuous_long_output_metadata(request_uses_continuous_long_output(request)),
                     "recommended_playback_buffer_ms": int(playback_buffer_ms),
                 }
             )

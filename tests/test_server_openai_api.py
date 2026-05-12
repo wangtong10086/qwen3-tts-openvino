@@ -6,9 +6,10 @@ import pytest
 
 from qwen3_tts_ov.server import (
     include_chunk_metadata,
+    needs_continuous_long_output,
     openai_speech_to_tts_request,
     playback_buffer_for_stream,
-    split_text_for_fastest_stream,
+    select_continuous_long_output_variant,
     stream_metadata,
 )
 
@@ -85,13 +86,25 @@ def test_forced_stream_metadata_ignores_requested_realtime_strategy():
     assert metadata["forced_chunk_strategy"] is True
 
 
-def test_fastest_text_splitter_breaks_long_text_into_short_segments():
+def test_fastest_long_text_uses_continuous_single_prompt_policy():
     text = "你好，这是第一段较长的测试文本，用来验证自动切分。这里还有第二段内容，确保不会因为最大生成帧数太小而截断。"
-    segments = split_text_for_fastest_stream(text, max_new_tokens=48)
 
-    assert len(segments) > 1
-    assert "".join(segments) == text
-    assert all(segment.strip() for segment in segments)
+    assert needs_continuous_long_output(text, max_new_tokens=48) is True
+    assert needs_continuous_long_output("你好", max_new_tokens=48) is False
+    assert needs_continuous_long_output("你好", max_new_tokens=160) is True
+
+
+def test_continuous_long_output_prefers_cachedsub_variant_when_bucket_available():
+    manifest = {
+        "graph_variants": {
+            "int8_sym_fused": {"graphs": {"fused_cache_step_buckets": {"exact": {"384": "fallback.xml"}}}},
+            "int8_sym_fused_cachedsub": {
+                "graphs": {"fused_cache_step_buckets": {"exact": {"384": "cachedsub.xml"}}}
+            },
+        }
+    }
+
+    assert select_continuous_long_output_variant(manifest) == "int8_sym_fused_cachedsub"
 
 
 def test_include_chunk_metadata_accepts_stream_flag():
@@ -214,7 +227,7 @@ def test_websocket_can_send_optional_chunk_metadata(monkeypatch, tmp_path):
         assert websocket.receive_json()["type"] == "final"
 
 
-def test_fastest_websocket_segments_long_voice_design_text(monkeypatch, tmp_path):
+def test_fastest_websocket_uses_single_prompt_continuous_long_output(monkeypatch, tmp_path):
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
     from qwen3_tts_ov import server
 
@@ -224,10 +237,11 @@ def test_fastest_websocket_segments_long_voice_design_text(monkeypatch, tmp_path
         json.dump({"tts_model_type": "voice_design"}, handle)
 
     calls = []
+    runtime_kwargs = []
 
     class FakeRuntime:
         def __init__(self, *args, **kwargs):
-            pass
+            runtime_kwargs.append(kwargs)
 
         def stream_voice_design(self, **kwargs):
             calls.append(kwargs)
@@ -256,6 +270,10 @@ def test_fastest_websocket_segments_long_voice_design_text(monkeypatch, tmp_path
         )
         metadata = websocket.receive_json()
         assert metadata["forced_chunk_strategy"] is True
+        assert metadata["continuous_long_output"] is True
+        assert metadata["continuous_backend"] == "single_prompt_stateful_bucket"
+        assert metadata["continuous_bucket"] == 384
+        assert metadata["paged_kv"] is False
 
         audio_messages = 0
         while True:
@@ -263,14 +281,20 @@ def test_fastest_websocket_segments_long_voice_design_text(monkeypatch, tmp_path
             if message["type"] == "final":
                 break
             assert message["type"] == "audio"
-            assert message["timings"]["text_segmented"] is True
+            assert message["timings"]["continuous_long_output"] is True
+            assert message["timings"]["continuous_backend"] == "single_prompt_stateful_bucket"
+            assert message["timings"]["paged_kv"] is False
             websocket.receive_bytes()
             audio_messages += 1
 
-    assert audio_messages == len(calls)
-    assert len(calls) > 1
-    assert all(call["max_new_tokens"] == 48 for call in calls)
-    assert "".join(call["text"] for call in calls) == text
+    assert audio_messages == 1
+    assert len(calls) == 1
+    assert calls[0]["text"] == text
+    assert calls[0]["max_new_tokens"] == 160
+    assert runtime_kwargs[0]["graph_variant"] == "int8_sym_fused"
+    assert runtime_kwargs[0]["codegen_unroll"] == 1
+    assert runtime_kwargs[0]["preferred_cache_bucket"] == 384
+    assert runtime_kwargs[0]["native_pipeline"] == "off"
 
 
 def test_server_realtime_profile_int8_reaches_runtime_and_health(monkeypatch, tmp_path):

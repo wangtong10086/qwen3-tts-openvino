@@ -36,6 +36,16 @@ pipelines do not model Qwen3-TTS' multi-codebook codec autoregression:
 - codec frames or decoded audio chunks are emitted back to Python through native
   streaming callbacks
 
+The currently exported IR uses OpenVINO `ReadValue` / `Assign` stateful KV with
+fixed cache buckets. It does not expose GenAI continuous batching inputs such as
+`key_cache.*`, `value_cache.*`, and `block_indices`, so the production path is
+not a true paged-KV `LLMPipeline` backend yet. Long VoiceDesign requests are
+handled by a single-prompt `cache384` stateful bucket path, preferring the
+`int8_sym_fused_cachedsub` graph variant when available, to preserve prosody
+without text segmentation. A true paged-KV backend requires a new export/
+transformation path that produces GenAI-compatible cache inputs for the Qwen3
+codec decoder graph.
+
 Build:
 
 ```bash
