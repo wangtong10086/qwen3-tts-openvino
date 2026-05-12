@@ -515,6 +515,12 @@ def create_app(
                 )
                 app.state.warmup["loaded_modes"].append(preload_mode)
                 app.state.warmup["runtimes"][preload_mode] = status
+                if status.get("status") != "ready":
+                    app.state.warmup["errors"][preload_mode] = (
+                        status.get("warmup_generation_error")
+                        or status.get("fallback_decoder_error")
+                        or f"prewarm finished with status={status.get('status')}"
+                    )
             except Exception as exc:
                 app.state.warmup["errors"][preload_mode] = str(exc)
         app.state.warmup["finished_at"] = time.time()

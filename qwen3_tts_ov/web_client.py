@@ -351,9 +351,9 @@ WEB_CLIENT_HTML = r"""<!doctype html>
             <div class="field">
               <label for="chunkStrategy">chunk_strategy</label>
               <select id="chunkStrategy">
-                <option value="realtime" selected>realtime</option>
+                <option value="realtime">realtime</option>
                 <option value="low_latency">low_latency</option>
-                <option value="smooth">smooth</option>
+                <option value="smooth" selected>smooth</option>
                 <option value="balanced">balanced</option>
                 <option value="stable">stable</option>
               </select>

@@ -3869,6 +3869,7 @@ class OpenVINOQwen3TTS:
         chunk_frames = int(stream_config["chunk_frames"])
         left_context_frames = int(stream_config["left_context_frames"])
         max_new_tokens = int(max_new_tokens or (initial_chunk_frames + chunk_frames))
+        native_pipeline_active = self._native_pipeline_mode() in {"1", "true", "on", "require"}
         status = {
             "enabled": True,
             "status": "running",
@@ -3895,6 +3896,7 @@ class OpenVINOQwen3TTS:
             "compiled_stream_decoders": [],
             "stream_decoder_errors": {},
             "streaming_decoder_available": bool(self.streaming_decoder_graphs_by_context),
+            "native_pipeline_prewarm": bool(native_pipeline_active),
         }
 
         def compile_stream_candidates(label: str, candidates: list[tuple[int, int]]):
@@ -3909,26 +3911,29 @@ class OpenVINOQwen3TTS:
                     status["stream_decoder_errors"][f"{label}:c{context}_t{chunk}"] = str(exc)
             return False
 
-        compile_stream_candidates(
-            "initial",
-            self._stream_decoder_key_candidates(
-                context_frames=0,
-                new_frames=initial_chunk_frames,
-                preferred_chunk_frames=initial_chunk_frames,
-                left_context_frames=left_context_frames,
-            ),
-        )
-        compile_stream_candidates(
-            "steady",
-            self._stream_decoder_key_candidates(
-                context_frames=min(initial_chunk_frames, left_context_frames),
-                new_frames=chunk_frames,
-                preferred_chunk_frames=chunk_frames,
-                left_context_frames=left_context_frames,
-            ),
-        )
+        if native_pipeline_active:
+            status["skipped_python_graph_prewarm"] = True
+        else:
+            compile_stream_candidates(
+                "initial",
+                self._stream_decoder_key_candidates(
+                    context_frames=0,
+                    new_frames=initial_chunk_frames,
+                    preferred_chunk_frames=initial_chunk_frames,
+                    left_context_frames=left_context_frames,
+                ),
+            )
+            compile_stream_candidates(
+                "steady",
+                self._stream_decoder_key_candidates(
+                    context_frames=min(initial_chunk_frames, left_context_frames),
+                    new_frames=chunk_frames,
+                    preferred_chunk_frames=chunk_frames,
+                    left_context_frames=left_context_frames,
+                ),
+            )
 
-        if self.mode == "cache":
+        if self.mode == "cache" and not native_pipeline_active:
             scheduled_unrolls = [item for item in self.codegen_schedule_unrolls if item > 1 and self.codegen_unroll_available(item)]
             if self.cache_step == "fused" and scheduled_unrolls:
                 available_buckets = {}
