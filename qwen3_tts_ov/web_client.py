@@ -351,7 +351,9 @@ WEB_CLIENT_HTML = r"""<!doctype html>
             <div class="field">
               <label for="chunkStrategy">chunk_strategy</label>
               <select id="chunkStrategy">
-                <option value="low_latency" selected>low_latency</option>
+                <option value="realtime" selected>realtime</option>
+                <option value="low_latency">low_latency</option>
+                <option value="smooth">smooth</option>
                 <option value="balanced">balanced</option>
                 <option value="stable">stable</option>
               </select>
@@ -391,7 +393,10 @@ WEB_CLIENT_HTML = r"""<!doctype html>
             <div class="metric"><span>播放队列</span><strong id="queueDepth">0ms</strong></div>
             <div class="metric"><span>Underrun</span><strong id="underrunCount">0</strong></div>
             <div class="metric"><span>RTF</span><strong id="rtfValue">-</strong></div>
-            <div class="metric"><span>策略</span><strong id="strategyValue">low_latency</strong></div>
+            <div class="metric"><span>策略</span><strong id="strategyValue">realtime</strong></div>
+            <div class="metric"><span>Profile</span><strong id="profileValue">fp16</strong></div>
+            <div class="metric"><span>Unroll</span><strong id="unrollValue">1</strong></div>
+            <div class="metric"><span>Schedule</span><strong id="scheduleValue">current</strong></div>
           </div>
 
           <div class="meters">
@@ -447,6 +452,9 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       underrunCount: $("underrunCount"),
       rtfValue: $("rtfValue"),
       strategyValue: $("strategyValue"),
+      profileValue: $("profileValue"),
+      unrollValue: $("unrollValue"),
+      scheduleValue: $("scheduleValue"),
       receiveBar: $("receiveBar"),
       queueBar: $("queueBar"),
       log: $("log"),
@@ -468,12 +476,14 @@ WEB_CLIENT_HTML = r"""<!doctype html>
     let underrunCount = 0;
     let targetBufferSec = 0.25;
     let minQueueSec = 0.10;
-    let maxBufferSec = 0.50;
+    let maxBufferSec = 2.00;
     let latestRtf = 0;
     let pendingAudioTiming = null;
     let timer = null;
     const strategyDefaults = {
+      realtime: { initialChunkFrames: 8, chunkFrames: 12, leftContextFrames: 25 },
       low_latency: { initialChunkFrames: 8, chunkFrames: 12, leftContextFrames: 25 },
+      smooth: { initialChunkFrames: 8, chunkFrames: 24, leftContextFrames: 25 },
       balanced: { initialChunkFrames: 12, chunkFrames: 12, leftContextFrames: 25 },
       stable: { initialChunkFrames: 12, chunkFrames: 24, leftContextFrames: 25 },
     };
@@ -508,6 +518,21 @@ WEB_CLIENT_HTML = r"""<!doctype html>
           log(`health warmup errors: ${JSON.stringify(errors)}`);
         } else {
           setHealth(true, `服务正常 ${data.model_root}`);
+        }
+        const runtimes = data.runtimes || {};
+        const runtime = Object.values(runtimes)[0];
+        const profile = data.warmup && data.warmup.realtime_profile
+          ? data.warmup.realtime_profile
+          : (runtime && runtime.graph_variant === "int8_sym_fused" ? "int8-sym" : (runtime && runtime.graph_variant === "int8_fused" ? "int8" : "fp16"));
+        els.profileValue.textContent = profile;
+        els.unrollValue.textContent = runtime && runtime.codegen_unroll ? String(runtime.codegen_unroll) : "1";
+        els.scheduleValue.textContent = runtime && runtime.codegen_schedule ? String(runtime.codegen_schedule) : "current";
+        if (runtime) {
+          log(
+            `runtime profile=${profile}, mode=${runtime.mode || "-"}, ` +
+            `variant=${runtime.graph_variant || "-"}, unroll=${runtime.codegen_unroll || 1}, schedule=${runtime.codegen_schedule || "current"}, ` +
+            `unroll_fallback=${runtime.unroll_fallback ? "yes" : "no"}, fused_int8=${runtime.fused_cache_variant_active ? "yes" : "no"}`
+          );
         }
       } catch (err) {
         setHealth(false, "服务未连接");
@@ -810,9 +835,19 @@ WEB_CLIENT_HTML = r"""<!doctype html>
             if (data.chunk_strategy) {
               els.strategyValue.textContent = data.chunk_strategy;
             }
+            if (data.realtime_profile || data.graph_variant) {
+              els.profileValue.textContent = data.realtime_profile || (data.graph_variant === "int8_sym_fused" ? "int8-sym" : (data.graph_variant === "int8_fused" ? "int8" : "fp16"));
+            }
+            if (data.codegen_unroll) {
+              els.unrollValue.textContent = String(data.codegen_unroll);
+            }
+            if (data.codegen_schedule) {
+              els.scheduleValue.textContent = String(data.codegen_schedule);
+            }
             log(
               `metadata sample_rate=${sampleRate}, format=${data.format}, ` +
-              `strategy=${data.chunk_strategy || "-"}, initial=${data.initial_chunk_frames || "-"}, chunk=${data.chunk_frames || "-"}`
+              `strategy=${data.chunk_strategy || "-"}, initial=${data.initial_chunk_frames || "-"}, chunk=${data.chunk_frames || "-"}, ` +
+              `profile=${data.realtime_profile || "-"}, variant=${data.graph_variant || "-"}, unroll=${data.codegen_unroll || 1}, schedule=${data.codegen_schedule || "current"}`
             );
           } else if (data.type === "final") {
             streamFinal = true;
@@ -834,6 +869,10 @@ WEB_CLIENT_HTML = r"""<!doctype html>
             }
             log(
               `audio meta index=${data.index}, bytes=${data.byte_length}, ` +
+              `path=${pendingAudioTiming && pendingAudioTiming.decode_path ? pendingAudioTiming.decode_path : "-"}, ` +
+              `unroll=${pendingAudioTiming && pendingAudioTiming.codegen_unroll ? pendingAudioTiming.codegen_unroll : 1}, ` +
+              `schedule=${pendingAudioTiming && pendingAudioTiming.codegen_schedule ? pendingAudioTiming.codegen_schedule : "current"}, ` +
+              `unroll_fallback=${pendingAudioTiming && pendingAudioTiming.unroll_fallback ? "yes" : "no"}, ` +
               `chunk_rtf=${pendingAudioTiming && pendingAudioTiming.rtf ? Number(pendingAudioTiming.rtf).toFixed(2) : "-"}, ` +
               `stream_rtf=${pendingAudioTiming && pendingAudioTiming.stream_rtf ? Number(pendingAudioTiming.stream_rtf).toFixed(2) : "-"}`
             );

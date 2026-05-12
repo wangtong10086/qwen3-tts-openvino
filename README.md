@@ -1,106 +1,95 @@
 # Qwen3-TTS OpenVINO
 
-OpenVINO runtime and exporter for Qwen3-TTS 12 Hz models.
+OpenVINO-only runtime and exporter for Qwen3-TTS 12 Hz models.
 
 This repository is source-only. It does not include model weights, exported
-OpenVINO IR, generated audio, or local virtual environments. See the Chinese
-documentation for complete setup and export instructions:
+OpenVINO IR, generated audio, local virtual environments, or native build
+artifacts.
 
-- [中文文档](README.zh-CN.md)
-- [Export guide](docs/export_zh.md)
-- [Artifacts and large files](docs/artifacts_zh.md)
-- [Streaming guide](docs/streaming_zh.md)
-- [OpenVINO cache guide](docs/cache_zh.md)
-- [Security notes](docs/security_zh.md)
+The production path is the `fastest` profile:
 
-## Features
+- native C++ pipeline is required
+- INT8_SYM cached-subcode fused graphs are required
+- no-repeat unroll4 + decode-unroll graphs are required
+- streaming uses the `smooth` chunk strategy by default
 
-- OpenVINO runtime entrypoint: `python -m qwen3_tts_ov`
-- VoiceDesign inference: `text + instruct + language`
-- CustomVoice inference: `text + speaker + optional instruct + language`
-- VoiceClone API shape: `text + ref_audio/ref_text or reusable prompt + language`
-- Streaming synthesis through Python iterators, CLI chunks, and a local HTTP/WebSocket sidecar
-- Exporter for Qwen3-TTS OpenVINO IR
-- Runtime import path avoids importing PyTorch; PyTorch is used only for export
+See the full Chinese guide: [README.zh-CN.md](README.zh-CN.md).
 
 ## Quick Start
 
 ```bash
+git submodule update --init --recursive
+uv sync --extra native --extra server --extra export
+uv run python scripts/build_native_codegen.py
 uv run python -m qwen3_tts_ov --help
 ```
 
-This is a source-only repository. Commands that use `--ir-dir` require either
-`auto` or an exported IR directory containing `manifest.json`. VoiceDesign
-commands resolve `auto` to `openvino/voice_design`, then `openvino_full`.
-
-If you want the `qwen3-tts-ov` console script, install the package first:
-
-```bash
-uv pip install -e .
-uv run qwen3-tts-ov --help
-```
-
-Export a VoiceDesign model:
+Export and compress the required VoiceDesign IR locally:
 
 ```bash
 uv run python -m qwen3_tts_ov export \
   --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
   --model-type voice_design \
   --out-dir openvino/voice_design \
-  --cache-buckets 128,192,256,320,384 \
-  --cache-kernels exact,sdpa \
+  --cache-buckets 96,128,192,256,320,384 \
+  --cache-kernels exact \
   --fused-cache-kernels exact \
+  --fused-subcode-mode cached \
+  --fused-cache-unroll-steps 4 \
+  --fused-cache-norepeat-steps 4 \
   --decoder-tokens 64,128,256 \
   --stream-decoder-chunks 8,12,24 \
-  --stream-decoder-first-chunks 6,8,12 \
+  --stream-decoder-first-chunks 8 \
   --stream-decoder-left-context 25
+
+uv run python scripts/compress_openvino_weights.py \
+  --ir-dir openvino/voice_design \
+  --source-variant fp16_fused_cachedsub \
+  --variant int8_sym_fused_cachedsub \
+  --mode int8_sym \
+  --fused-cache-unroll-steps 4
 ```
 
-Run inference:
+Warm the OpenVINO cache and start the sidecar:
 
 ```bash
-uv run python -m qwen3_tts_ov voice-design \
+uv run python -m qwen3_tts_ov cache-warmup \
   --ir-dir openvino/voice_design \
   --device GPU \
-  --text "你好，这是一次 OpenVINO 推理测试。" \
-  --instruct "A calm young female voice, natural Mandarin pronunciation." \
-  --language Chinese \
-  --output outputs/voice_design.wav
+  --realtime-profile fastest \
+  --graphs core,stream,buckets \
+  --preload-buckets warmup
+
+uv run python -m qwen3_tts_ov serve \
+  --model-root openvino \
+  --device GPU \
+  --realtime-profile fastest \
+  --host 127.0.0.1 \
+  --port 17860
 ```
 
-Run streaming synthesis:
+Open the web demo at `http://127.0.0.1:17860/`.
 
-```bash
-uv run python -m qwen3_tts_ov stream voice-design \
-  --ir-dir openvino/voice_design \
-  --text "Streaming OpenVINO synthesis test." \
-  --instruct "A bright and clear narrator voice." \
-  --language English \
-  --chunk-strategy low_latency \
-  --chunk-dir outputs/stream \
-  --output outputs/stream.wav
-```
+## Supported Modes
 
-## Repository Policy
+- VoiceDesign: `text + instruct + language`
+- CustomVoice: `text + speaker + optional instruct + language`
+- VoiceClone: `text + ref_audio/ref_text or reusable prompt + language`
 
-Large generated assets are intentionally ignored:
-
-- `models/`
-- `openvino_full/`
-- `openvino/`
-- `outputs/`
-- `.venv/`
-
-Regenerate them locally by following [docs/export_zh.md](docs/export_zh.md).
+The public runtime, CLI, HTTP/WebSocket sidecar, and OpenAI-compatible speech
+endpoint all use the same `fastest` production profile by default. Experimental
+profiles and historical scripts live under `devtools/`.
 
 ## Layout
 
 ```text
-qwen3_tts_ov/  package, runtime, exporter, sidecar, and CLI
-docs/          Chinese guides for export, streaming, cache, artifacts, security
+qwen3_tts_ov/  production runtime, exporter, sidecar, web client, and CLI
+native/        required C++ OpenVINO GenAI-style pipeline source
+scripts/       production helper scripts
+devtools/      experimental benchmarks, legacy scripts, and profiling tools
+docs/          Chinese guides
 examples/      small JSON/JSONL request examples
-scripts/       development helpers for compression, quantization, benchmark
-tests/         unit tests for runtime streaming, server mapping, cache config
+tests/         unit tests
 ```
 
 ## License

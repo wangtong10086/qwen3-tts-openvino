@@ -13,7 +13,7 @@ if "ZE_ENABLE_ALT_DRIVERS" not in os.environ:
 import openvino as ov
 import openvino._pyopenvino as ov_private
 import torch
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 import qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 as tokenizer_v2
 from qwen_tts.core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration
@@ -26,6 +26,45 @@ from qwen_tts.inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
 
 
 NEG_INF = -3.4028234663852886e38
+RMS_EXPORT_MODES = ("default", "canonical", "inline")
+SUBCODE_EXPORT_MODES = ("recompute", "cached")
+
+
+def normalize_rms_export_mode(value: str | None) -> str:
+    mode = str(value or "default").strip().lower().replace("-", "_")
+    if mode not in RMS_EXPORT_MODES:
+        raise ValueError(f"rms_export_mode must be one of {', '.join(RMS_EXPORT_MODES)}")
+    return mode
+
+
+def normalize_subcode_export_mode(value: str | None) -> str:
+    mode = str(value or "recompute").strip().lower().replace("-", "_")
+    if mode not in SUBCODE_EXPORT_MODES:
+        raise ValueError(f"subcode_export_mode must be one of {', '.join(SUBCODE_EXPORT_MODES)}")
+    return mode
+
+
+def canonical_rms_norm(hidden_states, norm, rms_export_mode: str = "default"):
+    if normalize_rms_export_mode(rms_export_mode) == "default":
+        return norm(hidden_states)
+    input_dtype = hidden_states.dtype
+    x = hidden_states.to(torch.float32)
+    variance = torch.mean(torch.pow(x, 2.0), dim=-1, keepdim=True)
+    eps = float(getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6)))
+    x = x / torch.sqrt(variance + eps)
+    return norm.weight * x.to(input_dtype)
+
+
+def rms_graph_suffix(rms_export_mode: str) -> str:
+    mode = normalize_rms_export_mode(rms_export_mode)
+    if mode == "default":
+        return ""
+    return f"_rms_{mode}"
+
+
+def fused_codegen_graph_suffix(rms_export_mode: str, subcode_export_mode: str) -> str:
+    suffix = "_cachedsub" if normalize_subcode_export_mode(subcode_export_mode) == "cached" else ""
+    return suffix + rms_graph_suffix(rms_export_mode)
 
 
 def causal_mask(length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -87,10 +126,11 @@ class SpeakerEncoderWrapper(torch.nn.Module):
 
 
 class TalkerNoCacheWrapper(torch.nn.Module):
-    def __init__(self, talker):
+    def __init__(self, talker, rms_export_mode: str = "default"):
         super().__init__()
         self.model = talker.model.eval()
         self.codec_head = talker.codec_head.eval()
+        self.rms_export_mode = normalize_rms_export_mode(rms_export_mode)
 
     def forward(self, inputs_embeds):
         batch, seq_len = inputs_embeds.shape[:2]
@@ -119,7 +159,13 @@ class TalkerNoCacheWrapper(torch.nn.Module):
 
 
 class StatefulTalkerWrapper(torch.nn.Module):
-    def __init__(self, talker, max_cache_len: int, attention_kernel: str = "exact"):
+    def __init__(
+        self,
+        talker,
+        max_cache_len: int,
+        attention_kernel: str = "exact",
+        rms_export_mode: str = "default",
+    ):
         super().__init__()
         self.model = talker.model.eval()
         self.codec_head = talker.codec_head.eval()
@@ -127,14 +173,23 @@ class StatefulTalkerWrapper(torch.nn.Module):
         if attention_kernel not in {"exact", "sdpa"}:
             raise ValueError(f"unsupported attention_kernel={attention_kernel!r}")
         self.attention_kernel = attention_kernel
+        self.rms_export_mode = normalize_rms_export_mode(rms_export_mode)
 
     def _attention(self, layer, hidden_states, attention_mask, position_embeddings, past_key, past_value, cache_position):
         attn = layer.self_attn
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, attn.head_dim)
 
-        query_states = attn.q_norm(attn.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = attn.k_norm(attn.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        query_states = canonical_rms_norm(
+            attn.q_proj(hidden_states).view(hidden_shape),
+            attn.q_norm,
+            self.rms_export_mode,
+        ).transpose(1, 2)
+        key_states = canonical_rms_norm(
+            attn.k_proj(hidden_states).view(hidden_shape),
+            attn.k_norm,
+            self.rms_export_mode,
+        ).transpose(1, 2)
         value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
@@ -193,7 +248,7 @@ class StatefulTalkerWrapper(torch.nn.Module):
             past_value = past_key_values[layer_index * 2 + 1]
 
             residual = hidden_states
-            normed_states = decoder_layer.input_layernorm(hidden_states)
+            normed_states = canonical_rms_norm(hidden_states, decoder_layer.input_layernorm, self.rms_export_mode)
             attn_output, present_key, present_value = self._attention(
                 decoder_layer,
                 normed_states,
@@ -206,20 +261,20 @@ class StatefulTalkerWrapper(torch.nn.Module):
             hidden_states = residual + attn_output
 
             residual = hidden_states
-            hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
+            hidden_states = canonical_rms_norm(hidden_states, decoder_layer.post_attention_layernorm, self.rms_export_mode)
             hidden_states = decoder_layer.mlp(hidden_states)
             hidden_states = residual + hidden_states
 
             present_key_values.extend([present_key, present_value])
 
-        hidden_states = self.model.norm(hidden_states)
+        hidden_states = canonical_rms_norm(hidden_states, self.model.norm, self.rms_export_mode)
         last_hidden = hidden_states[:, -1:, :]
         logits = self.codec_head(last_hidden)[:, -1, :]
         return (logits, last_hidden, *present_key_values)
 
 
 class SubcodeGreedyWrapper(torch.nn.Module):
-    def __init__(self, talker):
+    def __init__(self, talker, attention_kernel: str = "sdpa", rms_export_mode: str = "default"):
         super().__init__()
         self.first_embedding = talker.get_input_embeddings().eval()
         self.predictor = talker.code_predictor.eval()
@@ -227,6 +282,48 @@ class SubcodeGreedyWrapper(torch.nn.Module):
         self.small_to_mtp_projection = talker.code_predictor.small_to_mtp_projection.eval()
         self.lm_head = talker.code_predictor.lm_head.eval()
         self.sub_embeddings = talker.code_predictor.get_input_embeddings().eval()
+        if attention_kernel not in {"exact", "sdpa"}:
+            raise ValueError(f"unsupported attention_kernel={attention_kernel!r}")
+        self.attention_kernel = attention_kernel
+        self.rms_export_mode = normalize_rms_export_mode(rms_export_mode)
+
+    def _attention(self, layer, hidden_states, attention_mask, position_embeddings):
+        attn = layer.self_attn
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, attn.head_dim)
+
+        query_states = canonical_rms_norm(
+            attn.q_proj(hidden_states).view(hidden_shape),
+            attn.q_norm,
+            self.rms_export_mode,
+        ).transpose(1, 2)
+        key_states = canonical_rms_norm(
+            attn.k_proj(hidden_states).view(hidden_shape),
+            attn.k_norm,
+            self.rms_export_mode,
+        ).transpose(1, 2)
+        value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        key_for_attention = repeat_kv(key_states, attn.num_key_value_groups)
+        value_for_attention = repeat_kv(value_states, attn.num_key_value_groups)
+        if self.attention_kernel == "sdpa":
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_for_attention,
+                value_for_attention,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=attn.scaling,
+            )
+        else:
+            attn_weights = torch.matmul(query_states, key_for_attention.transpose(2, 3)) * attn.scaling
+            attn_weights = attn_weights + attention_mask
+            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_output = torch.matmul(attn_weights, value_for_attention)
+        return attn.o_proj(attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous())
 
     def _predict_next(self, embeds, head_index: int):
         inputs_embeds = torch.cat(embeds, dim=1)
@@ -237,18 +334,21 @@ class SubcodeGreedyWrapper(torch.nn.Module):
         position_embeddings = self.predictor_model.rotary_emb(hidden_states, position_ids)
 
         for decoder_layer in self.predictor_model.layers:
-            hidden_states = decoder_layer(
-                hidden_states,
-                attention_mask=additive_mask,
-                position_ids=position_ids,
-                past_key_values=None,
-                output_attentions=False,
-                use_cache=False,
-                cache_position=None,
-                position_embeddings=position_embeddings,
-            )[0]
+            residual = hidden_states
+            normed_states = canonical_rms_norm(hidden_states, decoder_layer.input_layernorm, self.rms_export_mode)
+            hidden_states = residual + self._attention(
+                decoder_layer,
+                normed_states,
+                additive_mask,
+                position_embeddings,
+            )
 
-        hidden_states = self.predictor_model.norm(hidden_states)
+            residual = hidden_states
+            hidden_states = canonical_rms_norm(hidden_states, decoder_layer.post_attention_layernorm, self.rms_export_mode)
+            hidden_states = decoder_layer.mlp(hidden_states)
+            hidden_states = residual + hidden_states
+
+        hidden_states = canonical_rms_norm(hidden_states, self.predictor_model.norm, self.rms_export_mode)
         logits = self.lm_head[head_index](hidden_states[:, -1:, :])[:, -1, :]
         return logits
 
@@ -272,7 +372,7 @@ class SubcodeGreedyWrapper(torch.nn.Module):
 
 
 class SubcodeGreedyCachedWrapper(torch.nn.Module):
-    def __init__(self, talker):
+    def __init__(self, talker, rms_export_mode: str = "default"):
         super().__init__()
         self.first_embedding = talker.get_input_embeddings().eval()
         self.predictor_model = talker.code_predictor.model.eval()
@@ -280,6 +380,7 @@ class SubcodeGreedyCachedWrapper(torch.nn.Module):
         self.lm_head = talker.code_predictor.lm_head.eval()
         self.sub_embeddings = talker.code_predictor.get_input_embeddings().eval()
         self.max_sub_len = talker.code_predictor.config.num_code_groups + 1
+        self.rms_export_mode = normalize_rms_export_mode(rms_export_mode)
 
     def _mask(self, cache_position, query_len, dtype):
         columns = torch.arange(self.max_sub_len, device=cache_position.device, dtype=cache_position.dtype)
@@ -296,8 +397,16 @@ class SubcodeGreedyCachedWrapper(torch.nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, attn.head_dim)
 
-        query_states = attn.q_norm(attn.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = attn.k_norm(attn.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        query_states = canonical_rms_norm(
+            attn.q_proj(hidden_states).view(hidden_shape),
+            attn.q_norm,
+            self.rms_export_mode,
+        ).transpose(1, 2)
+        key_states = canonical_rms_norm(
+            attn.k_proj(hidden_states).view(hidden_shape),
+            attn.k_norm,
+            self.rms_export_mode,
+        ).transpose(1, 2)
         value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
@@ -338,7 +447,7 @@ class SubcodeGreedyCachedWrapper(torch.nn.Module):
             past_value = past_key_values[layer_index * 2 + 1]
 
             residual = hidden_states
-            normed_states = decoder_layer.input_layernorm(hidden_states)
+            normed_states = canonical_rms_norm(hidden_states, decoder_layer.input_layernorm, self.rms_export_mode)
             attn_output, present_key, present_value = self._attention(
                 decoder_layer,
                 normed_states,
@@ -351,13 +460,13 @@ class SubcodeGreedyCachedWrapper(torch.nn.Module):
             hidden_states = residual + attn_output
 
             residual = hidden_states
-            hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
+            hidden_states = canonical_rms_norm(hidden_states, decoder_layer.post_attention_layernorm, self.rms_export_mode)
             hidden_states = decoder_layer.mlp(hidden_states)
             hidden_states = residual + hidden_states
 
             present_key_values.extend([present_key, present_value])
 
-        return self.predictor_model.norm(hidden_states), present_key_values
+        return canonical_rms_norm(hidden_states, self.predictor_model.norm, self.rms_export_mode), present_key_values
 
     def forward(self, past_hidden, first_code):
         first_embed = self.first_embedding(first_code)
@@ -401,10 +510,11 @@ class SubcodeGreedyCachedWrapper(torch.nn.Module):
 
 
 class FusedNoCacheCodecStepWrapper(torch.nn.Module):
-    def __init__(self, talker):
+    def __init__(self, talker, rms_export_mode: str = "default", subcode_export_mode: str = "recompute"):
         super().__init__()
-        self.talker = TalkerNoCacheWrapper(talker)
-        self.subcode = SubcodeGreedyWrapper(talker)
+        self.talker = TalkerNoCacheWrapper(talker, rms_export_mode=rms_export_mode)
+        subcode_cls = SubcodeGreedyCachedWrapper if normalize_subcode_export_mode(subcode_export_mode) == "cached" else SubcodeGreedyWrapper
+        self.subcode = subcode_cls(talker, rms_export_mode=rms_export_mode)
         vocab_size = talker.config.vocab_size
         eos_id = talker.config.codec_eos_token_id
         suppress_from = vocab_size - 1024
@@ -443,10 +553,23 @@ class FusedNoCacheCodecStepWrapper(torch.nn.Module):
 
 
 class FusedCacheCodecStepWrapper(torch.nn.Module):
-    def __init__(self, talker, max_cache_len: int, attention_kernel: str = "exact"):
+    def __init__(
+        self,
+        talker,
+        max_cache_len: int,
+        attention_kernel: str = "exact",
+        rms_export_mode: str = "default",
+        subcode_export_mode: str = "recompute",
+    ):
         super().__init__()
-        self.talker = StatefulTalkerWrapper(talker, max_cache_len, attention_kernel=attention_kernel)
-        self.subcode = SubcodeGreedyWrapper(talker)
+        self.talker = StatefulTalkerWrapper(
+            talker,
+            max_cache_len,
+            attention_kernel=attention_kernel,
+            rms_export_mode=rms_export_mode,
+        )
+        subcode_cls = SubcodeGreedyCachedWrapper if normalize_subcode_export_mode(subcode_export_mode) == "cached" else SubcodeGreedyWrapper
+        self.subcode = subcode_cls(talker, rms_export_mode=rms_export_mode)
         vocab_size = talker.config.vocab_size
         eos_id = talker.config.codec_eos_token_id
         suppress_from = vocab_size - 1024
@@ -497,6 +620,327 @@ class FusedCacheCodecStepWrapper(torch.nn.Module):
         codes, sum_embed = self.subcode(last_hidden, first_code)
         frame_embed = sum_embed + tts_pad_embed
         return (first_code, codes, frame_embed, *present_key_values)
+
+
+class FullCacheStatefulTalkerWrapper(StatefulTalkerWrapper):
+    def _attention(self, layer, hidden_states, attention_mask, position_embeddings, past_key, past_value, cache_position):
+        attn = layer.self_attn
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, attn.head_dim)
+
+        query_states = canonical_rms_norm(
+            attn.q_proj(hidden_states).view(hidden_shape),
+            attn.q_norm,
+            self.rms_export_mode,
+        ).transpose(1, 2)
+        key_states = canonical_rms_norm(
+            attn.k_proj(hidden_states).view(hidden_shape),
+            attn.k_norm,
+            self.rms_export_mode,
+        ).transpose(1, 2)
+        value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_multimodal_rotary_pos_emb(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            attn.rope_scaling["mrope_section"],
+            attn.rope_scaling["interleaved"],
+        )
+
+        scatter_index = cache_position.view(1, 1, -1, 1).expand(
+            key_states.shape[0],
+            key_states.shape[1],
+            key_states.shape[2],
+            key_states.shape[3],
+        )
+        full_key = past_key.scatter(2, scatter_index, key_states)
+        full_value = past_value.scatter(2, scatter_index, value_states)
+
+        key_for_attention = repeat_kv(full_key, attn.num_key_value_groups)
+        value_for_attention = repeat_kv(full_value, attn.num_key_value_groups)
+        if self.attention_kernel == "sdpa":
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_for_attention,
+                value_for_attention,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=attn.scaling,
+            )
+        else:
+            attn_weights = torch.matmul(query_states, key_for_attention.transpose(2, 3)) * attn.scaling
+            attn_weights = attn_weights + attention_mask
+            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_output = torch.matmul(attn_weights, value_for_attention)
+        attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+        return attn.o_proj(attn_output), full_key, full_value
+
+
+class FusedCacheCodecUnrollWrapper(torch.nn.Module):
+    def __init__(
+        self,
+        talker,
+        max_cache_len: int,
+        unroll_steps: int,
+        attention_kernel: str = "exact",
+        rms_export_mode: str = "default",
+        subcode_export_mode: str = "recompute",
+    ):
+        super().__init__()
+        self.talker = FullCacheStatefulTalkerWrapper(
+            talker,
+            max_cache_len,
+            attention_kernel=attention_kernel,
+            rms_export_mode=rms_export_mode,
+        )
+        subcode_cls = SubcodeGreedyCachedWrapper if normalize_subcode_export_mode(subcode_export_mode) == "cached" else SubcodeGreedyWrapper
+        self.subcode = subcode_cls(talker, rms_export_mode=rms_export_mode)
+        self.max_cache_len = int(max_cache_len)
+        self.unroll_steps = int(unroll_steps)
+        vocab_size = talker.config.vocab_size
+        eos_id = talker.config.codec_eos_token_id
+        suppress_from = vocab_size - 1024
+        suppress_add = torch.zeros(vocab_size, dtype=torch.float32)
+        suppress_add[suppress_from:] = NEG_INF
+        suppress_add[eos_id] = 0.0
+        self.eos_id = int(eos_id)
+        self.register_buffer("suppress_add", suppress_add.view(1, -1), persistent=False)
+
+    def _mask(self, cache_position, query_len, dtype):
+        columns = torch.arange(self.max_cache_len, device=cache_position.device, dtype=cache_position.dtype)
+        allowed = columns.view(1, -1) <= cache_position.view(-1, 1)
+        mask = torch.where(
+            allowed,
+            torch.zeros((), dtype=dtype, device=cache_position.device),
+            torch.full((), NEG_INF, dtype=dtype, device=cache_position.device),
+        )
+        return mask.view(1, 1, query_len, self.max_cache_len)
+
+    def _step(
+        self,
+        inputs_embeds,
+        cache_position,
+        attention_mask,
+        tts_pad_embed,
+        repeated_mask,
+        allow_eos,
+        repetition_penalty,
+        past_key_values,
+    ):
+        logits, last_hidden, *present_key_values = self.talker(
+            inputs_embeds,
+            cache_position,
+            attention_mask,
+            *past_key_values,
+        )
+        scores = logits.to(torch.float32) + self.suppress_add
+        eos_score = torch.where(
+            allow_eos.view(1) > 0,
+            logits[:, self.eos_id].to(torch.float32),
+            torch.full_like(logits[:, self.eos_id].to(torch.float32), NEG_INF),
+        )
+        scores = torch.cat(
+            [scores[:, : self.eos_id], eos_score.view(1, 1), scores[:, self.eos_id + 1 :]],
+            dim=-1,
+        )
+        repeated = repeated_mask > 0.5
+        penalized_scores = torch.where(
+            scores < 0,
+            scores * repetition_penalty.view(1, 1),
+            scores / repetition_penalty.view(1, 1),
+        )
+        scores = torch.where(repeated, penalized_scores, scores)
+        first_code = torch.argmax(scores, dim=-1, keepdim=True).to(torch.long)
+        codes, sum_embed = self.subcode(last_hidden, first_code)
+        frame_embed = sum_embed + tts_pad_embed
+        repeated_mask = repeated_mask.scatter(1, first_code, torch.ones_like(first_code, dtype=repeated_mask.dtype))
+        return first_code, codes, frame_embed, repeated_mask, present_key_values
+
+    def forward(
+        self,
+        inputs_embeds,
+        cache_position,
+        attention_mask,
+        tts_pad_embed,
+        repeated_mask,
+        allow_eos_steps,
+        repetition_penalty,
+        *past_key_values,
+    ):
+        next_inputs = inputs_embeds
+        next_position = cache_position
+        next_mask = attention_mask
+        state = list(past_key_values)
+        first_items = []
+        code_items = []
+        frame_embed = tts_pad_embed
+        start_position = cache_position[-1:]
+        for index in range(self.unroll_steps):
+            first_code, codes, frame_embed, repeated_mask, state = self._step(
+                next_inputs,
+                next_position,
+                next_mask,
+                tts_pad_embed,
+                repeated_mask,
+                allow_eos_steps[index],
+                repetition_penalty,
+                state,
+            )
+            first_items.append(first_code)
+            code_items.append(codes.unsqueeze(1))
+            next_inputs = frame_embed
+            next_position = start_position + (index + 1)
+            next_mask = self._mask(next_position, 1, next_inputs.dtype)
+        first_codes = torch.cat(first_items, dim=1)
+        codes = torch.cat(code_items, dim=1)
+        return (first_codes, codes, frame_embed, repeated_mask, *state)
+
+
+class FusedCacheCodecDecodeUnrollWrapper(FusedCacheCodecUnrollWrapper):
+    def forward(
+        self,
+        inputs_embeds,
+        cache_position,
+        tts_pad_embed,
+        repeated_mask,
+        allow_eos_steps,
+        repetition_penalty,
+        *past_key_values,
+    ):
+        next_inputs = inputs_embeds
+        next_position = cache_position
+        next_mask = self._mask(next_position, 1, next_inputs.dtype)
+        state = list(past_key_values)
+        first_items = []
+        code_items = []
+        frame_embed = tts_pad_embed
+        start_position = cache_position[-1:]
+        for index in range(self.unroll_steps):
+            first_code, codes, frame_embed, repeated_mask, state = self._step(
+                next_inputs,
+                next_position,
+                next_mask,
+                tts_pad_embed,
+                repeated_mask,
+                allow_eos_steps[index],
+                repetition_penalty,
+                state,
+            )
+            first_items.append(first_code)
+            code_items.append(codes.unsqueeze(1))
+            next_inputs = frame_embed
+            next_position = start_position + (index + 1)
+            next_mask = self._mask(next_position, 1, next_inputs.dtype)
+        first_codes = torch.cat(first_items, dim=1)
+        codes = torch.cat(code_items, dim=1)
+        return (first_codes, codes, frame_embed, repeated_mask, *state)
+
+
+class FusedCacheCodecUnrollNoRepeatWrapper(FusedCacheCodecUnrollWrapper):
+    def _step_no_repeat(
+        self,
+        inputs_embeds,
+        cache_position,
+        attention_mask,
+        tts_pad_embed,
+        allow_eos,
+        past_key_values,
+    ):
+        logits, last_hidden, *present_key_values = self.talker(
+            inputs_embeds,
+            cache_position,
+            attention_mask,
+            *past_key_values,
+        )
+        scores = logits.to(torch.float32) + self.suppress_add
+        eos_score = torch.where(
+            allow_eos.view(1) > 0,
+            logits[:, self.eos_id].to(torch.float32),
+            torch.full_like(logits[:, self.eos_id].to(torch.float32), NEG_INF),
+        )
+        scores = torch.cat(
+            [scores[:, : self.eos_id], eos_score.view(1, 1), scores[:, self.eos_id + 1 :]],
+            dim=-1,
+        )
+        first_code = torch.argmax(scores, dim=-1, keepdim=True).to(torch.long)
+        codes, sum_embed = self.subcode(last_hidden, first_code)
+        frame_embed = sum_embed + tts_pad_embed
+        return first_code, codes, frame_embed, present_key_values
+
+    def forward(
+        self,
+        inputs_embeds,
+        cache_position,
+        attention_mask,
+        tts_pad_embed,
+        allow_eos_steps,
+        *past_key_values,
+    ):
+        next_inputs = inputs_embeds
+        next_position = cache_position
+        next_mask = attention_mask
+        state = list(past_key_values)
+        first_items = []
+        code_items = []
+        frame_embed = tts_pad_embed
+        start_position = cache_position[-1:]
+        for index in range(self.unroll_steps):
+            first_code, codes, frame_embed, state = self._step_no_repeat(
+                next_inputs,
+                next_position,
+                next_mask,
+                tts_pad_embed,
+                allow_eos_steps[index],
+                state,
+            )
+            first_items.append(first_code)
+            code_items.append(codes.unsqueeze(1))
+            next_inputs = frame_embed
+            next_position = start_position + (index + 1)
+            next_mask = self._mask(next_position, 1, next_inputs.dtype)
+        first_codes = torch.cat(first_items, dim=1)
+        codes = torch.cat(code_items, dim=1)
+        return (first_codes, codes, frame_embed, *state)
+
+
+class FusedCacheCodecDecodeUnrollNoRepeatWrapper(FusedCacheCodecUnrollNoRepeatWrapper):
+    def forward(
+        self,
+        inputs_embeds,
+        cache_position,
+        tts_pad_embed,
+        allow_eos_steps,
+        *past_key_values,
+    ):
+        next_inputs = inputs_embeds
+        next_position = cache_position
+        next_mask = self._mask(next_position, 1, next_inputs.dtype)
+        state = list(past_key_values)
+        first_items = []
+        code_items = []
+        frame_embed = tts_pad_embed
+        start_position = cache_position[-1:]
+        for index in range(self.unroll_steps):
+            first_code, codes, frame_embed, state = self._step_no_repeat(
+                next_inputs,
+                next_position,
+                next_mask,
+                tts_pad_embed,
+                allow_eos_steps[index],
+                state,
+            )
+            first_items.append(first_code)
+            code_items.append(codes.unsqueeze(1))
+            next_inputs = frame_embed
+            next_position = start_position + (index + 1)
+            next_mask = self._mask(next_position, 1, next_inputs.dtype)
+        first_codes = torch.cat(first_items, dim=1)
+        codes = torch.cat(code_items, dim=1)
+        return (first_codes, codes, frame_embed, *state)
 
 
 class DecodeWrapper(torch.nn.Module):
@@ -560,6 +1004,7 @@ def save_stateful_talker_model(
     example_seq_len: int,
     max_cache_len: int,
     attention_kernel: str,
+    rms_export_mode: str = "default",
     force: bool = False,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -571,7 +1016,12 @@ def save_stateful_talker_model(
     kv_heads = config.num_key_value_heads
     head_dim = config.head_dim
     cache_shape = (1, kv_heads, max_cache_len, head_dim)
-    wrapper = StatefulTalkerWrapper(talker, max_cache_len, attention_kernel=attention_kernel)
+    wrapper = StatefulTalkerWrapper(
+        talker,
+        max_cache_len,
+        attention_kernel=attention_kernel,
+        rms_export_mode=rms_export_mode,
+    )
 
     example_inputs = (
         torch.zeros((1, example_seq_len, config.hidden_size), dtype=torch.float32),
@@ -603,6 +1053,8 @@ def save_fused_cache_step_model(
     example_seq_len: int,
     max_cache_len: int,
     attention_kernel: str,
+    rms_export_mode: str = "default",
+    subcode_export_mode: str = "recompute",
     force: bool = False,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -614,7 +1066,13 @@ def save_fused_cache_step_model(
     kv_heads = config.num_key_value_heads
     head_dim = config.head_dim
     cache_shape = (1, kv_heads, max_cache_len, head_dim)
-    wrapper = FusedCacheCodecStepWrapper(talker, max_cache_len, attention_kernel=attention_kernel)
+    wrapper = FusedCacheCodecStepWrapper(
+        talker,
+        max_cache_len,
+        attention_kernel=attention_kernel,
+        rms_export_mode=rms_export_mode,
+        subcode_export_mode=subcode_export_mode,
+    )
 
     example_inputs = (
         torch.zeros((1, example_seq_len, config.hidden_size), dtype=torch.float32),
@@ -657,6 +1115,211 @@ def save_fused_cache_step_model(
 
     ov.save_model(ov_model, path, compress_to_fp16=True)
     print(f"saved fused cache {attention_kernel} {path} in {time.time() - started:.1f}s", flush=True)
+
+
+def save_fused_cache_unroll_model(
+    talker,
+    path: Path,
+    example_seq_len: int,
+    max_cache_len: int,
+    unroll_steps: int,
+    attention_kernel: str,
+    rms_export_mode: str = "default",
+    subcode_export_mode: str = "recompute",
+    no_repeat: bool = False,
+    force: bool = False,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not force and path.exists() and path.with_suffix(".bin").exists():
+        return
+
+    started = time.time()
+    config = talker.config
+    example_seq_len = min(int(example_seq_len), int(max_cache_len) - int(unroll_steps) + 1)
+    if example_seq_len < 1:
+        raise ValueError(
+            f"cache length {max_cache_len} is too small for fused cache unroll{unroll_steps}; "
+            "increase --cache-buckets or reduce --fused-cache-unroll-steps"
+        )
+    kv_heads = config.num_key_value_heads
+    head_dim = config.head_dim
+    cache_shape = (1, kv_heads, max_cache_len, head_dim)
+    wrapper_cls = FusedCacheCodecUnrollNoRepeatWrapper if no_repeat else FusedCacheCodecUnrollWrapper
+    wrapper = wrapper_cls(
+        talker,
+        max_cache_len=max_cache_len,
+        unroll_steps=unroll_steps,
+        attention_kernel=attention_kernel,
+        rms_export_mode=rms_export_mode,
+        subcode_export_mode=subcode_export_mode,
+    )
+
+    base_inputs = (
+        torch.zeros((1, example_seq_len, config.hidden_size), dtype=torch.float32),
+        torch.arange(example_seq_len, dtype=torch.long),
+        torch.zeros((1, 1, example_seq_len, max_cache_len), dtype=torch.float32),
+        torch.zeros((1, 1, config.hidden_size), dtype=torch.float32),
+    )
+    penalty_inputs = () if no_repeat else (
+        torch.zeros((1, config.vocab_size), dtype=torch.float32),
+        torch.ones((unroll_steps,), dtype=torch.float32),
+        torch.full((1,), 1.05, dtype=torch.float32),
+    )
+    no_repeat_inputs = (torch.ones((unroll_steps,), dtype=torch.float32),) if no_repeat else ()
+    example_inputs = (
+        *base_inputs,
+        *penalty_inputs,
+        *no_repeat_inputs,
+        *[torch.zeros(cache_shape, dtype=torch.float32) for _ in range(config.num_hidden_layers * 2)],
+    )
+    input_shapes = [
+        ov.PartialShape([1, -1, config.hidden_size]),
+        ov.PartialShape([-1]),
+        ov.PartialShape([1, 1, -1, max_cache_len]),
+        ov.PartialShape([1, 1, config.hidden_size]),
+    ]
+    if no_repeat:
+        input_shapes.extend([ov.PartialShape([unroll_steps])])
+    else:
+        input_shapes.extend([
+        ov.PartialShape([1, config.vocab_size]),
+        ov.PartialShape([unroll_steps]),
+        ov.PartialShape([1]),
+        ])
+    input_shapes.extend([ov.PartialShape(cache_shape) for _ in range(config.num_hidden_layers * 2)])
+    ov_model = ov.convert_model(wrapper.eval(), example_input=example_inputs, input=input_shapes)
+
+    input_names, stateful_output_names, state_pairs = make_stateful_names(config.num_hidden_layers)
+    if no_repeat:
+        input_names = [
+            "inputs_embeds",
+            "cache_position",
+            "attention_mask",
+            "tts_pad_embed",
+            "allow_eos_steps",
+            *input_names[3:],
+        ]
+        output_names = ["first_codes", "codes", "frame_embed", *stateful_output_names[2:]]
+    else:
+        input_names = [
+            "inputs_embeds",
+            "cache_position",
+            "attention_mask",
+            "tts_pad_embed",
+            "repeated_mask",
+            "allow_eos_steps",
+            "repetition_penalty",
+            *input_names[3:],
+        ]
+        output_names = ["first_codes", "codes", "frame_embed", "repeated_mask", *stateful_output_names[2:]]
+    apply_stateful_names(ov_model, input_names, output_names, state_pairs)
+
+    ov.save_model(ov_model, path, compress_to_fp16=True)
+    norepeat_suffix = " norepeat" if no_repeat else ""
+    print(
+        f"saved fused cache unroll{unroll_steps}{norepeat_suffix} {attention_kernel} {path} "
+        f"in {time.time() - started:.1f}s",
+        flush=True,
+    )
+
+
+def save_fused_cache_decode_unroll_model(
+    talker,
+    path: Path,
+    max_cache_len: int,
+    unroll_steps: int,
+    attention_kernel: str,
+    rms_export_mode: str = "default",
+    subcode_export_mode: str = "recompute",
+    stateful_repeated_mask: bool = False,
+    no_repeat: bool = False,
+    force: bool = False,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not force and path.exists() and path.with_suffix(".bin").exists():
+        return
+
+    started = time.time()
+    config = talker.config
+    kv_heads = config.num_key_value_heads
+    head_dim = config.head_dim
+    cache_shape = (1, kv_heads, max_cache_len, head_dim)
+    wrapper_cls = FusedCacheCodecDecodeUnrollNoRepeatWrapper if no_repeat else FusedCacheCodecDecodeUnrollWrapper
+    wrapper = wrapper_cls(
+        talker,
+        max_cache_len=max_cache_len,
+        unroll_steps=unroll_steps,
+        attention_kernel=attention_kernel,
+        rms_export_mode=rms_export_mode,
+        subcode_export_mode=subcode_export_mode,
+    )
+
+    base_inputs = (
+        torch.zeros((1, 1, config.hidden_size), dtype=torch.float32),
+        torch.zeros((1,), dtype=torch.long),
+        torch.zeros((1, 1, config.hidden_size), dtype=torch.float32),
+    )
+    penalty_inputs = () if no_repeat else (
+        torch.zeros((1, config.vocab_size), dtype=torch.float32),
+        torch.ones((unroll_steps,), dtype=torch.float32),
+        torch.full((1,), 1.05, dtype=torch.float32),
+    )
+    no_repeat_inputs = (torch.ones((unroll_steps,), dtype=torch.float32),) if no_repeat else ()
+    example_inputs = (
+        *base_inputs,
+        *penalty_inputs,
+        *no_repeat_inputs,
+        *[torch.zeros(cache_shape, dtype=torch.float32) for _ in range(config.num_hidden_layers * 2)],
+    )
+    input_shapes = [
+        ov.PartialShape([1, 1, config.hidden_size]),
+        ov.PartialShape([1]),
+        ov.PartialShape([1, 1, config.hidden_size]),
+    ]
+    if no_repeat:
+        input_shapes.extend([ov.PartialShape([unroll_steps])])
+    else:
+        input_shapes.extend([
+        ov.PartialShape([1, config.vocab_size]),
+        ov.PartialShape([unroll_steps]),
+        ov.PartialShape([1]),
+        ])
+    input_shapes.extend([ov.PartialShape(cache_shape) for _ in range(config.num_hidden_layers * 2)])
+    ov_model = ov.convert_model(wrapper.eval(), example_input=example_inputs, input=input_shapes)
+
+    input_names, stateful_output_names, state_pairs = make_stateful_names(config.num_hidden_layers)
+    if no_repeat:
+        input_names = [
+            "inputs_embeds",
+            "cache_position",
+            "tts_pad_embed",
+            "allow_eos_steps",
+            *input_names[3:],
+        ]
+        output_names = ["first_codes", "codes", "frame_embed", *stateful_output_names[2:]]
+    else:
+        input_names = [
+            "inputs_embeds",
+            "cache_position",
+            "tts_pad_embed",
+            "repeated_mask",
+            "allow_eos_steps",
+            "repetition_penalty",
+            *input_names[3:],
+        ]
+        output_names = ["first_codes", "codes", "frame_embed", "repeated_mask_out", *stateful_output_names[2:]]
+    if stateful_repeated_mask and not no_repeat:
+        state_pairs["repeated_mask"] = "repeated_mask_out"
+    apply_stateful_names(ov_model, input_names, output_names, state_pairs)
+
+    ov.save_model(ov_model, path, compress_to_fp16=True)
+    mask_suffix = " statefulmask" if stateful_repeated_mask else ""
+    mask_suffix = f"{mask_suffix} norepeat" if no_repeat else mask_suffix
+    print(
+        f"saved fused cache decode unroll{unroll_steps}{mask_suffix} {attention_kernel} {path} "
+        f"in {time.time() - started:.1f}s",
+        flush=True,
+    )
 
 
 def load_model(model_dir: str):
@@ -780,11 +1443,253 @@ def parse_str_list(value: str) -> list[str]:
     return sorted(set(items))
 
 
-def cache_graphs(prefix: str, cache_buckets: list[int], cache_kernels: list[str]):
+def export_openvino_tokenizer(model_dir: str, out_dir: Path, force: bool = False) -> dict[str, str]:
+    tokenizer_path = out_dir / "openvino_tokenizer.xml"
+    detokenizer_path = out_dir / "openvino_detokenizer.xml"
+    if tokenizer_path.exists() and detokenizer_path.exists() and not force:
+        return {
+            "tokenizer": tokenizer_path.name,
+            "detokenizer": detokenizer_path.name,
+        }
+    try:
+        from openvino_tokenizers import convert_tokenizer
+    except Exception as exc:
+        raise RuntimeError(
+            "exporting OpenVINO tokenizer IR requires openvino-tokenizers; install the export/native extras"
+        ) from exc
+
+    started = time.time()
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+    converted = convert_tokenizer(tokenizer, with_detokenizer=True)
+    if not isinstance(converted, tuple) or len(converted) != 2:
+        raise RuntimeError("openvino_tokenizers.convert_tokenizer did not return tokenizer/detokenizer models")
+    ov_tokenizer, ov_detokenizer = converted
+    ov.save_model(ov_tokenizer, tokenizer_path)
+    ov.save_model(ov_detokenizer, detokenizer_path)
+    print(f"exported OpenVINO tokenizer IR in {time.time() - started:.1f}s", flush=True)
     return {
-        kernel: {str(length): f"{prefix}_{kernel}_cache{length}.xml" for length in cache_buckets}
+        "tokenizer": tokenizer_path.name,
+        "detokenizer": detokenizer_path.name,
+    }
+
+
+def update_manifest_tokenizer_ir(out_dir: Path, tokenizer_ir: dict[str, str]) -> None:
+    manifest_path = out_dir / "manifest.json"
+    if not manifest_path.exists():
+        return
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    manifest["tokenizer_ir"] = tokenizer_ir
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+
+def cache_graphs(prefix: str, cache_buckets: list[int], cache_kernels: list[str], out_dir: Path):
+    def maybe_graph(name: str) -> str | None:
+        return name if (out_dir / name).exists() else None
+
+    return {
+        kernel: {
+            str(length): graph
+            for length in cache_buckets
+            if (graph := maybe_graph(f"{prefix}_{kernel}_cache{length}.xml"))
+        }
         for kernel in cache_kernels
     }
+
+
+def add_graph_suffix(path: str, suffix: str) -> str:
+    if not suffix:
+        return path
+    item = Path(path)
+    return f"{item.stem}{suffix}{item.suffix}"
+
+
+def codegen_variant_feature_suffix(rms_export_mode: str, subcode_export_mode: str) -> str:
+    features = []
+    subcode_mode = normalize_subcode_export_mode(subcode_export_mode)
+    rms_mode = normalize_rms_export_mode(rms_export_mode)
+    if subcode_mode == "cached":
+        features.append("cachedsub")
+    if rms_mode != "default":
+        features.append("rms" if rms_mode == "canonical" else f"rms_{rms_mode}")
+    return "_".join(features)
+
+
+def codegen_variant_names(rms_export_mode: str, subcode_export_mode: str, fused_cache_kernels: list[str]) -> list[str]:
+    suffix = codegen_variant_feature_suffix(rms_export_mode, subcode_export_mode)
+    if not suffix:
+        return []
+    names = [f"fp16_fused_{suffix}"]
+    if "sdpa" in fused_cache_kernels:
+        names.append(f"fp16_sdpa_fused_{suffix}")
+    return names
+
+
+def build_codegen_variant_graphs(
+    out_dir: Path,
+    cache_buckets: list[int],
+    cache_kernels: list[str],
+    fused_cache_kernels: list[str],
+    fused_cache_unroll_steps: list[int],
+    fused_cache_decode_unroll_steps: list[int],
+    fused_cache_stateful_mask_steps: list[int],
+    fused_cache_norepeat_steps: list[int],
+    rms_suffix: str,
+    fused_suffix: str,
+) -> dict:
+    variant_graphs = {}
+    def maybe_graph(name: str) -> str | None:
+        return name if (out_dir / name).exists() else None
+
+    if rms_suffix:
+        variant_graphs.update(
+            {
+                "talker": maybe_graph(add_graph_suffix("talker_no_cache.xml", rms_suffix)),
+                "talker_stateful": add_graph_suffix(
+                    f"talker_stateful_exact_cache{max(cache_buckets)}.xml",
+                    rms_suffix,
+                ) if cache_buckets and (out_dir / add_graph_suffix(f"talker_stateful_exact_cache{max(cache_buckets)}.xml", rms_suffix)).exists() else None,
+                "talker_stateful_buckets": {
+                    kernel: {
+                        str(length): graph
+                        for length in cache_buckets
+                        if (graph := maybe_graph(add_graph_suffix(f"talker_stateful_{kernel}_cache{length}.xml", rms_suffix)))
+                    }
+                    for kernel in cache_kernels
+                },
+                "subcode_greedy": maybe_graph(add_graph_suffix("subcode_greedy.xml", rms_suffix)),
+                "subcode_greedy_cached": maybe_graph(add_graph_suffix("subcode_greedy_cached.xml", rms_suffix)),
+            }
+        )
+    if fused_suffix:
+        variant_graphs.update(
+            {
+        "fused_cache_step_buckets": {
+            kernel: {
+                str(length): graph
+                for length in cache_buckets
+                if (graph := maybe_graph(add_graph_suffix(f"fused_cache_step_{kernel}_cache{length}.xml", fused_suffix)))
+            }
+            for kernel in fused_cache_kernels
+        },
+        "fused_cache_step_unroll_buckets": {
+            kernel: {
+                str(unroll): {
+                    str(length): graph
+                    for length in cache_buckets
+                    if (graph := maybe_graph(add_graph_suffix(
+                        f"fused_cache_step_unroll{unroll}_{kernel}_cache{length}.xml",
+                        fused_suffix,
+                    )))
+                }
+                for unroll in fused_cache_unroll_steps
+            }
+            for kernel in fused_cache_kernels
+        },
+        "fused_cache_decode_unroll_buckets": {
+            kernel: {
+                str(unroll): {
+                    str(length): graph
+                    for length in cache_buckets
+                    if (graph := maybe_graph(add_graph_suffix(
+                        f"fused_cache_decode_unroll{unroll}_{kernel}_cache{length}.xml",
+                        fused_suffix,
+                    )))
+                }
+                for unroll in fused_cache_decode_unroll_steps
+            }
+            for kernel in fused_cache_kernels
+        },
+        "fused_cache_decode_unroll_stateful_mask_buckets": {
+            kernel: {
+                str(unroll): {
+                    str(length): graph
+                    for length in cache_buckets
+                    if (graph := maybe_graph(add_graph_suffix(
+                        f"fused_cache_decode_unroll{unroll}_{kernel}_statefulmask_cache{length}.xml",
+                        fused_suffix,
+                    )))
+                }
+                for unroll in fused_cache_stateful_mask_steps
+            }
+            for kernel in fused_cache_kernels
+        },
+        "fused_cache_step_unroll_norepeat_buckets": {
+            kernel: {
+                str(unroll): {
+                    str(length): graph
+                    for length in cache_buckets
+                    if (graph := maybe_graph(add_graph_suffix(
+                        f"fused_cache_step_unroll{unroll}_{kernel}_norepeat_cache{length}.xml",
+                        fused_suffix,
+                    )))
+                }
+                for unroll in fused_cache_norepeat_steps
+            }
+            for kernel in fused_cache_kernels
+        },
+        "fused_cache_decode_unroll_norepeat_buckets": {
+            kernel: {
+                str(unroll): {
+                    str(length): graph
+                    for length in cache_buckets
+                    if (graph := maybe_graph(add_graph_suffix(
+                        f"fused_cache_decode_unroll{unroll}_{kernel}_norepeat_cache{length}.xml",
+                        fused_suffix,
+                    )))
+                }
+                for unroll in fused_cache_norepeat_steps
+            }
+            for kernel in fused_cache_kernels
+        },
+        "fused_no_cache_step": maybe_graph(add_graph_suffix("fused_no_cache_step.xml", fused_suffix)),
+            }
+        )
+    return variant_graphs
+
+
+def update_codegen_variant_manifest(
+    out_dir: Path,
+    rms_export_mode: str,
+    subcode_export_mode: str,
+    cache_buckets: list[int],
+    cache_kernels: list[str],
+    fused_cache_kernels: list[str],
+    fused_cache_unroll_steps: list[int],
+    fused_cache_decode_unroll_steps: list[int],
+    fused_cache_stateful_mask_steps: list[int],
+    fused_cache_norepeat_steps: list[int],
+) -> None:
+    rms_suffix = rms_graph_suffix(rms_export_mode)
+    fused_suffix = fused_codegen_graph_suffix(rms_export_mode, subcode_export_mode)
+    if not rms_suffix and not fused_suffix:
+        return
+    manifest_path = out_dir / "manifest.json"
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    variant_graphs = build_codegen_variant_graphs(
+        out_dir,
+        cache_buckets,
+        cache_kernels,
+        fused_cache_kernels,
+        fused_cache_unroll_steps,
+        fused_cache_decode_unroll_steps,
+        fused_cache_stateful_mask_steps,
+        fused_cache_norepeat_steps,
+        rms_suffix,
+        fused_suffix,
+    )
+    variants = manifest.setdefault("graph_variants", {})
+    for name in codegen_variant_names(rms_export_mode, subcode_export_mode, fused_cache_kernels):
+        variants[name] = {
+            "precision": "fp16_weights",
+            "rms_export_mode": normalize_rms_export_mode(rms_export_mode),
+            "subcode_export_mode": normalize_subcode_export_mode(subcode_export_mode),
+            "graphs": variant_graphs,
+        }
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
 
 
 def write_manifest(
@@ -794,6 +1699,10 @@ def write_manifest(
     cache_buckets: list[int],
     cache_kernels: list[str],
     fused_cache_kernels: list[str],
+    fused_cache_unroll_steps: list[int],
+    fused_cache_decode_unroll_steps: list[int],
+    fused_cache_stateful_mask_steps: list[int],
+    fused_cache_norepeat_steps: list[int],
     stream_decoder_chunks: list[int],
     stream_decoder_left_context: int,
     stream_decoder_first_chunks: list[int],
@@ -809,8 +1718,71 @@ def write_manifest(
         speech_config = json.load(f)
 
     max_cache_len = max(cache_buckets) if cache_buckets else 0
-    stateful_buckets = cache_graphs("talker_stateful", cache_buckets, cache_kernels)
-    fused_cache_buckets = cache_graphs("fused_cache_step", cache_buckets, fused_cache_kernels)
+    default_cache_kernel = "exact" if "exact" in cache_kernels else (cache_kernels[0] if cache_kernels else None)
+    if default_cache_kernel is None and fused_cache_kernels:
+        default_cache_kernel = "exact" if "exact" in fused_cache_kernels else fused_cache_kernels[0]
+    stateful_buckets = cache_graphs("talker_stateful", cache_buckets, cache_kernels, out_dir)
+    fused_cache_buckets = cache_graphs("fused_cache_step", cache_buckets, fused_cache_kernels, out_dir)
+    fused_cache_unroll_buckets = {
+        kernel: {
+            str(unroll): {
+                str(length): graph
+                for length in cache_buckets
+                if (graph := f"fused_cache_step_unroll{unroll}_{kernel}_cache{length}.xml")
+                and (out_dir / graph).exists()
+            }
+            for unroll in fused_cache_unroll_steps
+        }
+        for kernel in fused_cache_kernels
+    }
+    fused_cache_decode_unroll_buckets = {
+        kernel: {
+            str(unroll): {
+                str(length): graph
+                for length in cache_buckets
+                if (graph := f"fused_cache_decode_unroll{unroll}_{kernel}_cache{length}.xml")
+                and (out_dir / graph).exists()
+            }
+            for unroll in fused_cache_decode_unroll_steps
+        }
+        for kernel in fused_cache_kernels
+    }
+    fused_cache_decode_unroll_stateful_mask_buckets = {
+        kernel: {
+            str(unroll): {
+                str(length): graph
+                for length in cache_buckets
+                if (graph := f"fused_cache_decode_unroll{unroll}_{kernel}_statefulmask_cache{length}.xml")
+                and (out_dir / graph).exists()
+            }
+            for unroll in fused_cache_stateful_mask_steps
+        }
+        for kernel in fused_cache_kernels
+    }
+    fused_cache_unroll_norepeat_buckets = {
+        kernel: {
+            str(unroll): {
+                str(length): graph
+                for length in cache_buckets
+                if (graph := f"fused_cache_step_unroll{unroll}_{kernel}_norepeat_cache{length}.xml")
+                and (out_dir / graph).exists()
+            }
+            for unroll in fused_cache_norepeat_steps
+        }
+        for kernel in fused_cache_kernels
+    }
+    fused_cache_decode_unroll_norepeat_buckets = {
+        kernel: {
+            str(unroll): {
+                str(length): graph
+                for length in cache_buckets
+                if (graph := f"fused_cache_decode_unroll{unroll}_{kernel}_norepeat_cache{length}.xml")
+                and (out_dir / graph).exists()
+            }
+            for unroll in fused_cache_norepeat_steps
+        }
+        for kernel in fused_cache_kernels
+    }
     stream_decoder_contexts = {}
     first_context_graphs = {}
     for chunk_frames in stream_decoder_first_chunks:
@@ -838,7 +1810,7 @@ def write_manifest(
         "max_cache_len": int(max_cache_len),
         "cache_buckets": cache_buckets,
         "cache_kernels": cache_kernels,
-        "default_cache_kernel": "exact" if "exact" in cache_kernels else cache_kernels[0],
+        "default_cache_kernel": default_cache_kernel,
         "default_cache_step": "split",
         "graphs": {
             "text_embedding": "text_embedding.xml",
@@ -847,11 +1819,20 @@ def write_manifest(
             "talker_stateful": stateful_buckets.get("exact", {}).get(str(max_cache_len)),
             "talker_stateful_buckets": stateful_buckets,
             "fused_cache_step_buckets": fused_cache_buckets,
+            "fused_cache_step_unroll_buckets": fused_cache_unroll_buckets,
+            "fused_cache_decode_unroll_buckets": fused_cache_decode_unroll_buckets,
+            "fused_cache_decode_unroll_stateful_mask_buckets": fused_cache_decode_unroll_stateful_mask_buckets,
+            "fused_cache_step_unroll_norepeat_buckets": fused_cache_unroll_norepeat_buckets,
+            "fused_cache_decode_unroll_norepeat_buckets": fused_cache_decode_unroll_norepeat_buckets,
             "subcode_greedy": "subcode_greedy.xml",
             "subcode_greedy_cached": "subcode_greedy_cached.xml",
             "code_frame_embedding": "code_frame_embedding.xml",
             "fused_no_cache_step": "fused_no_cache_step.xml",
-            "speech_decoder": {str(t): f"speech_decoder_t{t}.xml" for t in decoder_tokens},
+            "speech_decoder": {
+                str(t): graph
+                for t in decoder_tokens
+                if (graph := f"speech_decoder_t{t}.xml") and (out_dir / graph).exists()
+            },
         },
         "ids": {
             "tts_bos_token_id": config["tts_bos_token_id"],
@@ -905,6 +1886,13 @@ def write_manifest(
             "contexts": stream_decoder_contexts,
             "output_format": "pcm_f32",
         }
+    tokenizer_ir = {}
+    if (out_dir / "openvino_tokenizer.xml").exists():
+        tokenizer_ir["tokenizer"] = "openvino_tokenizer.xml"
+    if (out_dir / "openvino_detokenizer.xml").exists():
+        tokenizer_ir["detokenizer"] = "openvino_detokenizer.xml"
+    if tokenizer_ir:
+        manifest["tokenizer_ir"] = tokenizer_ir
     if (out_dir / "speech_encoder.xml").exists():
         manifest["graphs"]["speech_encoder"] = "speech_encoder.xml"
     if (out_dir / "speaker_encoder.xml").exists():
@@ -929,18 +1917,52 @@ def main() -> None:
     parser.add_argument("--max-cache-len", type=int, default=384, help=argparse.SUPPRESS)
     parser.add_argument(
         "--cache-buckets",
-        default="128,192,256,320,384",
+        default="80,96,112,128,192,256,320,384",
         help="Comma-separated stateful talker cache lengths.",
     )
     parser.add_argument("--cache-kernels", default="exact,sdpa", help="Comma-separated stateful attention kernels.")
     parser.add_argument("--fused-cache-kernels", default="exact", help="Comma-separated fused cache kernels.")
+    parser.add_argument("--fused-cache-unroll-steps", default="4,6,8,12", help="Comma-separated fused cache greedy unroll sizes.")
+    parser.add_argument(
+        "--fused-cache-decode-unroll-steps",
+        default="4,8,12",
+        help="Comma-separated steady-state fused cache greedy unroll sizes with in-graph masks.",
+    )
+    parser.add_argument(
+        "--fused-cache-stateful-mask-steps",
+        default="4,8,12",
+        help="Comma-separated steady-state fused cache unroll sizes with repeated_mask stored as OpenVINO state.",
+    )
+    parser.add_argument(
+        "--fused-cache-norepeat-steps",
+        default="4",
+        help="Comma-separated fused cache unroll sizes for greedy repetition_penalty=1.0 no-repeat fast graphs.",
+    )
     parser.add_argument("--decoder-tokens", default="64,128,256")
     parser.add_argument("--stream-decoder-chunks", default="8,12,24")
     parser.add_argument("--stream-decoder-first-chunks", default="6,8,12")
     parser.add_argument("--stream-decoder-left-context", type=int, default=25)
+    parser.add_argument(
+        "--rms-export-mode",
+        default="default",
+        choices=RMS_EXPORT_MODES,
+        help=(
+            "Export alternate codegen graphs with a canonical Python RMSNorm decomposition. "
+            "Use 'canonical' to create fp16_fused_rms graph variants for RMS fusion experiments."
+        ),
+    )
+    parser.add_argument(
+        "--fused-subcode-mode",
+        default="recompute",
+        choices=SUBCODE_EXPORT_MODES,
+        help="Use cached subcode predictor inside fused codegen graphs to avoid recomputing the subcode prefix each group.",
+    )
     parser.add_argument("--force-stateful", action="store_true", help="Re-export stateful talker cache graphs.")
     parser.add_argument("--force-cache-graphs", action="store_true", help="Re-export stateful and fused cache graphs.")
     parser.add_argument("--export-clone-graphs", action="store_true", help="Export speech/speaker encoder graphs when available.")
+    parser.add_argument("--skip-tokenizer-ir", action="store_true", help="Do not export OpenVINO tokenizer/detokenizer IR.")
+    parser.add_argument("--force-tokenizer-ir", action="store_true", help="Re-export OpenVINO tokenizer/detokenizer IR.")
+    parser.add_argument("--tokenizer-only", action="store_true", help="Only export OpenVINO tokenizer IR and update manifest.")
     args = parser.parse_args()
 
     with open(os.path.join(args.model, "config.json"), "r", encoding="utf-8") as f:
@@ -956,29 +1978,74 @@ def main() -> None:
     cache_buckets = parse_int_list(args.cache_buckets) if args.cache_buckets else [int(args.max_cache_len)]
     cache_kernels = parse_str_list(args.cache_kernels)
     fused_cache_kernels = parse_str_list(args.fused_cache_kernels)
+    fused_cache_unroll_steps = parse_int_list(args.fused_cache_unroll_steps)
+    fused_cache_decode_unroll_steps = parse_int_list(args.fused_cache_decode_unroll_steps)
+    fused_cache_stateful_mask_steps = parse_int_list(args.fused_cache_stateful_mask_steps)
+    fused_cache_norepeat_steps = parse_int_list(args.fused_cache_norepeat_steps)
+    rms_export_mode = normalize_rms_export_mode(args.rms_export_mode)
+    subcode_export_mode = normalize_subcode_export_mode(args.fused_subcode_mode)
+    rms_suffix = rms_graph_suffix(rms_export_mode)
+    fused_suffix = fused_codegen_graph_suffix(rms_export_mode, subcode_export_mode)
+    graph = lambda name: add_graph_suffix(name, rms_suffix)
+    fused_graph = lambda name: add_graph_suffix(name, fused_suffix)
     if not cache_buckets:
         raise ValueError("at least one cache bucket is required")
     for kernel in cache_kernels + fused_cache_kernels:
         if kernel not in {"exact", "sdpa"}:
             raise ValueError(f"unsupported cache kernel {kernel!r}")
+    if args.tokenizer_only:
+        tokenizer_ir = export_openvino_tokenizer(args.model, out_dir, force=args.force_tokenizer_ir)
+        update_manifest_tokenizer_ir(out_dir, tokenizer_ir)
+        print(f"tokenizer export complete: {out_dir / 'manifest.json'}", flush=True)
+        return
 
     core_paths = [
         out_dir / "text_embedding.xml",
         out_dir / "codec_embedding.xml",
-        out_dir / "talker_no_cache.xml",
-        out_dir / "subcode_greedy.xml",
-        out_dir / "subcode_greedy_cached.xml",
+        out_dir / graph("talker_no_cache.xml"),
+        out_dir / graph("subcode_greedy.xml"),
+        out_dir / graph("subcode_greedy_cached.xml"),
         out_dir / "code_frame_embedding.xml",
-        out_dir / "fused_no_cache_step.xml",
+        out_dir / fused_graph("fused_no_cache_step.xml"),
     ]
     core_paths.extend(
-        out_dir / f"talker_stateful_{kernel}_cache{length}.xml"
+        out_dir / graph(f"talker_stateful_{kernel}_cache{length}.xml")
         for kernel in cache_kernels
         for length in cache_buckets
     )
     core_paths.extend(
-        out_dir / f"fused_cache_step_{kernel}_cache{length}.xml"
+        out_dir / fused_graph(f"fused_cache_step_{kernel}_cache{length}.xml")
         for kernel in fused_cache_kernels
+        for length in cache_buckets
+    )
+    core_paths.extend(
+        out_dir / fused_graph(f"fused_cache_step_unroll{unroll}_{kernel}_cache{length}.xml")
+        for kernel in fused_cache_kernels
+        for unroll in fused_cache_unroll_steps
+        for length in cache_buckets
+    )
+    core_paths.extend(
+        out_dir / fused_graph(f"fused_cache_decode_unroll{unroll}_{kernel}_cache{length}.xml")
+        for kernel in fused_cache_kernels
+        for unroll in fused_cache_decode_unroll_steps
+        for length in cache_buckets
+    )
+    core_paths.extend(
+        out_dir / fused_graph(f"fused_cache_decode_unroll{unroll}_{kernel}_statefulmask_cache{length}.xml")
+        for kernel in fused_cache_kernels
+        for unroll in fused_cache_stateful_mask_steps
+        for length in cache_buckets
+    )
+    core_paths.extend(
+        out_dir / fused_graph(f"fused_cache_step_unroll{unroll}_{kernel}_norepeat_cache{length}.xml")
+        for kernel in fused_cache_kernels
+        for unroll in fused_cache_norepeat_steps
+        for length in cache_buckets
+    )
+    core_paths.extend(
+        out_dir / fused_graph(f"fused_cache_decode_unroll{unroll}_{kernel}_norepeat_cache{length}.xml")
+        for kernel in fused_cache_kernels
+        for unroll in fused_cache_norepeat_steps
         for length in cache_buckets
     )
     force_cache_graphs = args.force_stateful or args.force_cache_graphs
@@ -1011,41 +2078,46 @@ def main() -> None:
             [ov.PartialShape([1, -1, talker.config.num_code_groups])],
         )
         save_openvino_model(
-            TalkerNoCacheWrapper(talker),
+            TalkerNoCacheWrapper(talker, rms_export_mode=rms_export_mode),
             (torch.zeros((1, args.example_seq_len, talker.config.hidden_size), dtype=torch.float32),),
-            out_dir / "talker_no_cache.xml",
+            out_dir / graph("talker_no_cache.xml"),
             [ov.PartialShape([1, -1, talker.config.hidden_size])],
         )
         for kernel in cache_kernels:
             for cache_len in cache_buckets:
                 save_stateful_talker_model(
                     talker,
-                    out_dir / f"talker_stateful_{kernel}_cache{cache_len}.xml",
+                    out_dir / graph(f"talker_stateful_{kernel}_cache{cache_len}.xml"),
                     min(args.example_seq_len, cache_len),
                     cache_len,
                     kernel,
+                    rms_export_mode=rms_export_mode,
                     force=force_cache_graphs,
                 )
         save_openvino_model(
-            SubcodeGreedyWrapper(talker),
+            SubcodeGreedyWrapper(talker, rms_export_mode=rms_export_mode),
             (
                 torch.zeros((1, 1, talker.config.hidden_size), dtype=torch.float32),
                 torch.zeros((1, 1), dtype=torch.long),
             ),
-            out_dir / "subcode_greedy.xml",
+            out_dir / graph("subcode_greedy.xml"),
             [ov.PartialShape([1, 1, talker.config.hidden_size]), ov.PartialShape([1, 1])],
         )
         save_openvino_model(
-            SubcodeGreedyCachedWrapper(talker),
+            SubcodeGreedyCachedWrapper(talker, rms_export_mode=rms_export_mode),
             (
                 torch.zeros((1, 1, talker.config.hidden_size), dtype=torch.float32),
                 torch.zeros((1, 1), dtype=torch.long),
             ),
-            out_dir / "subcode_greedy_cached.xml",
+            out_dir / graph("subcode_greedy_cached.xml"),
             [ov.PartialShape([1, 1, talker.config.hidden_size]), ov.PartialShape([1, 1])],
         )
         save_openvino_model(
-            FusedNoCacheCodecStepWrapper(talker),
+            FusedNoCacheCodecStepWrapper(
+                talker,
+                rms_export_mode=rms_export_mode,
+                subcode_export_mode=subcode_export_mode,
+            ),
             (
                 torch.zeros((1, args.example_seq_len, talker.config.hidden_size), dtype=torch.float32),
                 torch.zeros((1, 1, talker.config.hidden_size), dtype=torch.float32),
@@ -1053,7 +2125,7 @@ def main() -> None:
                 torch.ones((1,), dtype=torch.float32),
                 torch.full((1,), 1.05, dtype=torch.float32),
             ),
-            out_dir / "fused_no_cache_step.xml",
+            out_dir / fused_graph("fused_no_cache_step.xml"),
             [
                 ov.PartialShape([1, -1, talker.config.hidden_size]),
                 ov.PartialShape([1, 1, talker.config.hidden_size]),
@@ -1066,12 +2138,74 @@ def main() -> None:
             for cache_len in cache_buckets:
                 save_fused_cache_step_model(
                     talker,
-                    out_dir / f"fused_cache_step_{kernel}_cache{cache_len}.xml",
+                    out_dir / fused_graph(f"fused_cache_step_{kernel}_cache{cache_len}.xml"),
                     min(args.example_seq_len, cache_len),
                     cache_len,
                     kernel,
+                    rms_export_mode=rms_export_mode,
+                    subcode_export_mode=subcode_export_mode,
                     force=force_cache_graphs,
                 )
+                for unroll_steps in fused_cache_unroll_steps:
+                    save_fused_cache_unroll_model(
+                        talker,
+                        out_dir / fused_graph(f"fused_cache_step_unroll{unroll_steps}_{kernel}_cache{cache_len}.xml"),
+                        min(args.example_seq_len, cache_len),
+                        cache_len,
+                        unroll_steps,
+                        kernel,
+                        rms_export_mode=rms_export_mode,
+                        subcode_export_mode=subcode_export_mode,
+                        force=force_cache_graphs,
+                    )
+                for unroll_steps in fused_cache_decode_unroll_steps:
+                    save_fused_cache_decode_unroll_model(
+                        talker,
+                        out_dir / fused_graph(f"fused_cache_decode_unroll{unroll_steps}_{kernel}_cache{cache_len}.xml"),
+                        cache_len,
+                        unroll_steps,
+                        kernel,
+                        rms_export_mode=rms_export_mode,
+                        subcode_export_mode=subcode_export_mode,
+                        stateful_repeated_mask=False,
+                        force=force_cache_graphs,
+                    )
+                for unroll_steps in fused_cache_stateful_mask_steps:
+                    save_fused_cache_decode_unroll_model(
+                        talker,
+                        out_dir / fused_graph(f"fused_cache_decode_unroll{unroll_steps}_{kernel}_statefulmask_cache{cache_len}.xml"),
+                        cache_len,
+                        unroll_steps,
+                        kernel,
+                        rms_export_mode=rms_export_mode,
+                        subcode_export_mode=subcode_export_mode,
+                        stateful_repeated_mask=True,
+                        force=force_cache_graphs,
+                    )
+                for unroll_steps in fused_cache_norepeat_steps:
+                    save_fused_cache_unroll_model(
+                        talker,
+                        out_dir / fused_graph(f"fused_cache_step_unroll{unroll_steps}_{kernel}_norepeat_cache{cache_len}.xml"),
+                        min(args.example_seq_len, cache_len),
+                        cache_len,
+                        unroll_steps,
+                        kernel,
+                        rms_export_mode=rms_export_mode,
+                        subcode_export_mode=subcode_export_mode,
+                        no_repeat=True,
+                        force=force_cache_graphs,
+                    )
+                    save_fused_cache_decode_unroll_model(
+                        talker,
+                        out_dir / fused_graph(f"fused_cache_decode_unroll{unroll_steps}_{kernel}_norepeat_cache{cache_len}.xml"),
+                        cache_len,
+                        unroll_steps,
+                        kernel,
+                        rms_export_mode=rms_export_mode,
+                        subcode_export_mode=subcode_export_mode,
+                        no_repeat=True,
+                        force=force_cache_graphs,
+                    )
         with open(os.path.join(args.model, "config.json"), "r", encoding="utf-8") as f:
             config = json.load(f)
         if args.export_clone_graphs or config.get("tts_model_type") == "base":
@@ -1098,6 +2232,8 @@ def main() -> None:
             left_context_frames=args.stream_decoder_left_context,
             force=force_cache_graphs,
         )
+    if not args.skip_tokenizer_ir:
+        export_openvino_tokenizer(args.model, out_dir, force=args.force_tokenizer_ir)
 
     write_manifest(
         args.model,
@@ -1106,9 +2242,25 @@ def main() -> None:
         cache_buckets,
         cache_kernels,
         fused_cache_kernels,
+        fused_cache_unroll_steps,
+        fused_cache_decode_unroll_steps,
+        fused_cache_stateful_mask_steps,
+        fused_cache_norepeat_steps,
         stream_decoder_chunks,
         args.stream_decoder_left_context,
         stream_decoder_first_chunks,
+    )
+    update_codegen_variant_manifest(
+        out_dir,
+        rms_export_mode,
+        subcode_export_mode,
+        cache_buckets,
+        cache_kernels,
+        fused_cache_kernels,
+        fused_cache_unroll_steps,
+        fused_cache_decode_unroll_steps,
+        fused_cache_stateful_mask_steps,
+        fused_cache_norepeat_steps,
     )
     print(f"export complete: {out_dir / 'manifest.json'}", flush=True)
 

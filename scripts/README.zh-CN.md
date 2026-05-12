@@ -8,12 +8,11 @@ uv run python -m qwen3_tts_ov --help
 
 如果已执行 `uv pip install -e .`，也可以使用 `uv run qwen3-tts-ov --help`。
 
-本目录只保留开发和实验辅助脚本：
+本目录只保留生产流程会直接用到的辅助脚本：
 
 - `compress_openvino_weights.py`: 对已导出的 OpenVINO IR 做权重压缩，并更新 manifest graph variants。
-- `quantize_openvino_full.py`: 基于校准样本做 NNCF PTQ 实验。
-- `benchmark_fast_cache.py`: 对不同 cache/graph variant 路径做本地 benchmark。
+- `build_native_codegen.py`: 构建必需的 native C++ GenAI-style pipeline 共享库和 standalone smoke CLI。
+- `benchmark_streaming_realtime.py`: 默认用子进程隔离验证 `fastest` profile 的流式 RTF。
 - `env.sh`: 本地开发环境辅助变量。
-- `legacy/`: 旧入口兼容包装，保留用于查历史命令，不建议新流程使用。
 
-这些脚本可能需要额外依赖，例如 `.[export]` 或 `nncf`。普通 runtime 和 sidecar 使用不依赖它们。
+历史 benchmark、PTQ 对照、profiling 和 legacy 入口已经移动到 `devtools/`。这些脚本可能需要额外依赖，例如 `.[export]` 或 `nncf`，不属于生产主线。

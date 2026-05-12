@@ -1,0 +1,4 @@
+[submodule "third_party/openvino.genai"]
+	path = third_party/openvino.genai
+	url = https://github.com/openvinotoolkit/openvino.genai
+

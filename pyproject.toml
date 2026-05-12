@@ -21,11 +21,16 @@ export = [
   "transformers",
   "nncf",
   "modelscope",
+  "openvino-tokenizers",
 ]
 server = [
   "fastapi",
   "uvicorn",
   "websockets",
+]
+native = [
+  "openvino-genai",
+  "openvino-tokenizers",
 ]
 dev = [
   "pytest",
@@ -44,3 +49,7 @@ packages = ["qwen3_tts_ov"]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["third_party", ".venv", "openvino", "openvino_full", "outputs"]

@@ -11,7 +11,15 @@ import openvino as ov
 
 from .cache import merge_compile_config_with_cache_mode, normalize_ov_cache_mode, resolve_ov_cache_dir
 from .manifest import load_manifest, resolve_ir_dir
-from .runtime import compile_model
+from .profiles import (
+    effective_codegen_unroll,
+    effective_runtime_options,
+    is_fastest_or_norepeat_mode,
+    missing_graph_variant_message,
+    normalize_codegen_schedule,
+    scheduled_codegen_unrolls,
+)
+from .runtime import DEFAULT_STREAM_CHUNK_STRATEGIES, compile_model, normalize_preferred_cache_bucket
 
 
 @dataclass(frozen=True)
@@ -27,12 +35,6 @@ def parse_csv(value: str | None) -> list[str]:
     return [item.strip() for item in str(value).split(",") if item.strip()]
 
 
-def effective_runtime_options(mode: str, cache_kernel: str, cache_step: str, graph_variant: str) -> tuple[str, str, str, str]:
-    if mode == "fast-cache":
-        return "cache", "sdpa", "split", "int8_cachedsub"
-    return mode, cache_kernel, cache_step, graph_variant
-
-
 def graph_name(graphs: dict, variant_graphs: dict, name: str) -> str | None:
     if name in variant_graphs:
         return variant_graphs[name]
@@ -46,7 +48,7 @@ def load_graph_variant(manifest: dict, graph_variant: str) -> dict:
     variants = manifest.get("graph_variants", {})
     if graph_variant not in variants:
         available = ", ".join(sorted(variants)) or "none"
-        raise ValueError(f"graph variant {graph_variant!r} not found in manifest; available variants: {available}")
+        raise ValueError(missing_graph_variant_message(graph_variant, available))
     return variants[graph_variant].get("graphs", {})
 
 
@@ -66,14 +68,40 @@ def merged_bucket_graphs(graphs: dict, variant_graphs: dict, section: str, kerne
     return dict(sorted(buckets.items()))
 
 
-def select_buckets(available: dict[int, str], preload_buckets: str) -> dict[int, str]:
+def load_unroll_bucket_graphs(bucket_section: dict, kernel: str, unroll_steps: int) -> dict[int, str]:
+    by_kernel = bucket_section.get(kernel, {}) if isinstance(bucket_section, dict) else {}
+    if not isinstance(by_kernel, dict):
+        return {}
+    by_unroll = by_kernel.get(str(unroll_steps), {})
+    if isinstance(by_unroll, dict):
+        return {int(length): graph for length, graph in by_unroll.items() if graph}
+    return {}
+
+
+def merged_unroll_bucket_graphs(
+    graphs: dict,
+    variant_graphs: dict,
+    kernel: str,
+    unroll_steps: int,
+    section: str = "fused_cache_step_unroll_buckets",
+) -> dict[int, str]:
+    buckets = load_unroll_bucket_graphs(graphs.get(section, {}), kernel, unroll_steps)
+    buckets.update(load_unroll_bucket_graphs(variant_graphs.get(section, {}), kernel, unroll_steps))
+    return dict(sorted(buckets.items()))
+
+
+def select_buckets(available: dict[int, str], preload_buckets: str, preferred_cache_bucket: int | str | None = 112) -> dict[int, str]:
     mode = str(preload_buckets or "warmup").strip().lower()
     if mode == "all":
         return available
     if mode in {"", "none", "off", "false", "0"}:
         return {}
     if mode in {"warmup", "auto", "required", "first"}:
-        return {min(available): available[min(available)]} if available else {}
+        if not available:
+            return {}
+        preferred = normalize_preferred_cache_bucket(preferred_cache_bucket) or min(available)
+        bucket = next((item for item in sorted(available) if item >= preferred), max(available))
+        return {bucket: available[bucket]}
     requested = [int(item) for item in parse_csv(mode)]
     return {bucket: available[bucket] for bucket in requested if bucket in available}
 
@@ -120,6 +148,10 @@ def collect_warmup_tasks(
     cache_kernel: str = "exact",
     cache_step: str = "fused",
     graph_variant: str = "fp16",
+    codegen_unroll: str | int = "profile",
+    codegen_schedule: str = "current",
+    codegen_decode_unroll: str = "off",
+    preferred_cache_bucket: int | str | None = 112,
     preload_buckets: str = "warmup",
     stream_decoders: str = "strategy",
     warmup_strategy: str = "low_latency",
@@ -132,9 +164,16 @@ def collect_warmup_tasks(
         cache_step,
         graph_variant,
     )
+    effective_unroll = effective_codegen_unroll(mode, effective_variant, codegen_unroll)
+    effective_schedule = normalize_codegen_schedule(codegen_schedule)
+    effective_unrolls = scheduled_codegen_unrolls(effective_schedule, effective_unroll)
+    effective_decode_unroll = str(codegen_decode_unroll or "off").strip().lower().replace("_", "-")
+    if effective_decode_unroll not in {"off", "auto", "on"}:
+        raise ValueError("codegen_decode_unroll must be one of off, auto, on")
     graph_sections = set(parse_csv(graphs) or ["core", "stream", "buckets"])
     manifest_graphs = manifest["graphs"]
     variant_graphs = load_graph_variant(manifest, effective_variant)
+    use_no_repeat_graphs = is_fastest_or_norepeat_mode(mode)
     tasks: list[WarmupTask] = []
 
     def add(label: str, graph: str | None, device_role: str = "runtime"):
@@ -159,12 +198,80 @@ def collect_warmup_tasks(
         add("core:speaker_encoder", manifest_graphs.get("speaker_encoder"))
 
     if "buckets" in graph_sections and effective_mode == "cache":
-        section = "fused_cache_step_buckets" if effective_step == "fused" else "talker_stateful_buckets"
-        for bucket, graph in select_buckets(
-            merged_bucket_graphs(manifest_graphs, variant_graphs, section, effective_kernel),
-            preload_buckets,
-        ).items():
-            add(f"bucket:{section}:{bucket}", graph)
+        if effective_step == "fused" and effective_unroll > 1:
+            step_unroll_section = (
+                "fused_cache_step_unroll_norepeat_buckets"
+                if use_no_repeat_graphs
+                else "fused_cache_step_unroll_buckets"
+            )
+            unroll_sections = {
+                unroll: merged_unroll_bucket_graphs(
+                    manifest_graphs,
+                    variant_graphs,
+                    effective_kernel,
+                    unroll,
+                    step_unroll_section,
+                )
+                for unroll in effective_unrolls
+                if int(unroll) > 1
+            }
+            available_unroll_buckets = {}
+            for buckets in unroll_sections.values():
+                available_unroll_buckets.update(buckets)
+            available_unroll_buckets = dict(sorted(available_unroll_buckets.items()))
+            if use_no_repeat_graphs and not available_unroll_buckets:
+                raise ValueError(
+                    f"{mode} requires {step_unroll_section}.{effective_kernel} unroll graphs; "
+                    "export no-repeat graphs or choose a non-norepeat realtime mode."
+                )
+            if available_unroll_buckets:
+                selected_buckets = set(select_buckets(available_unroll_buckets, preload_buckets, preferred_cache_bucket))
+                for unroll, unroll_buckets in sorted(unroll_sections.items()):
+                    for bucket, graph in select_buckets(unroll_buckets, preload_buckets, preferred_cache_bucket).items():
+                        if bucket in selected_buckets:
+                            add(f"bucket:fused_cache_step_unroll{unroll}:{bucket}", graph)
+                if effective_decode_unroll in {"auto", "on"}:
+                    for unroll in effective_unrolls:
+                        if use_no_repeat_graphs:
+                            decode_unroll_buckets = merged_unroll_bucket_graphs(
+                                manifest_graphs,
+                                variant_graphs,
+                                effective_kernel,
+                                unroll,
+                                "fused_cache_decode_unroll_norepeat_buckets",
+                            )
+                        else:
+                            decode_unroll_buckets = merged_unroll_bucket_graphs(
+                                manifest_graphs,
+                                variant_graphs,
+                                effective_kernel,
+                                unroll,
+                                "fused_cache_decode_unroll_stateful_mask_buckets",
+                            ) or merged_unroll_bucket_graphs(
+                                manifest_graphs,
+                                variant_graphs,
+                                effective_kernel,
+                                unroll,
+                                "fused_cache_decode_unroll_buckets",
+                            )
+                        for bucket, graph in select_buckets(decode_unroll_buckets, preload_buckets, preferred_cache_bucket).items():
+                            if bucket in selected_buckets:
+                                add(f"bucket:fused_cache_decode_unroll{unroll}:{bucket}", graph)
+            else:
+                for bucket, graph in select_buckets(
+                    merged_bucket_graphs(manifest_graphs, variant_graphs, "fused_cache_step_buckets", effective_kernel),
+                    preload_buckets,
+                    preferred_cache_bucket,
+                ).items():
+                    add(f"bucket:fused_cache_step_buckets:{bucket}", graph)
+        else:
+            section = "fused_cache_step_buckets" if effective_step == "fused" else "talker_stateful_buckets"
+            for bucket, graph in select_buckets(
+                merged_bucket_graphs(manifest_graphs, variant_graphs, section, effective_kernel),
+                preload_buckets,
+                preferred_cache_bucket,
+            ).items():
+                add(f"bucket:{section}:{bucket}", graph)
 
     if "stream" in graph_sections:
         contexts = streaming_contexts(manifest, manifest_graphs)
@@ -175,7 +282,8 @@ def collect_warmup_tasks(
         else:
             stream_config = manifest.get("streaming_decoder", {})
             strategies = stream_config.get("strategies", {})
-            strategy = strategies.get(warmup_strategy) or strategies.get(warmup_strategy.replace("-", "_")) or {}
+            strategy_key = str(warmup_strategy or "low_latency").replace("-", "_")
+            strategy = strategies.get(warmup_strategy) or strategies.get(strategy_key) or DEFAULT_STREAM_CHUNK_STRATEGIES.get(strategy_key, {})
             initial_frames = int(strategy.get("initial_chunk_frames", 8))
             chunk_frames = int(strategy.get("chunk_frames", 12))
             left_context = int(strategy.get("left_context_frames", stream_config.get("left_context_frames", 25)))
@@ -212,6 +320,8 @@ def compile_warmup_task(
     cache_kernel: str,
     cache_step: str,
     graph_variant: str,
+    codegen_unroll: str | int,
+    codegen_schedule: str,
     precision_hint: str,
     compile_config: dict,
     ov_cache_dir: str | Path | None,
@@ -226,6 +336,8 @@ def compile_warmup_task(
         cache_step,
         graph_variant,
     )
+    effective_unroll = effective_codegen_unroll(mode, effective_variant, codegen_unroll)
+    effective_schedule = normalize_codegen_schedule(codegen_schedule)
     effective_compile_config = merge_compile_config_with_cache_mode(
         compile_config,
         ov_cache_mode=ov_cache_mode,
@@ -240,6 +352,8 @@ def compile_warmup_task(
         cache_kernel=effective_kernel,
         cache_step=effective_step,
         graph_variant=effective_variant,
+        codegen_unroll=effective_unroll,
+        codegen_schedule=effective_schedule,
         precision_hint=precision_hint,
         compile_config=effective_compile_config,
         ov_cache_dir=ov_cache_dir,
@@ -287,6 +401,8 @@ def run_single_task(args: argparse.Namespace) -> dict:
         cache_kernel=args.cache_kernel,
         cache_step=args.cache_step,
         graph_variant=args.graph_variant,
+        codegen_unroll=args.codegen_unroll,
+        codegen_schedule=args.codegen_schedule,
         precision_hint=args.precision_hint,
         compile_config=compile_config,
         ov_cache_dir=args.ov_cache_dir,
@@ -314,6 +430,12 @@ def subprocess_base_args(args: argparse.Namespace, compile_config: dict) -> list
         args.cache_step,
         "--graph-variant",
         args.graph_variant,
+        "--codegen-unroll",
+        str(args.codegen_unroll),
+        "--codegen-schedule",
+        args.codegen_schedule,
+        "--preferred-cache-bucket",
+        str(args.preferred_cache_bucket),
         "--precision-hint",
         args.precision_hint,
         "--ov-cache-mode",
@@ -342,19 +464,33 @@ def run_cache_warmup(args: argparse.Namespace, compile_config: dict) -> dict:
         cache_kernel=args.cache_kernel,
         cache_step=args.cache_step,
         graph_variant=args.graph_variant,
+        codegen_unroll=args.codegen_unroll,
+        codegen_schedule=args.codegen_schedule,
+        codegen_decode_unroll=args.codegen_decode_unroll,
+        preferred_cache_bucket=args.preferred_cache_bucket,
         preload_buckets=args.preload_buckets,
         stream_decoders=args.stream_decoders,
         warmup_strategy=args.warmup_strategy,
     )
+    effective_mode, effective_kernel, effective_step, effective_variant = effective_runtime_options(
+        args.mode,
+        args.cache_kernel,
+        args.cache_step,
+        args.graph_variant,
+    )
+    effective_unroll = effective_codegen_unroll(args.mode, effective_variant, args.codegen_unroll)
+    effective_schedule = normalize_codegen_schedule(args.codegen_schedule)
     cache_dir = resolve_ov_cache_dir(
         args.ir_dir,
         manifest,
         device=args.device,
         decoder_device=args.decoder_device,
-        mode=effective_runtime_options(args.mode, args.cache_kernel, args.cache_step, args.graph_variant)[0],
-        cache_kernel=effective_runtime_options(args.mode, args.cache_kernel, args.cache_step, args.graph_variant)[1],
-        cache_step=effective_runtime_options(args.mode, args.cache_kernel, args.cache_step, args.graph_variant)[2],
-        graph_variant=effective_runtime_options(args.mode, args.cache_kernel, args.cache_step, args.graph_variant)[3],
+        mode=effective_mode,
+        cache_kernel=effective_kernel,
+        cache_step=effective_step,
+        graph_variant=effective_variant,
+        codegen_unroll=effective_unroll,
+        codegen_schedule=effective_schedule,
         precision_hint=args.precision_hint,
         compile_config=merge_compile_config_with_cache_mode(
             compile_config,
@@ -368,6 +504,7 @@ def run_cache_warmup(args: argparse.Namespace, compile_config: dict) -> dict:
         "ir_dir": str(Path(args.ir_dir).resolve()),
         "cache_dir": None if cache_dir is None else str(cache_dir),
         "ov_cache_mode": normalize_ov_cache_mode(args.ov_cache_mode),
+        "preferred_cache_bucket": normalize_preferred_cache_bucket(args.preferred_cache_bucket),
         "task_count": len(tasks),
         "tasks": [asdict(task) for task in tasks],
         "results": [],
@@ -407,6 +544,8 @@ def run_cache_warmup(args: argparse.Namespace, compile_config: dict) -> dict:
                     cache_kernel=args.cache_kernel,
                     cache_step=args.cache_step,
                     graph_variant=args.graph_variant,
+                    codegen_unroll=args.codegen_unroll,
+                    codegen_schedule=args.codegen_schedule,
                     precision_hint=args.precision_hint,
                     compile_config=compile_config,
                     ov_cache_dir=args.ov_cache_dir,

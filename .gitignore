@@ -25,6 +25,7 @@ openvino/**/ov_cache/
 *.blob
 *.cl_cache
 *.onednn.cl_cache
+native/build/
 
 onnx_full/
 *.onnx

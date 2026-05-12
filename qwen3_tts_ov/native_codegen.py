@@ -1,0 +1,703 @@
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+import queue
+import threading
+from pathlib import Path
+
+import numpy as np
+
+
+class NativeCodegenUnavailable(RuntimeError):
+    pass
+
+
+def default_library_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "native" / "build" / "libqwen3_tts_ov_genai.so"
+
+
+def ensure_openvino_tokenizers_extension_env() -> None:
+    if os.environ.get("OPENVINO_TOKENIZERS_PATH_GENAI"):
+        return
+    try:
+        import openvino_tokenizers
+    except Exception:
+        return
+    extension_path = getattr(openvino_tokenizers, "_ext_path", None)
+    if extension_path:
+        os.environ["OPENVINO_TOKENIZERS_PATH_GENAI"] = str(extension_path)
+
+
+class NativeCodegenRunner:
+    def __init__(
+        self,
+        prefill_graph: Path,
+        decode_graph: Path,
+        device: str,
+        cache_dir: Path | None = None,
+        cache_mode: str = "OPTIMIZE_SPEED",
+        library_path: Path | None = None,
+    ):
+        library_path = Path(library_path or os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN_LIB") or default_library_path())
+        if not library_path.exists():
+            raise NativeCodegenUnavailable(
+                f"native codegen library not found: {library_path}; build it with `uv run python scripts/build_native_codegen.py`"
+            )
+        ensure_openvino_tokenizers_extension_env()
+        self.library_path = library_path
+        self.lib = ctypes.CDLL(str(library_path))
+        self._configure_api()
+        self.handle = ctypes.c_void_p()
+        err = ctypes.c_char_p()
+        rc = self.lib.qwen3_tts_codegen_create(
+            str(prefill_graph).encode("utf-8"),
+            str(decode_graph).encode("utf-8"),
+            str(device).encode("utf-8"),
+            str(cache_dir or "").encode("utf-8"),
+            str(cache_mode or "OPTIMIZE_SPEED").encode("utf-8"),
+            ctypes.byref(self.handle),
+            ctypes.byref(err),
+        )
+        self._check(rc, err)
+        self.closed = False
+        self.last_remote_embed = False
+
+    def _configure_api(self) -> None:
+        self.lib.qwen3_tts_codegen_create.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_create.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_destroy.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p)]
+        self.lib.qwen3_tts_codegen_destroy.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_run_unroll4_statefulmask.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_run_unroll4_statefulmask.restype = ctypes.c_int
+        self._frame_callback_type = ctypes.CFUNCTYPE(
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_void_p,
+        )
+        self.lib.qwen3_tts_codegen_run_unroll4_statefulmask_stream.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            self._frame_callback_type,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_run_unroll4_statefulmask_stream.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_set_stream_decoders.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_set_stream_decoders.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_configure_voice_design_prompt.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_configure_voice_design_prompt.restype = ctypes.c_int
+        self._audio_callback_type = ctypes.CFUNCTYPE(
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_void_p,
+        )
+        self.lib.qwen3_tts_codegen_run_unroll4_statefulmask_audio_stream.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.c_int64,
+            self._audio_callback_type,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_run_unroll4_statefulmask_audio_stream.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_run_voice_design_audio_stream.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            self._audio_callback_type,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_run_voice_design_audio_stream.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_get_last_remote_embed_used.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_get_last_remote_embed_used.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_reset_profile.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_reset_profile.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_get_profile_json.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_get_profile_json.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_get_last_timing_json.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_get_last_timing_json.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_free_error.argtypes = [ctypes.c_char_p]
+        self.lib.qwen3_tts_codegen_free_error.restype = None
+
+    def _check(self, rc: int, err: ctypes.c_char_p) -> None:
+        if rc == 0:
+            return
+        message = err.value.decode("utf-8", errors="replace") if err.value else "native codegen failed"
+        if err.value:
+            self.lib.qwen3_tts_codegen_free_error(err)
+        raise RuntimeError(message)
+
+    def last_remote_embed_used(self) -> bool:
+        used = ctypes.c_int64(0)
+        err = ctypes.c_char_p()
+        rc = self.lib.qwen3_tts_codegen_get_last_remote_embed_used(
+            self.handle,
+            ctypes.byref(used),
+            ctypes.byref(err),
+        )
+        self._check(rc, err)
+        return bool(used.value)
+
+    def reset_profile(self) -> None:
+        err = ctypes.c_char_p()
+        rc = self.lib.qwen3_tts_codegen_reset_profile(self.handle, ctypes.byref(err))
+        self._check(rc, err)
+
+    def profile_json(self) -> dict | None:
+        out = ctypes.c_char_p()
+        err = ctypes.c_char_p()
+        rc = self.lib.qwen3_tts_codegen_get_profile_json(
+            self.handle,
+            ctypes.byref(out),
+            ctypes.byref(err),
+        )
+        self._check(rc, err)
+        try:
+            if not out.value:
+                return None
+            return json.loads(out.value.decode("utf-8", errors="replace"))
+        finally:
+            if out.value:
+                self.lib.qwen3_tts_codegen_free_error(out)
+
+    def timing_json(self) -> dict | None:
+        out = ctypes.c_char_p()
+        err = ctypes.c_char_p()
+        rc = self.lib.qwen3_tts_codegen_get_last_timing_json(
+            self.handle,
+            ctypes.byref(out),
+            ctypes.byref(err),
+        )
+        self._check(rc, err)
+        try:
+            if not out.value:
+                return None
+            return json.loads(out.value.decode("utf-8", errors="replace"))
+        finally:
+            if out.value:
+                self.lib.qwen3_tts_codegen_free_error(out)
+
+    def run(
+        self,
+        sequence: np.ndarray,
+        tts_pad_embed: np.ndarray,
+        max_new_tokens: int,
+        min_new_tokens: int,
+        repetition_penalty: float,
+        vocab_size: int,
+        num_code_groups: int,
+        eos_token_id: int,
+    ) -> tuple[np.ndarray, float]:
+        sequence = np.ascontiguousarray(sequence, dtype=np.float32)
+        tts_pad_embed = np.ascontiguousarray(tts_pad_embed, dtype=np.float32)
+        if sequence.ndim != 3 or sequence.shape[0] != 1:
+            raise ValueError("sequence must have shape [1, prompt_len, hidden]")
+        if tts_pad_embed.shape != (1, 1, sequence.shape[-1]):
+            raise ValueError("tts_pad_embed must have shape [1, 1, hidden]")
+        out = np.empty((int(max_new_tokens), int(num_code_groups)), dtype=np.int64)
+        out_count = ctypes.c_int64(0)
+        elapsed_ms = ctypes.c_double(0.0)
+        err = ctypes.c_char_p()
+        self.reset_profile()
+        rc = self.lib.qwen3_tts_codegen_run_unroll4_statefulmask(
+            self.handle,
+            sequence.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ctypes.c_int64(sequence.shape[1]),
+            ctypes.c_int64(sequence.shape[2]),
+            tts_pad_embed.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ctypes.c_int64(max_new_tokens),
+            ctypes.c_int64(min_new_tokens),
+            ctypes.c_float(repetition_penalty),
+            ctypes.c_int64(vocab_size),
+            ctypes.c_int64(num_code_groups),
+            ctypes.c_int64(eos_token_id),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            ctypes.byref(out_count),
+            ctypes.byref(elapsed_ms),
+            ctypes.byref(err),
+        )
+        self._check(rc, err)
+        self.last_remote_embed = self.last_remote_embed_used()
+        self.last_timing_json = self.timing_json()
+        return out[: int(out_count.value)].copy(), float(elapsed_ms.value)
+
+    def set_stream_decoders(
+        self,
+        first_decoder_graph: Path,
+        steady_decoder_graph: Path,
+        decoder_device: str,
+        cache_dir: Path | None = None,
+        cache_mode: str = "OPTIMIZE_SPEED",
+        first_context_frames: int = 0,
+        first_chunk_frames: int = 8,
+        steady_context_frames: int = 25,
+        steady_chunk_frames: int = 12,
+        num_code_groups: int = 16,
+        decode_upsample_rate: int = 2000,
+    ) -> None:
+        err = ctypes.c_char_p()
+        rc = self.lib.qwen3_tts_codegen_set_stream_decoders(
+            self.handle,
+            str(first_decoder_graph).encode("utf-8"),
+            str(steady_decoder_graph).encode("utf-8"),
+            str(decoder_device).encode("utf-8"),
+            str(cache_dir or "").encode("utf-8"),
+            str(cache_mode or "OPTIMIZE_SPEED").encode("utf-8"),
+            ctypes.c_int64(first_context_frames),
+            ctypes.c_int64(first_chunk_frames),
+            ctypes.c_int64(steady_context_frames),
+            ctypes.c_int64(steady_chunk_frames),
+            ctypes.c_int64(num_code_groups),
+            ctypes.c_int64(decode_upsample_rate),
+            ctypes.byref(err),
+        )
+        self._check(rc, err)
+
+    def configure_voice_design_prompt(
+        self,
+        tokenizer_dir: Path,
+        text_embedding_graph: Path,
+        codec_embedding_graph: Path,
+        device: str,
+        ids: dict,
+        cache_dir: Path | None = None,
+        cache_mode: str = "OPTIMIZE_SPEED",
+    ) -> None:
+        err = ctypes.c_char_p()
+        rc = self.lib.qwen3_tts_codegen_configure_voice_design_prompt(
+            self.handle,
+            str(tokenizer_dir).encode("utf-8"),
+            str(text_embedding_graph).encode("utf-8"),
+            str(codec_embedding_graph).encode("utf-8"),
+            str(device).encode("utf-8"),
+            str(cache_dir or "").encode("utf-8"),
+            str(cache_mode or "OPTIMIZE_SPEED").encode("utf-8"),
+            ctypes.c_int64(int(ids["tts_bos_token_id"])),
+            ctypes.c_int64(int(ids["tts_eos_token_id"])),
+            ctypes.c_int64(int(ids["tts_pad_token_id"])),
+            ctypes.c_int64(int(ids["codec_pad_id"])),
+            ctypes.c_int64(int(ids["codec_bos_id"])),
+            ctypes.byref(err),
+        )
+        self._check(rc, err)
+
+    def iter_batches(
+        self,
+        sequence: np.ndarray,
+        tts_pad_embed: np.ndarray,
+        max_new_tokens: int,
+        min_new_tokens: int,
+        repetition_penalty: float,
+        vocab_size: int,
+        num_code_groups: int,
+        eos_token_id: int,
+    ):
+        sequence = np.ascontiguousarray(sequence, dtype=np.float32)
+        tts_pad_embed = np.ascontiguousarray(tts_pad_embed, dtype=np.float32)
+        if sequence.ndim != 3 or sequence.shape[0] != 1:
+            raise ValueError("sequence must have shape [1, prompt_len, hidden]")
+        if tts_pad_embed.shape != (1, 1, sequence.shape[-1]):
+            raise ValueError("tts_pad_embed must have shape [1, 1, hidden]")
+
+        out_queue: queue.Queue[object] = queue.Queue()
+        self.reset_profile()
+
+        def callback(ptr, num_frames, num_groups, _user_data):
+            flat = np.ctypeslib.as_array(ptr, shape=(int(num_frames) * int(num_groups),))
+            batch = flat.copy().reshape(int(num_frames), int(num_groups))
+            out_queue.put(batch)
+            return 0
+
+        c_callback = self._frame_callback_type(callback)
+
+        def worker():
+            out_count = ctypes.c_int64(0)
+            elapsed_ms = ctypes.c_double(0.0)
+            err = ctypes.c_char_p()
+            try:
+                rc = self.lib.qwen3_tts_codegen_run_unroll4_statefulmask_stream(
+                    self.handle,
+                    sequence.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    ctypes.c_int64(sequence.shape[1]),
+                    ctypes.c_int64(sequence.shape[2]),
+                    tts_pad_embed.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    ctypes.c_int64(max_new_tokens),
+                    ctypes.c_int64(min_new_tokens),
+                    ctypes.c_float(repetition_penalty),
+                    ctypes.c_int64(vocab_size),
+                    ctypes.c_int64(num_code_groups),
+                    ctypes.c_int64(eos_token_id),
+                    c_callback,
+                    None,
+                    ctypes.byref(out_count),
+                    ctypes.byref(elapsed_ms),
+                    ctypes.byref(err),
+                )
+                self._check(rc, err)
+                remote_embed = self.last_remote_embed_used()
+                profile = self.profile_json()
+                timing = self.timing_json()
+                out_queue.put(("done", int(out_count.value), float(elapsed_ms.value), remote_embed, profile, timing))
+            except BaseException as exc:
+                out_queue.put(exc)
+
+        thread = threading.Thread(target=worker, name="qwen3-tts-native-codegen", daemon=True)
+        thread.start()
+        while True:
+            item = out_queue.get()
+            if isinstance(item, BaseException):
+                thread.join(timeout=0.1)
+                raise item
+            if isinstance(item, tuple) and item and item[0] == "done":
+                self.last_stream_count = int(item[1])
+                self.last_stream_elapsed_ms = float(item[2])
+                self.last_remote_embed = bool(item[3]) if len(item) > 3 else False
+                self.last_profile_json = item[4] if len(item) > 4 else None
+                self.last_timing_json = item[5] if len(item) > 5 else None
+                thread.join(timeout=0.1)
+                return
+            yield item
+
+    def iter_audio_chunks(
+        self,
+        sequence: np.ndarray,
+        tts_pad_embed: np.ndarray,
+        max_new_tokens: int,
+        min_new_tokens: int,
+        repetition_penalty: float,
+        vocab_size: int,
+        num_code_groups: int,
+        eos_token_id: int,
+        prefix_codes: np.ndarray | None = None,
+    ):
+        sequence = np.ascontiguousarray(sequence, dtype=np.float32)
+        tts_pad_embed = np.ascontiguousarray(tts_pad_embed, dtype=np.float32)
+        if sequence.ndim != 3 or sequence.shape[0] != 1:
+            raise ValueError("sequence must have shape [1, prompt_len, hidden]")
+        if tts_pad_embed.shape != (1, 1, sequence.shape[-1]):
+            raise ValueError("tts_pad_embed must have shape [1, 1, hidden]")
+        if prefix_codes is None:
+            prefix = np.empty((0, int(num_code_groups)), dtype=np.int64)
+        else:
+            prefix = np.ascontiguousarray(prefix_codes, dtype=np.int64).reshape(-1, int(num_code_groups))
+
+        out_queue: queue.Queue[object] = queue.Queue()
+        self.reset_profile()
+
+        def callback(audio_ptr, num_samples, codes_ptr, num_frames, num_groups, is_final, codegen_ms, decode_ms, _user_data):
+            if int(num_samples) > 0:
+                audio = np.ctypeslib.as_array(audio_ptr, shape=(int(num_samples),)).copy()
+            else:
+                audio = np.zeros((0,), dtype=np.float32)
+            if int(num_frames) > 0:
+                flat_codes = np.ctypeslib.as_array(codes_ptr, shape=(int(num_frames) * int(num_groups),))
+                codes = flat_codes.copy().reshape(int(num_frames), int(num_groups))
+            else:
+                codes = np.empty((0, int(num_groups)), dtype=np.int64)
+            remote_embed = self.last_remote_embed_used()
+            self.last_remote_embed = remote_embed
+            out_queue.put(
+                {
+                    "audio": audio,
+                    "codes": codes,
+                    "is_final": bool(is_final),
+                    "codegen_ms": float(codegen_ms),
+                    "decode_ms": float(decode_ms),
+                    "remote_embed": remote_embed,
+                }
+            )
+            return 0
+
+        c_callback = self._audio_callback_type(callback)
+
+        def worker():
+            out_count = ctypes.c_int64(0)
+            elapsed_ms = ctypes.c_double(0.0)
+            err = ctypes.c_char_p()
+            try:
+                rc = self.lib.qwen3_tts_codegen_run_unroll4_statefulmask_audio_stream(
+                    self.handle,
+                    sequence.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    ctypes.c_int64(sequence.shape[1]),
+                    ctypes.c_int64(sequence.shape[2]),
+                    tts_pad_embed.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    ctypes.c_int64(max_new_tokens),
+                    ctypes.c_int64(min_new_tokens),
+                    ctypes.c_float(repetition_penalty),
+                    ctypes.c_int64(vocab_size),
+                    ctypes.c_int64(num_code_groups),
+                    ctypes.c_int64(eos_token_id),
+                    prefix.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                    ctypes.c_int64(prefix.shape[0]),
+                    c_callback,
+                    None,
+                    ctypes.byref(out_count),
+                    ctypes.byref(elapsed_ms),
+                    ctypes.byref(err),
+                )
+                self._check(rc, err)
+                remote_embed = self.last_remote_embed_used()
+                profile = self.profile_json()
+                timing = self.timing_json()
+                out_queue.put(("done", int(out_count.value), float(elapsed_ms.value), remote_embed, profile, timing))
+            except BaseException as exc:
+                out_queue.put(exc)
+
+        thread = threading.Thread(target=worker, name="qwen3-tts-native-audio-pipeline", daemon=True)
+        thread.start()
+        pending_final = None
+        while True:
+            item = out_queue.get()
+            if isinstance(item, BaseException):
+                thread.join(timeout=0.1)
+                raise item
+            if isinstance(item, tuple) and item and item[0] == "done":
+                self.last_audio_stream_count = int(item[1])
+                self.last_audio_stream_elapsed_ms = float(item[2])
+                self.last_remote_embed = bool(item[3]) if len(item) > 3 else False
+                self.last_profile_json = item[4] if len(item) > 4 else None
+                self.last_timing_json = item[5] if len(item) > 5 else None
+                thread.join(timeout=0.1)
+                if pending_final is not None:
+                    if self.last_profile_json is not None:
+                        pending_final["native_ov_profile"] = self.last_profile_json
+                    if self.last_timing_json is not None:
+                        pending_final["native_timing"] = self.last_timing_json
+                    yield pending_final
+                return
+            if isinstance(item, dict) and item.get("is_final"):
+                pending_final = item
+                continue
+            yield item
+
+    def iter_voice_design_audio_chunks(
+        self,
+        text: str,
+        instruct: str,
+        codec_prefill: list[int] | np.ndarray,
+        max_prompt_tokens: int,
+        max_new_tokens: int,
+        min_new_tokens: int,
+        repetition_penalty: float,
+        vocab_size: int,
+        num_code_groups: int,
+        eos_token_id: int,
+    ):
+        codec_prefill_array = np.ascontiguousarray(codec_prefill, dtype=np.int64).reshape(-1)
+        if codec_prefill_array.size == 0:
+            raise ValueError("codec_prefill must not be empty")
+
+        out_queue: queue.Queue[object] = queue.Queue()
+        self.reset_profile()
+
+        def callback(audio_ptr, num_samples, codes_ptr, num_frames, num_groups, is_final, codegen_ms, decode_ms, _user_data):
+            if int(num_samples) > 0:
+                audio = np.ctypeslib.as_array(audio_ptr, shape=(int(num_samples),)).copy()
+            else:
+                audio = np.zeros((0,), dtype=np.float32)
+            if int(num_frames) > 0:
+                flat_codes = np.ctypeslib.as_array(codes_ptr, shape=(int(num_frames) * int(num_groups),))
+                codes = flat_codes.copy().reshape(int(num_frames), int(num_groups))
+            else:
+                codes = np.empty((0, int(num_groups)), dtype=np.int64)
+            remote_embed = self.last_remote_embed_used()
+            self.last_remote_embed = remote_embed
+            out_queue.put(
+                {
+                    "audio": audio,
+                    "codes": codes,
+                    "is_final": bool(is_final),
+                    "codegen_ms": float(codegen_ms),
+                    "decode_ms": float(decode_ms),
+                    "remote_embed": remote_embed,
+                }
+            )
+            return 0
+
+        c_callback = self._audio_callback_type(callback)
+
+        def worker():
+            out_count = ctypes.c_int64(0)
+            elapsed_ms = ctypes.c_double(0.0)
+            err = ctypes.c_char_p()
+            try:
+                rc = self.lib.qwen3_tts_codegen_run_voice_design_audio_stream(
+                    self.handle,
+                    str(text).encode("utf-8"),
+                    str(instruct or "").encode("utf-8"),
+                    codec_prefill_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                    ctypes.c_int64(codec_prefill_array.size),
+                    ctypes.c_int64(max_prompt_tokens),
+                    ctypes.c_int64(max_new_tokens),
+                    ctypes.c_int64(min_new_tokens),
+                    ctypes.c_float(repetition_penalty),
+                    ctypes.c_int64(vocab_size),
+                    ctypes.c_int64(num_code_groups),
+                    ctypes.c_int64(eos_token_id),
+                    c_callback,
+                    None,
+                    ctypes.byref(out_count),
+                    ctypes.byref(elapsed_ms),
+                    ctypes.byref(err),
+                )
+                self._check(rc, err)
+                remote_embed = self.last_remote_embed_used()
+                profile = self.profile_json()
+                timing = self.timing_json()
+                out_queue.put(("done", int(out_count.value), float(elapsed_ms.value), remote_embed, profile, timing))
+            except BaseException as exc:
+                out_queue.put(exc)
+
+        thread = threading.Thread(target=worker, name="qwen3-tts-native-voice-design-pipeline", daemon=True)
+        thread.start()
+        pending_final = None
+        while True:
+            item = out_queue.get()
+            if isinstance(item, BaseException):
+                thread.join(timeout=0.1)
+                raise item
+            if isinstance(item, tuple) and item and item[0] == "done":
+                self.last_audio_stream_count = int(item[1])
+                self.last_audio_stream_elapsed_ms = float(item[2])
+                self.last_remote_embed = bool(item[3]) if len(item) > 3 else False
+                self.last_profile_json = item[4] if len(item) > 4 else None
+                self.last_timing_json = item[5] if len(item) > 5 else None
+                thread.join(timeout=0.1)
+                if pending_final is not None:
+                    if self.last_profile_json is not None:
+                        pending_final["native_ov_profile"] = self.last_profile_json
+                    if self.last_timing_json is not None:
+                        pending_final["native_timing"] = self.last_timing_json
+                    yield pending_final
+                return
+            if isinstance(item, dict) and item.get("is_final"):
+                pending_final = item
+                continue
+            yield item
+
+    def close(self) -> None:
+        if getattr(self, "closed", True):
+            return
+        err = ctypes.c_char_p()
+        rc = self.lib.qwen3_tts_codegen_destroy(self.handle, ctypes.byref(err))
+        self.closed = True
+        self._check(rc, err)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

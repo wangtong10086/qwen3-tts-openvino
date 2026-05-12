@@ -88,6 +88,30 @@ def test_stream_decode_codes_uses_initial_chunk_strategy_then_steady_chunk():
     assert chunks[1].timings["configured_chunk_frames"] == 2
 
 
+def test_smooth_strategy_uses_low_latency_first_chunk_and_larger_steady_chunk():
+    runtime = make_runtime()
+    codes = [np.asarray([index, index + 10], dtype=np.int64) for index in range(32)]
+
+    chunks = list(runtime.stream_decode_codes(codes, chunk_strategy="smooth"))
+
+    assert [chunk.codes.shape[0] for chunk in chunks] == [8, 24, 0]
+    assert chunks[0].timings["strategy"] == "smooth"
+    assert chunks[0].timings["initial_chunk_frames"] == 8
+    assert chunks[1].timings["configured_chunk_frames"] == 24
+
+
+def test_realtime_strategy_uses_eight_then_twelve_frame_chunks():
+    runtime = make_runtime()
+    codes = [np.asarray([index, index + 10], dtype=np.int64) for index in range(32)]
+
+    chunks = list(runtime.stream_decode_codes(codes, chunk_strategy="realtime"))
+
+    assert [chunk.codes.shape[0] for chunk in chunks] == [8, 12, 12, 0]
+    assert chunks[0].timings["strategy"] == "realtime"
+    assert chunks[0].timings["initial_chunk_frames"] == 8
+    assert chunks[1].timings["configured_chunk_frames"] == 12
+
+
 def test_stream_decoder_key_prefers_first_chunk_then_left_context_graph():
     runtime = make_runtime()
     runtime.streaming_decoder_graphs_by_context = {

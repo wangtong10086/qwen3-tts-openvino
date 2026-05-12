@@ -9,7 +9,7 @@
     "min_new_tokens": 8
   },
   "stream": {
-    "chunk_strategy": "low_latency",
+    "chunk_strategy": "smooth",
     "format": "pcm_s16le"
   }
 }

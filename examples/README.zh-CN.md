@@ -4,11 +4,12 @@
 
 ## 批处理 JSONL
 
-运行前请先导出 IR，并确认 `openvino/voice_design/manifest.json` 存在。若使用本机旧 VoiceDesign IR，可把 `--ir-dir openvino/voice_design` 替换为 `--ir-dir openvino_full`。
+运行前请先按主 README 导出并压缩 `fastest` 所需 IR，确认 `openvino/voice_design/manifest.json` 存在。
 
 ```bash
 uv run python -m qwen3_tts_ov batch \
   --ir-dir openvino/voice_design \
+  --realtime-profile fastest \
   --batch-jsonl examples/requests.example.jsonl \
   --output-dir outputs/batch
 ```

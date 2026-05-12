@@ -59,6 +59,8 @@ def manifest_cache_fingerprint(
     cache_kernel: str,
     cache_step: str,
     graph_variant: str,
+    codegen_unroll: int | str = 1,
+    codegen_schedule: str = "current",
     precision_hint: str,
     compile_config: dict | None,
 ) -> str:
@@ -73,6 +75,8 @@ def manifest_cache_fingerprint(
         "cache_kernel": cache_kernel,
         "cache_step": cache_step,
         "graph_variant": graph_variant,
+        "codegen_unroll": str(codegen_unroll),
+        "codegen_schedule": str(codegen_schedule),
         "precision_hint": precision_hint,
         "compile_config": compile_config or {},
     }
@@ -92,6 +96,8 @@ def resolve_ov_cache_dir(
     cache_kernel: str = "exact",
     cache_step: str = "fused",
     graph_variant: str = "fp16",
+    codegen_unroll: int | str = 1,
+    codegen_schedule: str = "current",
     precision_hint: str = "f16",
     compile_config: dict | None = None,
     ov_cache_dir: str | Path | None = None,
@@ -113,6 +119,8 @@ def resolve_ov_cache_dir(
         cache_kernel=cache_kernel,
         cache_step=cache_step,
         graph_variant=graph_variant,
+        codegen_unroll=codegen_unroll,
+        codegen_schedule=codegen_schedule,
         precision_hint=precision_hint,
         compile_config=compile_config,
     )[:16]

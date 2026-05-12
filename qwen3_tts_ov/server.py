@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import os
 import time
 from pathlib import Path
 
@@ -8,12 +9,31 @@ import numpy as np
 import soundfile as sf
 
 from .manifest import (
+    AUTO_IR_DIR,
     DEFAULT_VOICE_DESIGN_IR_DIR,
+    LEGACY_VOICE_DESIGN_IR_DIR,
     has_manifest,
     load_manifest,
     manifest_missing_message,
     path_text,
     resolve_ir_dir,
+)
+from .profiles import (
+    FASTEST_CHUNK_STRATEGY,
+    FASTEST_CODEGEN_DECODE_UNROLL,
+    FASTEST_CODEGEN_SCHEDULE,
+    FASTEST_CODEGEN_UNROLL,
+    FASTEST_NATIVE_BUFFER_REUSE,
+    FASTEST_NATIVE_PIPELINE,
+    FASTEST_PREFERRED_CACHE_BUCKET,
+    FASTEST_PROFILE_NAME,
+    FASTEST_REPETITION_PENALTY,
+    REALTIME_BENCHMARK_PROFILE_OPTIONS,
+    REALTIME_PROFILE_CHOICES,
+    effective_codegen_unroll,
+    apply_realtime_profile,
+    is_fastest_or_norepeat_mode,
+    normalize_codegen_schedule,
 )
 from .runtime import DEFAULT_STREAM_CHUNK_STRATEGIES, OpenVINOQwen3TTS
 from .web_client import WEB_CLIENT_HTML
@@ -56,7 +76,61 @@ def parse_csv(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
     return [item.strip() for item in str(value).split(",") if item.strip()]
 
 
-def generation_kwargs(request: dict) -> dict:
+def select_auto_realtime_profile(path: str | Path = "outputs/realtime_bench/streaming_profiles.json") -> dict | None:
+    benchmark_path = Path(path)
+    if not benchmark_path.exists():
+        return None
+    try:
+        with open(benchmark_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return None
+    summary_candidates = []
+    for summary in payload.get("summaries", []):
+        profile_name = summary.get("profile")
+        if profile_name not in REALTIME_BENCHMARK_PROFILE_OPTIONS:
+            continue
+        if not summary.get("accepted"):
+            continue
+        metric = summary.get("p90_stream_rtf")
+        if metric is None:
+            continue
+        summary_candidates.append((float(metric), profile_name, summary))
+    if summary_candidates:
+        _, profile_name, summary = min(summary_candidates, key=lambda item: item[0])
+        return {
+            "profile": profile_name,
+            "metric": summary.get("p90_stream_rtf"),
+            "summary_metric": "p90_stream_rtf",
+            **REALTIME_BENCHMARK_PROFILE_OPTIONS[profile_name],
+        }
+
+    candidates = []
+    for run in payload.get("runs", []):
+        profile_name = run.get("profile")
+        if profile_name not in REALTIME_BENCHMARK_PROFILE_OPTIONS:
+            continue
+        if run.get("status") != "ok":
+            continue
+        if run.get("worker_exit_code") not in (None, 0):
+            continue
+        metric = run.get("stream_compute_rtf")
+        if metric is None:
+            metric = run.get("stream_rtf")
+        if metric is None:
+            continue
+        candidates.append((float(metric), profile_name, run))
+    if not candidates:
+        return None
+    _, profile_name, run = min(candidates, key=lambda item: item[0])
+    return {
+        "profile": profile_name,
+        "metric": run.get("stream_compute_rtf", run.get("stream_rtf")),
+        **REALTIME_BENCHMARK_PROFILE_OPTIONS[profile_name],
+    }
+
+
+def generation_kwargs(request: dict, default_repetition_penalty: float = 1.05) -> dict:
     generation = request.get("generation") or {}
     def value(name: str, default):
         return generation.get(name, request.get(name, default))
@@ -64,7 +138,7 @@ def generation_kwargs(request: dict) -> dict:
     return {
         "max_new_tokens": int(value("max_new_tokens", 512)),
         "min_new_tokens": int(value("min_new_tokens", 2)),
-        "repetition_penalty": float(value("repetition_penalty", 1.05)),
+        "repetition_penalty": float(value("repetition_penalty", default_repetition_penalty)),
         "max_prompt_tokens": int(value("max_prompt_tokens", 512)),
         "progress_interval": int(value("progress_interval", 0)),
         "do_sample": bool(value("do_sample", False)),
@@ -74,21 +148,21 @@ def generation_kwargs(request: dict) -> dict:
     }
 
 
-def normalize_chunk_strategy(strategy: str | None) -> str:
-    normalized = str(strategy or "low_latency").strip().replace("-", "_").lower()
+def normalize_chunk_strategy(strategy: str | None, default: str = "low_latency") -> str:
+    normalized = str(strategy or default).strip().replace("-", "_").lower()
     if normalized not in DEFAULT_STREAM_CHUNK_STRATEGIES:
         supported = ", ".join(sorted(DEFAULT_STREAM_CHUNK_STRATEGIES))
         raise ValueError(f"unsupported chunk_strategy={strategy!r}; supported strategies: {supported}")
     return normalized
 
 
-def stream_kwargs(request: dict) -> dict:
+def stream_kwargs(request: dict, default_strategy: str = "low_latency") -> dict:
     stream = request.get("stream") if isinstance(request.get("stream"), dict) else {}
     fmt = stream.get("format", "pcm_s16le")
     if fmt != "pcm_s16le":
         raise ValueError("only stream.format=pcm_s16le is supported")
     kwargs = {
-        "chunk_strategy": stream.get("chunk_strategy", request.get("chunk_strategy")),
+        "chunk_strategy": stream.get("chunk_strategy", request.get("chunk_strategy", default_strategy)),
     }
     for name in ("initial_chunk_frames", "chunk_frames", "left_context_frames"):
         if name in stream:
@@ -103,9 +177,9 @@ def include_chunk_metadata(request: dict) -> bool:
     return bool(stream.get("include_chunk_metadata", request.get("include_chunk_metadata", False)))
 
 
-def stream_metadata(request: dict) -> dict:
+def stream_metadata(request: dict, default_strategy: str = "low_latency") -> dict:
     stream = request.get("stream") if isinstance(request.get("stream"), dict) else {}
-    strategy = normalize_chunk_strategy(stream.get("chunk_strategy", request.get("chunk_strategy")))
+    strategy = normalize_chunk_strategy(stream.get("chunk_strategy", request.get("chunk_strategy")), default_strategy)
     defaults = DEFAULT_STREAM_CHUNK_STRATEGIES[strategy]
     return {
         "chunk_strategy": strategy,
@@ -113,6 +187,18 @@ def stream_metadata(request: dict) -> dict:
         "chunk_frames": int(stream.get("chunk_frames", request.get("chunk_frames", defaults["chunk_frames"]))),
         "left_context_frames": int(stream.get("left_context_frames", request.get("left_context_frames", defaults["left_context_frames"]))),
     }
+
+
+def playback_buffer_for_stream(metadata: dict, configured_ms: int) -> int:
+    strategy = str(metadata.get("chunk_strategy") or "low_latency")
+    strategy_floor = {
+        "realtime": 1900,
+        "smooth": 1900,
+        "stable": 1500,
+        "balanced": 500,
+        "low_latency": 500,
+    }.get(strategy, 500)
+    return max(int(configured_ms), strategy_floor)
 
 
 def normalize_openai_task_type(request: dict) -> str:
@@ -196,6 +282,10 @@ def create_app(
     cache_kernel: str = "exact",
     cache_step: str = "fused",
     graph_variant: str = "fp16",
+    codegen_unroll: str | int = "profile",
+    codegen_schedule: str = "current",
+    codegen_decode_unroll: str = "off",
+    preferred_cache_bucket: int | str | None = 112,
     ov_cache_dir: str | Path | None = None,
     ov_cache_mode: str | None = "optimize_speed",
     disable_ov_cache: bool = False,
@@ -205,22 +295,119 @@ def create_app(
     warmup_text: str = "你好，这是一次流式预热。",
     warmup_strategy: str = "low_latency",
     recommended_playback_buffer_ms: int = 250,
+    realtime_profile: str = FASTEST_PROFILE_NAME,
 ):
     from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
     from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
     app = FastAPI(title="Qwen3-TTS OpenVINO Engine")
     model_root = Path(model_root)
+    if realtime_profile not in REALTIME_PROFILE_CHOICES:
+        raise ValueError(f"realtime_profile must be one of {', '.join(REALTIME_PROFILE_CHOICES)}")
+    auto_profile = select_auto_realtime_profile() if realtime_profile == "auto" else None
+    if auto_profile:
+        realtime_profile = str(auto_profile["realtime_profile"])
+        codegen_unroll = auto_profile["codegen_unroll"]
+        codegen_schedule = auto_profile["codegen_schedule"]
+        codegen_decode_unroll = auto_profile.get("codegen_decode_unroll", codegen_decode_unroll)
+        preferred_cache_bucket = auto_profile.get("preferred_cache_bucket", preferred_cache_bucket)
+    elif realtime_profile == "auto":
+        realtime_profile = FASTEST_PROFILE_NAME
+    if realtime_profile in {FASTEST_PROFILE_NAME, "auto"}:
+        codegen_unroll = str(FASTEST_CODEGEN_UNROLL)
+        codegen_schedule = FASTEST_CODEGEN_SCHEDULE
+        codegen_decode_unroll = FASTEST_CODEGEN_DECODE_UNROLL
+        preferred_cache_bucket = FASTEST_PREFERRED_CACHE_BUCKET
+        warmup_strategy = FASTEST_CHUNK_STRATEGY if warmup_strategy == "low_latency" else warmup_strategy
+        os.environ["QWEN3_TTS_OV_NATIVE_PIPELINE"] = "require" if FASTEST_NATIVE_PIPELINE == "require" else "1"
+        os.environ["QWEN3_TTS_OV_NATIVE_BUFFER_REUSE"] = "1" if FASTEST_NATIVE_BUFFER_REUSE == "on" else "0"
+    default_repetition_penalty = (
+        float(auto_profile["repetition_penalty"])
+        if auto_profile and "repetition_penalty" in auto_profile
+        else (FASTEST_REPETITION_PENALTY if realtime_profile == FASTEST_PROFILE_NAME else (1.0 if is_fastest_or_norepeat_mode(realtime_profile) else 1.05))
+    )
+    mode, cache_kernel, cache_step, graph_variant = apply_realtime_profile(
+        realtime_profile,
+        mode,
+        cache_kernel,
+        cache_step,
+        graph_variant,
+    )
+    effective_unroll = effective_codegen_unroll(mode, graph_variant, codegen_unroll)
+    codegen_schedule = normalize_codegen_schedule(codegen_schedule)
+    codegen_decode_unroll = str(codegen_decode_unroll or "off").strip().lower().replace("_", "-")
+    if codegen_decode_unroll not in {"off", "auto", "on"}:
+        raise ValueError("codegen_decode_unroll must be one of off, auto, on")
+    variant_profile_names = {
+        "int8_fused": "int8",
+        "int8_sym_fused": "int8-sym",
+        "fp16_fused_rms": "fp16-fused-rms",
+        "int8_sym_fused_rms": "int8-sym-fused-rms",
+        "fp16_sdpa_fused_rms": "fp16-sdpa-fused-rms",
+        "int8_sym_sdpa_fused_rms": "int8-sym-sdpa-fused-rms",
+        "fp16_fused_cachedsub": "fp16-fused-cachedsub",
+        "int8_sym_fused_cachedsub": "int8-sym-fused-cachedsub",
+        "fp16_sdpa_fused_cachedsub": "fp16-sdpa-fused-cachedsub",
+        "int8_sym_sdpa_fused_cachedsub": "int8-sym-sdpa-fused-cachedsub",
+        "fp16_fused_cachedsub_rms": "fp16-fused-cachedsub-rms",
+        "int8_sym_fused_cachedsub_rms": "int8-sym-fused-cachedsub-rms",
+    }
+    reported_realtime_profile = (
+        realtime_profile
+        if realtime_profile == FASTEST_PROFILE_NAME or is_fastest_or_norepeat_mode(realtime_profile)
+        else variant_profile_names.get(graph_variant, realtime_profile)
+    )
+    default_stream_strategy = FASTEST_CHUNK_STRATEGY if reported_realtime_profile == FASTEST_PROFILE_NAME else "low_latency"
     runtimes = {}
     app.state.warmup = {
         "enabled": bool(warmup),
         "status": "pending" if warmup else "disabled",
+        "realtime_profile": reported_realtime_profile,
+        "auto_profile": auto_profile,
+        "mode": mode,
+        "cache_kernel": cache_kernel,
+        "cache_step": cache_step,
+        "graph_variant": graph_variant,
+        "codegen_unroll": effective_unroll,
+        "codegen_schedule": codegen_schedule,
+        "codegen_decode_unroll": codegen_decode_unroll,
+        "default_repetition_penalty": default_repetition_penalty,
+        "preferred_cache_bucket": preferred_cache_bucket,
+        "native_codegen": os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN") or "off",
+        "native_pipeline": os.environ.get("QWEN3_TTS_OV_NATIVE_PIPELINE") or "off",
+        "native_async_decode": os.environ.get("QWEN3_TTS_OV_NATIVE_ASYNC_DECODE") or "off",
+        "native_buffer_reuse": os.environ.get("QWEN3_TTS_OV_NATIVE_BUFFER_REUSE") or "auto",
+        "native_remote_embed": os.environ.get("QWEN3_TTS_OV_NATIVE_REMOTE_EMBED") or "auto",
+        "native_prompt": os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT") or "off",
+        "native_prompt_device": os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE") or "CPU",
+        "native_ov_profile": os.environ.get("QWEN3_TTS_OV_NATIVE_PERF_COUNT") or "off",
         "warmup_strategy": warmup_strategy,
         "ov_cache_dir": None if disable_ov_cache else str(ov_cache_dir or "auto"),
         "ov_cache_mode": ov_cache_mode,
         "loaded_modes": [],
         "errors": {},
         "runtimes": {},
+    }
+    runtime_stream_metadata = {
+        "realtime_profile": reported_realtime_profile,
+        "mode": mode,
+        "cache_kernel": cache_kernel,
+        "cache_step": cache_step,
+        "graph_variant": graph_variant,
+        "codegen_unroll": effective_unroll,
+        "codegen_schedule": codegen_schedule,
+        "codegen_decode_unroll": codegen_decode_unroll,
+        "preferred_cache_bucket": preferred_cache_bucket,
+        "native_codegen": os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN") or "off",
+        "native_pipeline": os.environ.get("QWEN3_TTS_OV_NATIVE_PIPELINE") or "off",
+        "native_async_decode": os.environ.get("QWEN3_TTS_OV_NATIVE_ASYNC_DECODE") or "off",
+        "native_buffer_reuse": os.environ.get("QWEN3_TTS_OV_NATIVE_BUFFER_REUSE") or "auto",
+        "native_remote_embed": os.environ.get("QWEN3_TTS_OV_NATIVE_REMOTE_EMBED") or "auto",
+        "native_prompt": os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT") or "off",
+        "native_prompt_device": os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE") or "CPU",
+        "native_ov_profile": os.environ.get("QWEN3_TTS_OV_NATIVE_PERF_COUNT") or "off",
+        "unroll_available": effective_unroll > 1,
+        "unroll_fallback": False,
     }
 
     def manifest_supports_mode(ir_dir: Path, mode_name: str) -> bool:
@@ -239,6 +426,17 @@ def create_app(
 
     def resolve_mode_ir_dir(mode_name: str) -> Path:
         model_dir_name = MODE_DIR[mode_name]
+        if path_text(model_root) == AUTO_IR_DIR:
+            candidates = [Path("openvino") / model_dir_name]
+            if mode_name == "voice_design":
+                candidates.append(Path(LEGACY_VOICE_DESIGN_IR_DIR))
+            for candidate in candidates:
+                if has_manifest(candidate) and manifest_supports_mode(candidate, mode_name):
+                    return candidate
+            resolved = resolve_ir_dir(AUTO_IR_DIR, fallback_to_local_voice_design=(mode_name == "voice_design"), warn=True)
+            if has_manifest(resolved) and manifest_supports_mode(resolved, mode_name):
+                return resolved
+            raise ValueError(manifest_missing_message(AUTO_IR_DIR))
         nested = model_root / model_dir_name
         if has_manifest(nested):
             return nested
@@ -254,7 +452,17 @@ def create_app(
         if not has_manifest(ir_dir):
             raise ValueError(manifest_missing_message(ir_dir))
         effective_cache_step = "split" if do_sample and mode == "cache" and cache_step == "fused" else cache_step
-        key = (str(ir_dir.resolve()), effective_cache_step, str(ov_cache_dir or "auto"), ov_cache_mode, bool(disable_ov_cache))
+        key = (
+            str(ir_dir.resolve()),
+            effective_cache_step,
+            int(effective_unroll),
+            codegen_schedule,
+            codegen_decode_unroll,
+            str(preferred_cache_bucket),
+            str(ov_cache_dir or "auto"),
+            ov_cache_mode,
+            bool(disable_ov_cache),
+        )
         if key not in runtimes:
             runtimes[key] = OpenVINOQwen3TTS(
                 ir_dir,
@@ -265,6 +473,10 @@ def create_app(
                 cache_kernel=cache_kernel,
                 cache_step=effective_cache_step,
                 graph_variant=graph_variant,
+                codegen_unroll=effective_unroll,
+                codegen_schedule=codegen_schedule,
+                codegen_decode_unroll=codegen_decode_unroll,
+                preferred_cache_bucket=preferred_cache_bucket,
                 ov_cache_dir=ov_cache_dir,
                 ov_cache_mode=ov_cache_mode,
                 disable_ov_cache=disable_ov_cache,
@@ -297,6 +509,7 @@ def create_app(
                     chunk_strategy=warmup_strategy,
                     left_context_frames=None,
                     max_new_tokens=None,
+                    repetition_penalty=default_repetition_penalty,
                     preload_buckets=preload_buckets,
                     run_generation=runtime.manifest.get("tts_model_type") == "voice_design",
                 )
@@ -309,9 +522,9 @@ def create_app(
         app.state.warmup["status"] = "ready" if not app.state.warmup["errors"] else "ready_with_errors"
 
     def stream_chunks(request: dict):
-        gen_kwargs = generation_kwargs(request)
+        gen_kwargs = generation_kwargs(request, default_repetition_penalty=default_repetition_penalty)
         mode_name, runtime = get_runtime(request.get("mode"), do_sample=bool(gen_kwargs["do_sample"]))
-        kwargs = {**gen_kwargs, **stream_kwargs(request)}
+        kwargs = {**gen_kwargs, **stream_kwargs(request, default_stream_strategy)}
         text = request.get("text")
         language = request.get("language", "Auto")
         if not text:
@@ -340,7 +553,7 @@ def create_app(
         )
 
     def full_audio(request: dict):
-        kwargs = generation_kwargs(request)
+        kwargs = generation_kwargs(request, default_repetition_penalty=default_repetition_penalty)
         mode_name, runtime = get_runtime(request.get("mode"), do_sample=bool(kwargs["do_sample"]))
         text = request.get("text")
         language = request.get("language", "Auto")
@@ -374,9 +587,28 @@ def create_app(
     def health():
         runtime_status = {}
         for key, runtime in runtimes.items():
-            ir_dir, effective_cache_step = key[0], key[1]
+            ir_dir, effective_cache_step, runtime_unroll = key[0], key[1], key[2]
+            variant_fused_buckets = (getattr(runtime, "variant_graphs", {}) or {}).get("fused_cache_step_buckets", {})
+            cache_kernel = getattr(runtime, "cache_kernel", None)
+            fused_variant_active = False
+            if isinstance(variant_fused_buckets, dict):
+                if cache_kernel in variant_fused_buckets and isinstance(variant_fused_buckets[cache_kernel], dict):
+                    fused_variant_active = bool(variant_fused_buckets[cache_kernel])
+                elif all(str(bucket).isdigit() for bucket in variant_fused_buckets):
+                    fused_variant_active = bool(variant_fused_buckets)
             runtime_status[ir_dir] = {
                 "cache_step": effective_cache_step,
+                "mode": getattr(runtime, "mode", None),
+                "requested_mode": getattr(runtime, "requested_mode", None),
+                "cache_kernel": cache_kernel,
+                "graph_variant": getattr(runtime, "graph_variant", None),
+                "codegen_unroll": getattr(runtime, "codegen_unroll", runtime_unroll),
+                "codegen_schedule": getattr(runtime, "codegen_schedule", codegen_schedule),
+                "codegen_decode_unroll": getattr(runtime, "codegen_decode_unroll", codegen_decode_unroll),
+                "preferred_cache_bucket": getattr(runtime, "preferred_cache_bucket", preferred_cache_bucket),
+                "unroll_available": bool(getattr(runtime, "fused_cache_unroll_bucket_graphs", {}))
+                or bool(getattr(runtime, "fused_cache_unroll_bucket_graphs_by_step", {})),
+                "unroll_fallback": bool(getattr(runtime, "codegen_unroll_fallback", False)),
                 "ov_cache_dir": None if getattr(runtime, "cache_dir", None) is None else str(runtime.cache_dir),
                 "ov_cache_mode": getattr(runtime, "ov_cache_mode", None),
                 "ov_cache_disabled": getattr(runtime, "disable_ov_cache", False),
@@ -392,6 +624,10 @@ def create_app(
                     for context, chunk in sorted(getattr(runtime, "streaming_decoders", {}))
                 ],
                 "compiled_fused_buckets": sorted(getattr(runtime, "fused_cache_step_by_bucket", {})),
+                "fused_cache_bucket_graphs": {
+                    str(bucket): graph for bucket, graph in getattr(runtime, "fused_cache_bucket_graphs", {}).items()
+                },
+                "fused_cache_variant_active": fused_variant_active,
                 "compiled_stateful_buckets": sorted(getattr(runtime, "talker_stateful_by_bucket", {})),
             }
         return {
@@ -422,7 +658,8 @@ def create_app(
         def iter_lines():
             started = time.time()
             try:
-                metadata = stream_metadata(request)
+                metadata = stream_metadata(request, default_stream_strategy)
+                playback_buffer_ms = playback_buffer_for_stream(metadata, recommended_playback_buffer_ms)
                 yield json.dumps(
                     {
                         "type": "metadata",
@@ -430,7 +667,8 @@ def create_app(
                         "format": "pcm_s16le",
                         "started_at": started,
                         **metadata,
-                        "recommended_playback_buffer_ms": int(recommended_playback_buffer_ms),
+                        **runtime_stream_metadata,
+                        "recommended_playback_buffer_ms": int(playback_buffer_ms),
                     },
                     ensure_ascii=False,
                 ) + "\n"
@@ -526,7 +764,8 @@ def create_app(
         try:
             request = await websocket.receive_json()
             started = time.time()
-            metadata = stream_metadata(request)
+            metadata = stream_metadata(request, default_stream_strategy)
+            playback_buffer_ms = playback_buffer_for_stream(metadata, recommended_playback_buffer_ms)
             await websocket.send_json(
                 {
                     "type": "metadata",
@@ -534,7 +773,8 @@ def create_app(
                     "format": "pcm_s16le",
                     "started_at": started,
                     **metadata,
-                    "recommended_playback_buffer_ms": int(recommended_playback_buffer_ms),
+                    **runtime_stream_metadata,
+                    "recommended_playback_buffer_ms": int(playback_buffer_ms),
                 }
             )
             final_timings = {}
@@ -587,6 +827,10 @@ def serve(
     cache_kernel: str = "exact",
     cache_step: str = "fused",
     graph_variant: str = "fp16",
+    codegen_unroll: str | int = "profile",
+    codegen_schedule: str = "current",
+    codegen_decode_unroll: str = "off",
+    preferred_cache_bucket: int | str | None = 112,
     ov_cache_dir: str | Path | None = None,
     ov_cache_mode: str | None = "optimize_speed",
     disable_ov_cache: bool = False,
@@ -595,6 +839,7 @@ def serve(
     preload_buckets: str = "warmup",
     warmup_text: str = "你好，这是一次流式预热。",
     warmup_strategy: str = "low_latency",
+    realtime_profile: str = FASTEST_PROFILE_NAME,
 ):
     import uvicorn
 
@@ -607,6 +852,10 @@ def serve(
         cache_kernel=cache_kernel,
         cache_step=cache_step,
         graph_variant=graph_variant,
+        codegen_unroll=codegen_unroll,
+        codegen_schedule=codegen_schedule,
+        codegen_decode_unroll=codegen_decode_unroll,
+        preferred_cache_bucket=preferred_cache_bucket,
         ov_cache_dir=ov_cache_dir,
         ov_cache_mode=ov_cache_mode,
         disable_ov_cache=disable_ov_cache,
@@ -615,5 +864,6 @@ def serve(
         preload_buckets=preload_buckets,
         warmup_text=warmup_text,
         warmup_strategy=warmup_strategy,
+        realtime_profile=realtime_profile,
     )
     uvicorn.run(app, host=host, port=port)

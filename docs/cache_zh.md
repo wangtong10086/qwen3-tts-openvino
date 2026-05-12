@@ -1,93 +1,53 @@
 # OpenVINO 编译缓存
 
-OpenVINO 的 `compile_model()` 会把 GPU kernel/blob 写入 `CACHE_DIR`。本项目默认使用用户级缓存目录，避免模型 IR 目录必须可写，也避免每次启动 sidecar 都从零编译。
+生产路径使用 `fastest` profile。它会编译 native C++ pipeline 所需的 unroll4、decode-unroll、streaming decoder 和基础 embedding 图。
 
-默认目录：
-
-- Linux: `$XDG_CACHE_HOME/qwen3-tts-ov/openvino-cache`，未设置时为 `~/.cache/qwen3-tts-ov/openvino-cache`
-- Windows: `%LOCALAPPDATA%\\qwen3-tts-ov\\openvino-cache`
-- 可用 `QWEN3_TTS_OV_CACHE_DIR` 或 `--ov-cache-dir` 覆盖
-
-缓存会按 OpenVINO 版本、设备、模型 manifest、graph variant、cache kernel/step 和 compile config 分目录。更换驱动、OpenVINO 版本、设备或 IR 后建议重新 warmup。
-
-## 离线填充缓存
-
-首次部署或更新 IR 后运行。`--ir-dir` 默认是 `auto`：优先使用 `openvino/voice_design`，缺失时回退到本机旧目录 `openvino_full`。
+## 预热
 
 ```bash
 uv run python -m qwen3_tts_ov cache-warmup \
+  --ir-dir openvino/voice_design \
   --device GPU \
-  --decoder-device GPU \
-  --mode cache \
-  --cache-step fused \
+  --realtime-profile fastest \
   --graphs core,stream,buckets \
-  --preload-buckets warmup \
-  --warmup-strategy low_latency
+  --preload-buckets warmup
 ```
 
-`cache-warmup` 默认使用子进程逐图编译。每个图编译完成后子进程退出，GPU/USM 内存会释放；磁盘上的 OpenVINO cache 保留下来。
+默认缓存写入用户缓存目录，不写入 IR 目录。`--preload-buckets warmup` 只预热当前最快路径需要的 bucket，避免 iGPU USM 压力过大。
 
-如需提前填充所有 cache bucket：
+## 查看任务
 
 ```bash
 uv run python -m qwen3_tts_ov cache-warmup \
+  --ir-dir openvino/voice_design \
   --device GPU \
-  --mode cache \
-  --cache-step fused \
-  --graphs core,stream,buckets \
-  --preload-buckets all \
-  --stream-decoders all
+  --realtime-profile fastest \
+  --dry-run
 ```
 
-这只填充磁盘缓存，不表示服务启动后会常驻所有 bucket。
+期望任务包含：
 
-查看计划但不编译：
+- core embedding graph
+- `fused_cache_step_unroll4_*_norepeat_cache96_*`
+- `fused_cache_decode_unroll4_*_norepeat_cache96_*`
+- `speech_decoder_stream_c0_t8.xml`
+- `speech_decoder_stream_c25_t24.xml`
 
-```bash
-uv run python -m qwen3_tts_ov cache-warmup --dry-run
-```
-
-## 服务启动
-
-sidecar 启动时仍建议使用最小 resident warmup：
+## Sidecar
 
 ```bash
 uv run python -m qwen3_tts_ov serve \
   --model-root openvino \
   --device GPU \
+  --realtime-profile fastest \
   --preload-modes voice_design \
-  --preload-buckets warmup \
-  --warmup-strategy low_latency
+  --preload-buckets warmup
 ```
 
-`--model-root openvino` 需要如下布局：
+`serve --realtime-profile auto` 会读取 `outputs/realtime_bench/streaming_profiles.json` 中已通过的 p90 summary；没有 benchmark 结果时回到 `fastest`。
 
-```text
-openvino/
-  voice_design/manifest.json
-  custom_voice/manifest.json
-  base/manifest.json
-```
+## 注意事项
 
-如果 `openvino/voice_design` 缺失但当前目录存在 `openvino_full/manifest.json`，服务端会对 VoiceDesign 自动回退到 `openvino_full`。CustomVoice 和 VoiceClone 不会回退到 VoiceDesign IR，仍需要各自的导出目录。
-
-只有单个 VoiceDesign IR 时，可以临时使用：
-
-```bash
-uv run python -m qwen3_tts_ov serve \
-  --ir-dir openvino_full \
-  --device GPU \
-  --preload-modes voice_design \
-  --preload-buckets warmup \
-  --warmup-strategy low_latency
-```
-
-`--preload-buckets all` 会把所有 bucket 编译并常驻在服务进程中，iGPU 上容易触发 USM OOM。需要全量预编译时使用 `cache-warmup --preload-buckets all`。
-
-## 常用参数
-
-- `--ov-cache-dir`: 指定 OpenVINO cache 目录。
-- `--ov-cache-mode optimize_speed|optimize_size`: 默认 `optimize_speed`。
-- `--disable-ov-cache`: 禁用 OpenVINO 编译缓存，用于排查缓存污染。
-- `--graphs core,stream,buckets,decoder`: 控制 warmup 范围。
-- `--no-subprocess`: 在当前进程顺序编译，调试用；生产不建议。
+- 不要把 `openvino/**/ov_cache/`、`outputs/` 或用户缓存目录提交到 git。
+- `--preload-buckets all` 只适合离线预编译，不建议在 sidecar 常驻启动时使用。
+- 如果缺少 no-repeat 或 decode-unroll graph，`fastest` 会直接报错；这是预期行为，避免静默降级到慢路径。

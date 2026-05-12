@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -7,6 +8,23 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from .profiles import (
+    CODEGEN_SCHEDULE_CHOICES,
+    CODEGEN_UNROLL_CHOICES,
+    FASTEST_CHUNK_STRATEGY,
+    FASTEST_CODEGEN_DECODE_UNROLL,
+    FASTEST_CODEGEN_SCHEDULE,
+    FASTEST_CODEGEN_UNROLL,
+    FASTEST_MODE,
+    FASTEST_NATIVE_BUFFER_REUSE,
+    FASTEST_NATIVE_PIPELINE,
+    FASTEST_PREFERRED_CACHE_BUCKET,
+    FASTEST_PROFILE_NAME,
+    PUBLIC_REALTIME_PROFILE_CHOICES,
+    REALTIME_PROFILE_CHOICES,
+    RUNTIME_MODE_CHOICES,
+    is_fastest_or_norepeat_mode,
+)
 from .runtime import OpenVINOQwen3TTS
 
 
@@ -23,15 +41,34 @@ def add_runtime_args(
     )
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
-    parser.add_argument("--mode", default="cache", choices=["no-cache", "cache", "fast-cache", "fused-no-cache"])
-    parser.add_argument("--cache-kernel", default="exact", choices=["exact", "sdpa"])
-    parser.add_argument("--cache-step", default="fused", choices=["split", "fused"])
-    parser.add_argument("--graph-variant", default="fp16")
+    parser.add_argument(
+        "--realtime-profile",
+        default=FASTEST_PROFILE_NAME,
+        metavar="{" + ",".join(PUBLIC_REALTIME_PROFILE_CHOICES) + "}",
+        help="Production runtime profile. Default fastest requires the native C++ pipeline and optimized INT8_SYM IR.",
+    )
+    advanced = argparse.SUPPRESS
+    parser.add_argument("--mode", default="cache", choices=RUNTIME_MODE_CHOICES, help=advanced)
+    parser.add_argument("--cache-kernel", default="exact", choices=["exact", "sdpa"], help=advanced)
+    parser.add_argument("--cache-step", default="fused", choices=["split", "fused"], help=advanced)
+    parser.add_argument("--graph-variant", default="fp16", help=advanced)
+    parser.add_argument("--codegen-unroll", default="profile", choices=CODEGEN_UNROLL_CHOICES, help=advanced)
+    parser.add_argument("--codegen-schedule", default="current", choices=CODEGEN_SCHEDULE_CHOICES, help=advanced)
+    parser.add_argument("--codegen-decode-unroll", default="off", choices=["off", "auto", "on"], help=advanced)
+    parser.add_argument("--preferred-cache-bucket", default="112", help=advanced)
     parser.add_argument("--ov-cache-dir", default=None)
     parser.add_argument("--ov-cache-mode", default="optimize_speed", choices=["optimize_speed", "optimize_size"])
     parser.add_argument("--disable-ov-cache", action="store_true")
     parser.add_argument("--allow-cpu-fallback", action="store_true")
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--native-codegen", default=None, choices=["off", "on", "require"], help=advanced)
+    parser.add_argument("--native-pipeline", default=None, choices=["off", "on", "require"], help=advanced)
+    parser.add_argument("--native-async-decode", default=None, choices=["auto", "off", "on"], help=advanced)
+    parser.add_argument("--native-remote-embed", default=None, choices=["auto", "off", "on"], help=advanced)
+    parser.add_argument("--native-buffer-reuse", default=None, choices=["auto", "off", "on"], help=advanced)
+    parser.add_argument("--native-prompt", default=None, choices=["off", "on"], help=advanced)
+    parser.add_argument("--native-prompt-device", default=None, help=advanced)
+    parser.add_argument("--native-ov-profile", action="store_true", help=advanced)
     if not include_generation:
         return
     parser.add_argument("--max-new-tokens", type=int, default=128)
@@ -50,6 +87,8 @@ def add_runtime_args(
 
 
 def build_runtime(args):
+    apply_profile_defaults(args)
+    apply_native_env(args)
     cache_step = args.cache_step
     if getattr(args, "do_sample", False) and args.mode == "cache" and cache_step == "fused":
         cache_step = "split"
@@ -62,6 +101,10 @@ def build_runtime(args):
         cache_kernel=args.cache_kernel,
         cache_step=cache_step,
         graph_variant=args.graph_variant,
+        codegen_unroll=args.codegen_unroll,
+        codegen_schedule=args.codegen_schedule,
+        codegen_decode_unroll=args.codegen_decode_unroll,
+        preferred_cache_bucket=args.preferred_cache_bucket,
         ov_cache_dir=args.ov_cache_dir,
         ov_cache_mode=args.ov_cache_mode,
         disable_ov_cache=args.disable_ov_cache,
@@ -69,11 +112,82 @@ def build_runtime(args):
     )
 
 
+def apply_profile_defaults(args):
+    realtime_profile = getattr(args, "realtime_profile", None)
+    if realtime_profile not in (None, "") and realtime_profile not in REALTIME_PROFILE_CHOICES:
+        raise ValueError(f"realtime_profile must be one of {', '.join(REALTIME_PROFILE_CHOICES)}")
+    if realtime_profile in {FASTEST_PROFILE_NAME, "auto"}:
+        args.mode = FASTEST_MODE
+        args.cache_kernel, args.cache_step, args.graph_variant = (
+            "exact",
+            "fused",
+            "int8_sym_fused_cachedsub",
+        )
+        args.codegen_unroll = str(FASTEST_CODEGEN_UNROLL)
+        args.codegen_schedule = FASTEST_CODEGEN_SCHEDULE
+        args.codegen_decode_unroll = FASTEST_CODEGEN_DECODE_UNROLL
+        args.preferred_cache_bucket = str(FASTEST_PREFERRED_CACHE_BUCKET)
+        args.native_pipeline = FASTEST_NATIVE_PIPELINE
+        args.native_buffer_reuse = FASTEST_NATIVE_BUFFER_REUSE
+        return
+
+
+def apply_native_env(args):
+    for arg_name, env_name in (
+        ("native_codegen", "QWEN3_TTS_OV_NATIVE_CODEGEN"),
+        ("native_pipeline", "QWEN3_TTS_OV_NATIVE_PIPELINE"),
+    ):
+        value = getattr(args, arg_name, None)
+        if value is None:
+            continue
+        if value == "off":
+            os.environ.pop(env_name, None)
+        elif value == "on":
+            os.environ[env_name] = "1"
+        else:
+            os.environ[env_name] = "require"
+    async_decode = getattr(args, "native_async_decode", None)
+    if async_decode in (None, "auto", "off"):
+        os.environ.pop("QWEN3_TTS_OV_NATIVE_ASYNC_DECODE", None)
+    elif async_decode == "on":
+        os.environ["QWEN3_TTS_OV_NATIVE_ASYNC_DECODE"] = "1"
+    buffer_reuse = getattr(args, "native_buffer_reuse", None)
+    if buffer_reuse in (None, "auto"):
+        os.environ.pop("QWEN3_TTS_OV_NATIVE_BUFFER_REUSE", None)
+    elif buffer_reuse == "off":
+        os.environ["QWEN3_TTS_OV_NATIVE_BUFFER_REUSE"] = "0"
+    elif buffer_reuse == "on":
+        os.environ["QWEN3_TTS_OV_NATIVE_BUFFER_REUSE"] = "1"
+    remote_embed = getattr(args, "native_remote_embed", None)
+    if remote_embed in (None, "auto"):
+        os.environ.pop("QWEN3_TTS_OV_NATIVE_REMOTE_EMBED", None)
+    elif remote_embed == "off":
+        os.environ["QWEN3_TTS_OV_NATIVE_REMOTE_EMBED"] = "0"
+    elif remote_embed == "on":
+        os.environ["QWEN3_TTS_OV_NATIVE_REMOTE_EMBED"] = "1"
+    native_prompt = getattr(args, "native_prompt", None)
+    if native_prompt == "off":
+        os.environ.pop("QWEN3_TTS_OV_NATIVE_PROMPT", None)
+    elif native_prompt == "on":
+        os.environ["QWEN3_TTS_OV_NATIVE_PROMPT"] = "1"
+    prompt_device = getattr(args, "native_prompt_device", None)
+    if prompt_device:
+        os.environ["QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE"] = str(prompt_device)
+    if getattr(args, "native_ov_profile", False):
+        os.environ["QWEN3_TTS_OV_NATIVE_PERF_COUNT"] = "1"
+
+
 def generation_kwargs(args):
+    repetition_penalty = args.repetition_penalty
+    if (
+        getattr(args, "realtime_profile", None) == FASTEST_PROFILE_NAME
+        or is_fastest_or_norepeat_mode(getattr(args, "mode", None))
+    ) and repetition_penalty == 1.05:
+        repetition_penalty = 1.0
     return {
         "max_new_tokens": args.max_new_tokens,
         "min_new_tokens": args.min_new_tokens,
-        "repetition_penalty": args.repetition_penalty,
+        "repetition_penalty": repetition_penalty,
         "max_prompt_tokens": args.max_prompt_tokens,
         "progress_interval": args.progress_interval,
         "do_sample": args.do_sample,
@@ -99,7 +213,7 @@ def write_wavs(wavs, sample_rate: int, output: str):
 
 def add_stream_args(parser):
     parser.add_argument("--chunk-dir", default="outputs/stream")
-    parser.add_argument("--chunk-strategy", default=None, choices=["low_latency", "balanced", "stable"])
+    parser.add_argument("--chunk-strategy", default=None, choices=["realtime", "low_latency", "smooth", "balanced", "stable"])
     parser.add_argument("--initial-chunk-frames", type=int, default=None)
     parser.add_argument("--chunk-frames", type=int, default=None)
     parser.add_argument("--left-context-frames", type=int, default=None)
@@ -107,8 +221,11 @@ def add_stream_args(parser):
 
 
 def stream_kwargs(args):
+    chunk_strategy = args.chunk_strategy
+    if chunk_strategy is None and getattr(args, "realtime_profile", None) == FASTEST_PROFILE_NAME:
+        chunk_strategy = FASTEST_CHUNK_STRATEGY
     return {
-        "chunk_strategy": args.chunk_strategy,
+        "chunk_strategy": chunk_strategy,
         "initial_chunk_frames": args.initial_chunk_frames,
         "chunk_frames": args.chunk_frames,
         "left_context_frames": args.left_context_frames,
@@ -137,6 +254,8 @@ def write_stream_chunks(chunks, chunk_dir: str, output: str):
             audio_parts.append(chunk.audio)
             rtf = chunk.timings.get("rtf")
             rtf_text = f"{rtf:.2f}" if isinstance(rtf, (int, float)) else "n/a"
+            stream_rtf = chunk.timings.get("stream_rtf")
+            stream_rtf_text = f"{stream_rtf:.2f}" if isinstance(stream_rtf, (int, float)) else "n/a"
             decode_path = chunk.timings.get("decode_path", "unknown")
             codegen_ms = float(chunk.timings.get("codegen_ms", 0.0))
             decode_ms = float(chunk.timings.get("decode_ms", 0.0))
@@ -144,7 +263,7 @@ def write_stream_chunks(chunks, chunk_dir: str, output: str):
                 f"wrote {item_path} frames={chunk.codes.shape[0]} samples={chunk.audio.shape[0]} "
                 f"strategy={chunk.timings.get('strategy', 'n/a')} path={decode_path} "
                 f"codegen_ms={codegen_ms:.1f} decode_ms={decode_ms:.1f} "
-                f"rtf={rtf_text} final={chunk.is_final}",
+                f"rtf={rtf_text} stream_rtf={stream_rtf_text} final={chunk.is_final}",
                 flush=True,
             )
         elif chunk.is_final:
@@ -313,6 +432,8 @@ def run_stream_voice_clone(args):
 def run_serve(args):
     from .server import serve
 
+    apply_profile_defaults(args)
+    apply_native_env(args)
     serve(
         model_root=args.ir_dir or args.model_root,
         host=args.host,
@@ -324,6 +445,11 @@ def run_serve(args):
         cache_kernel=args.cache_kernel,
         cache_step=args.cache_step,
         graph_variant=args.graph_variant,
+        codegen_unroll=args.codegen_unroll,
+        codegen_schedule=args.codegen_schedule,
+        codegen_decode_unroll=args.codegen_decode_unroll,
+        preferred_cache_bucket=args.preferred_cache_bucket,
+        realtime_profile=args.realtime_profile,
         ov_cache_dir=args.ov_cache_dir,
         ov_cache_mode=args.ov_cache_mode,
         disable_ov_cache=args.disable_ov_cache,
@@ -338,13 +464,19 @@ def run_serve(args):
 def run_cache_warmup_command(args):
     from .cache_warmup import run_cache_warmup, run_single_task
 
+    apply_profile_defaults(args)
+    apply_native_env(args)
     if args.single_task_json:
         result = run_single_task(args)
         print(json.dumps(result, ensure_ascii=False), flush=True)
         return
 
     compile_config = json.loads(args.compile_config_json or "{}")
-    summary = run_cache_warmup(args, compile_config)
+    try:
+        summary = run_cache_warmup(args, compile_config)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from None
     if args.output_json:
         output = Path(args.output_json)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -367,10 +499,21 @@ def add_cache_warmup_args(parser):
     )
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
-    parser.add_argument("--mode", default="cache", choices=["no-cache", "cache", "fast-cache", "fused-no-cache"])
-    parser.add_argument("--cache-kernel", default="exact", choices=["exact", "sdpa"])
-    parser.add_argument("--cache-step", default="fused", choices=["split", "fused"])
-    parser.add_argument("--graph-variant", default="fp16")
+    parser.add_argument(
+        "--realtime-profile",
+        default=FASTEST_PROFILE_NAME,
+        metavar="{" + ",".join(PUBLIC_REALTIME_PROFILE_CHOICES) + "}",
+        help="Production cache warmup profile. Default fastest warms the native realtime graph set.",
+    )
+    advanced = argparse.SUPPRESS
+    parser.add_argument("--mode", default="cache", choices=RUNTIME_MODE_CHOICES, help=advanced)
+    parser.add_argument("--cache-kernel", default="exact", choices=["exact", "sdpa"], help=advanced)
+    parser.add_argument("--cache-step", default="fused", choices=["split", "fused"], help=advanced)
+    parser.add_argument("--graph-variant", default="fp16", help=advanced)
+    parser.add_argument("--codegen-unroll", default="profile", choices=CODEGEN_UNROLL_CHOICES, help=advanced)
+    parser.add_argument("--codegen-schedule", default="current", choices=CODEGEN_SCHEDULE_CHOICES, help=advanced)
+    parser.add_argument("--codegen-decode-unroll", default="off", choices=["off", "auto", "on"], help=advanced)
+    parser.add_argument("--preferred-cache-bucket", default="112", help=advanced)
     parser.add_argument("--precision-hint", default="f16", choices=["f16", "f32"])
     parser.add_argument("--ov-cache-dir", default=None)
     parser.add_argument("--ov-cache-mode", default="optimize_speed", choices=["optimize_speed", "optimize_size"])
@@ -379,7 +522,7 @@ def add_cache_warmup_args(parser):
     parser.add_argument("--graphs", default="core,stream,buckets")
     parser.add_argument("--preload-buckets", default="warmup")
     parser.add_argument("--stream-decoders", default="strategy", choices=["strategy", "all"])
-    parser.add_argument("--warmup-strategy", default="low_latency", choices=["low_latency", "balanced", "stable"])
+    parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["realtime", "low_latency", "smooth", "balanced", "stable"])
     parser.add_argument("--subprocess", dest="subprocess", action="store_true", default=True)
     parser.add_argument("--no-subprocess", dest="subprocess", action="store_false")
     parser.add_argument("--dry-run", action="store_true")
@@ -474,7 +617,7 @@ def main(argv=None):
     serve_parser.add_argument("--preload-modes", default="voice_design")
     serve_parser.add_argument("--preload-buckets", default="warmup")
     serve_parser.add_argument("--warmup-text", default="你好，这是一次流式预热。")
-    serve_parser.add_argument("--warmup-strategy", default="low_latency", choices=["low_latency", "balanced", "stable"])
+    serve_parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["realtime", "low_latency", "smooth", "balanced", "stable"])
     serve_parser.set_defaults(func=run_serve)
 
     args = parser.parse_args(argv)

@@ -7,7 +7,7 @@
   "instructions": "A calm young female voice, natural Mandarin pronunciation.",
   "stream": true,
   "response_format": "pcm",
-  "chunk_strategy": "low_latency",
+  "chunk_strategy": "smooth",
   "max_new_tokens": 128,
   "min_new_tokens": 8
 }

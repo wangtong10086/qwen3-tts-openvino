@@ -25,14 +25,36 @@ import soundfile as sf
 from .audio import load_audio, speaker_mel_spectrogram
 from .cache import build_ov_cache_config, merge_compile_config_with_cache_mode, normalize_ov_cache_mode, resolve_ov_cache_dir
 from .manifest import load_manifest, resolve_ir_dir
+from .profiles import (
+    CODEGEN_SCHEDULE_CHOICES,
+    CODEGEN_UNROLL_CHOICES,
+    RUNTIME_MODE_CHOICES,
+    effective_codegen_unroll,
+    effective_runtime_options,
+    fastest_runtime_defaults,
+    is_fastest_or_norepeat_mode,
+    missing_graph_variant_message,
+    normalize_codegen_schedule,
+    scheduled_codegen_unrolls,
+)
 
 
 PRETOKENIZE_REGEX = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
 NEG_INF = -3.4028234663852886e38
 DEFAULT_STREAM_CHUNK_STRATEGIES = {
+    "realtime": {
+        "initial_chunk_frames": 8,
+        "chunk_frames": 12,
+        "left_context_frames": 25,
+    },
     "low_latency": {
         "initial_chunk_frames": 8,
         "chunk_frames": 12,
+        "left_context_frames": 25,
+    },
+    "smooth": {
+        "initial_chunk_frames": 8,
+        "chunk_frames": 24,
         "left_context_frames": 25,
     },
     "balanced": {
@@ -46,6 +68,18 @@ DEFAULT_STREAM_CHUNK_STRATEGIES = {
         "left_context_frames": 25,
     },
 }
+
+
+def normalize_preferred_cache_bucket(value) -> int | None:
+    if value is None:
+        return 112
+    text = str(value).strip().lower()
+    if text in {"", "auto"}:
+        return 112
+    if text in {"none", "off", "false", "0"}:
+        return None
+    bucket = int(text)
+    return bucket if bucket > 0 else None
 
 
 @dataclass
@@ -377,6 +411,10 @@ class OpenVINOQwen3TTS:
         cache_kernel: str = "exact",
         cache_step: str = "split",
         graph_variant: str = "fp16",
+        codegen_unroll: str | int = "profile",
+        codegen_schedule: str = "current",
+        codegen_decode_unroll: str = "off",
+        preferred_cache_bucket: int | str | None = 112,
         precision_hint: str = "f16",
         compile_config: dict | None = None,
         ov_cache_dir: str | Path | None = None,
@@ -410,13 +448,30 @@ class OpenVINOQwen3TTS:
         self.streaming_decoder_requests = {}
         self.last_stream_decode_info = {}
         self.stream_pipeline_decode = True
+        if mode == "fastest":
+            fastest = fastest_runtime_defaults()
+            codegen_unroll = fastest["codegen_unroll"]
+            codegen_schedule = fastest["codegen_schedule"]
+            codegen_decode_unroll = fastest["codegen_decode_unroll"]
+            preferred_cache_bucket = fastest["preferred_cache_bucket"]
+            os.environ["QWEN3_TTS_OV_NATIVE_PIPELINE"] = "require"
+            os.environ["QWEN3_TTS_OV_NATIVE_BUFFER_REUSE"] = "1"
         self.requested_mode = mode
-        if mode == "fast-cache":
-            mode = "cache"
-            cache_kernel = "sdpa"
-            cache_step = "split"
-            graph_variant = "int8_cachedsub"
+        mode, cache_kernel, cache_step, graph_variant = effective_runtime_options(
+            mode,
+            cache_kernel,
+            cache_step,
+            graph_variant,
+        )
         self.graph_variant = graph_variant
+        self.codegen_unroll = effective_codegen_unroll(self.requested_mode, self.graph_variant, codegen_unroll)
+        self.codegen_schedule = normalize_codegen_schedule(codegen_schedule)
+        self.codegen_schedule_unrolls = scheduled_codegen_unrolls(self.codegen_schedule, self.codegen_unroll)
+        self.codegen_decode_unroll = str(codegen_decode_unroll or "off").strip().lower().replace("_", "-")
+        if self.codegen_decode_unroll not in {"off", "auto", "on"}:
+            raise ValueError("codegen_decode_unroll must be one of off, auto, on")
+        self.codegen_unroll_fallback = False
+        self.preferred_cache_bucket = normalize_preferred_cache_bucket(preferred_cache_bucket)
         self.variant_graphs = self._load_graph_variant(graph_variant)
         self.cache_kernel = cache_kernel or self.manifest.get("default_cache_kernel", "exact")
         self.cache_step = cache_step or self.manifest.get("default_cache_step", "fused")
@@ -424,6 +479,43 @@ class OpenVINOQwen3TTS:
             raise ValueError(f"unsupported cache_step={self.cache_step!r}")
         self.cache_bucket_graphs = self._load_cache_bucket_graphs(graphs, self.cache_kernel, self.variant_graphs)
         self.fused_cache_bucket_graphs = self._load_fused_cache_bucket_graphs(graphs, self.cache_kernel, self.variant_graphs)
+        self.fused_cache_unroll_bucket_graphs_by_step = self._load_fused_cache_unroll_bucket_graphs_by_step(
+            graphs,
+            self.cache_kernel,
+            self.variant_graphs,
+        )
+        self.fused_cache_unroll_norepeat_bucket_graphs_by_step = self._load_fused_cache_decode_unroll_bucket_graphs_by_step(
+            graphs,
+            self.cache_kernel,
+            self.variant_graphs,
+            "fused_cache_step_unroll_norepeat_buckets",
+        )
+        self.fused_cache_unroll_bucket_graphs = self.fused_cache_unroll_bucket_graphs_by_step.get(self.codegen_unroll, {})
+        self.fused_cache_decode_unroll_bucket_graphs_by_step = self._load_fused_cache_decode_unroll_bucket_graphs_by_step(
+            graphs,
+            self.cache_kernel,
+            self.variant_graphs,
+            "fused_cache_decode_unroll_buckets",
+        )
+        self.fused_cache_decode_unroll_stateful_mask_bucket_graphs_by_step = self._load_fused_cache_decode_unroll_bucket_graphs_by_step(
+            graphs,
+            self.cache_kernel,
+            self.variant_graphs,
+            "fused_cache_decode_unroll_stateful_mask_buckets",
+        )
+        self.fused_cache_decode_unroll_norepeat_bucket_graphs_by_step = self._load_fused_cache_decode_unroll_bucket_graphs_by_step(
+            graphs,
+            self.cache_kernel,
+            self.variant_graphs,
+            "fused_cache_decode_unroll_norepeat_buckets",
+        )
+        self.fused_cache_decode_unroll_bucket_graphs = self.fused_cache_decode_unroll_bucket_graphs_by_step.get(self.codegen_unroll, {})
+        self.fused_cache_decode_unroll_stateful_mask_bucket_graphs = (
+            self.fused_cache_decode_unroll_stateful_mask_bucket_graphs_by_step.get(self.codegen_unroll, {})
+        )
+        self.fused_cache_decode_unroll_norepeat_bucket_graphs = (
+            self.fused_cache_decode_unroll_norepeat_bucket_graphs_by_step.get(self.codegen_unroll, {})
+        )
         self.max_cache_len = max(self.cache_bucket_graphs) if self.cache_bucket_graphs else 0
         self.mode = mode
         self.device = device
@@ -446,6 +538,8 @@ class OpenVINOQwen3TTS:
             cache_kernel=self.cache_kernel,
             cache_step=self.cache_step,
             graph_variant=self.graph_variant,
+            codegen_unroll=self.codegen_unroll,
+            codegen_schedule=self.codegen_schedule,
             precision_hint=self.precision_hint,
             compile_config=self.compile_config,
             ov_cache_dir=ov_cache_dir,
@@ -483,8 +577,15 @@ class OpenVINOQwen3TTS:
         self.talker_request_by_bucket = {}
         self.fused_cache_step_by_bucket = {}
         self.fused_cache_request_by_bucket = {}
+        self.fused_cache_unroll_step_by_bucket = {}
+        self.fused_cache_unroll_request_by_bucket = {}
+        self.fused_cache_decode_unroll_step_by_bucket = {}
+        self.fused_cache_decode_unroll_request_by_bucket = {}
+        self.native_codegen_runners = {}
+        self.native_audio_runners = {}
         self.fused_step = None
         self.fused_request = None
+        self.last_codegen_info = {}
         if self.mode == "fused-no-cache":
             self.fused_step = compile_model(
                 self.core, self.ir_dir / self.graph_name(graphs, "fused_no_cache_step"), device, self.cache_dir, allow_cpu_fallback, ov_profile, self.precision_hint, self.compile_config
@@ -567,8 +668,16 @@ class OpenVINOQwen3TTS:
             self.assert_gpu_execution(gpu_models)
         cache_suffix = f" {self.cache_kernel}/{self.cache_step}" if self.mode == "cache" else ""
         variant_suffix = f" variant={self.graph_variant}" if self.graph_variant != "fp16" else ""
+        unroll_suffix = f" unroll={self.codegen_unroll}" if self.codegen_unroll > 1 else ""
+        schedule_suffix = f" schedule={self.codegen_schedule}" if self.codegen_schedule != "current" else ""
+        decode_unroll_suffix = f" decode_unroll={self.codegen_decode_unroll}" if self.codegen_unroll > 1 else ""
+        bucket_suffix = f" preferred_bucket={self.preferred_cache_bucket}" if self.preferred_cache_bucket else ""
         config_suffix = f" config={self.compile_config}" if self.compile_config else ""
-        print(f"compiled {self.requested_mode}{cache_suffix}{variant_suffix}{config_suffix} core graphs on {device} in {time.time() - started:.1f}s", flush=True)
+        print(
+            f"compiled {self.requested_mode}{cache_suffix}{variant_suffix}{unroll_suffix}"
+            f"{schedule_suffix}{decode_unroll_suffix}{bucket_suffix}{config_suffix} core graphs on {device} in {time.time() - started:.1f}s",
+            flush=True,
+        )
 
     def dump_calibration(self, name: str, inputs) -> None:
         if self.calibration_dir is None:
@@ -586,7 +695,7 @@ class OpenVINOQwen3TTS:
         variants = self.manifest.get("graph_variants", {})
         if graph_variant not in variants:
             available = ", ".join(sorted(variants)) or "none"
-            raise ValueError(f"graph variant {graph_variant!r} not found in manifest; available variants: {available}")
+            raise ValueError(missing_graph_variant_message(graph_variant, available))
         return variants[graph_variant].get("graphs", {})
 
     def graph_name(self, graphs, name: str) -> str:
@@ -614,6 +723,47 @@ class OpenVINOQwen3TTS:
         bucket_graphs = self._load_bucket_graphs(graphs.get("fused_cache_step_buckets", {}), kernel)
         bucket_graphs.update(self._load_bucket_graphs((variant_graphs or {}).get("fused_cache_step_buckets", {}), kernel))
         return dict(sorted(bucket_graphs.items()))
+
+    def _load_unroll_bucket_graphs(self, bucket_section, kernel: str, unroll_steps: int):
+        if not bucket_section:
+            return {}
+        by_kernel = bucket_section.get(kernel, {}) if isinstance(bucket_section, dict) else {}
+        if not isinstance(by_kernel, dict):
+            return {}
+        by_unroll = by_kernel.get(str(unroll_steps), {})
+        if isinstance(by_unroll, dict):
+            return {int(length): graph for length, graph in by_unroll.items() if graph}
+        return {}
+
+    def _load_fused_cache_unroll_bucket_graphs_by_step(self, graphs, kernel: str, variant_graphs=None):
+        section = graphs.get("fused_cache_step_unroll_buckets", {})
+        variant_section = (variant_graphs or {}).get("fused_cache_step_unroll_buckets", {})
+        return self._load_unroll_bucket_graphs_by_step(section, variant_section, kernel)
+
+    def _load_fused_cache_decode_unroll_bucket_graphs_by_step(
+        self,
+        graphs,
+        kernel: str,
+        variant_graphs=None,
+        section_name: str = "fused_cache_decode_unroll_buckets",
+    ):
+        section = graphs.get(section_name, {})
+        variant_section = (variant_graphs or {}).get(section_name, {})
+        return self._load_unroll_bucket_graphs_by_step(section, variant_section, kernel)
+
+    def _load_unroll_bucket_graphs_by_step(self, section, variant_section, kernel: str):
+        steps = set()
+        for item in (section, variant_section):
+            by_kernel = item.get(kernel, {}) if isinstance(item, dict) else {}
+            if isinstance(by_kernel, dict):
+                steps.update(int(step) for step in by_kernel if str(step).isdigit())
+        result = {}
+        for step in sorted(steps):
+            bucket_graphs = self._load_unroll_bucket_graphs(section, kernel, step)
+            bucket_graphs.update(self._load_unroll_bucket_graphs(variant_section, kernel, step))
+            if bucket_graphs:
+                result[int(step)] = dict(sorted(bucket_graphs.items()))
+        return result
 
     def _load_streaming_decoder_graphs(self, stream_config: dict, graphs: dict) -> dict[int, dict[int, str]]:
         contexts = stream_config.get("contexts")
@@ -713,6 +863,22 @@ class OpenVINOQwen3TTS:
             )
         return bucket
 
+    @staticmethod
+    def select_runtime_bucket(
+        available_buckets: dict[int, str],
+        required_len: int,
+        compiled_buckets=(),
+        preferred_min_bucket: int | None = None,
+    ) -> int | None:
+        compiled_candidates = sorted(
+            bucket for bucket in compiled_buckets if bucket in available_buckets and bucket >= required_len
+        )
+        if compiled_candidates:
+            return compiled_candidates[0]
+        if preferred_min_bucket is not None and required_len <= preferred_min_bucket and preferred_min_bucket in available_buckets:
+            return preferred_min_bucket
+        return next((length for length in sorted(available_buckets) if length >= required_len), None)
+
     def get_talker_stateful(self, required_len: int):
         bucket = self.select_cache_bucket(required_len)
         if bucket not in self.talker_stateful_by_bucket:
@@ -736,7 +902,11 @@ class OpenVINOQwen3TTS:
         return bucket, self.talker_stateful_by_bucket[bucket], self.talker_request_by_bucket[bucket]
 
     def get_fused_cache_step(self, required_len: int):
-        bucket = next((length for length in self.fused_cache_bucket_graphs if length >= required_len), None)
+        bucket = self.select_runtime_bucket(
+            self.fused_cache_bucket_graphs,
+            required_len,
+            self.fused_cache_step_by_bucket.keys(),
+        )
         if bucket is None:
             available = ", ".join(str(length) for length in self.fused_cache_bucket_graphs)
             raise ValueError(
@@ -762,6 +932,654 @@ class OpenVINOQwen3TTS:
             self.fused_cache_request_by_bucket[bucket] = compiled.create_infer_request()
             print(f"compiled fused cache bucket {bucket} on {self.device} in {time.time() - started:.1f}s", flush=True)
         return bucket, self.fused_cache_step_by_bucket[bucket], self.fused_cache_request_by_bucket[bucket]
+
+    def get_fused_cache_unroll_step(
+        self,
+        required_len: int,
+        unroll_steps: int | None = None,
+        preferred_min_bucket: int | None = 112,
+    ):
+        unroll_steps = int(unroll_steps or self.codegen_unroll)
+        bucket_graphs = self.fused_cache_unroll_bucket_graphs_by_step.get(unroll_steps, {})
+        compiled_buckets = [
+            bucket
+            for unroll, bucket in self.fused_cache_unroll_step_by_bucket
+            if unroll == unroll_steps
+        ]
+        bucket = self.select_runtime_bucket(
+            bucket_graphs,
+            required_len,
+            compiled_buckets,
+            preferred_min_bucket=preferred_min_bucket,
+        )
+        if bucket is None:
+            available = ", ".join(str(length) for length in bucket_graphs)
+            raise ValueError(
+                f"prompt_len + max_new_tokens requires fused unroll cache length {required_len}, "
+                f"but available fused unroll{unroll_steps} cache buckets are: {available}"
+            )
+        key = (unroll_steps, bucket)
+        if key not in self.fused_cache_unroll_step_by_bucket:
+            started = time.time()
+            graph = bucket_graphs[bucket]
+            compiled = compile_model(
+                self.core,
+                self.ir_dir / graph,
+                self.device,
+                self.cache_dir,
+                self.allow_cpu_fallback,
+                self.ov_profiler.enabled,
+                self.precision_hint,
+                self.compile_config,
+            )
+            if not self.allow_cpu_fallback and self.device == "GPU":
+                self.assert_gpu_execution([compiled])
+            self.fused_cache_unroll_step_by_bucket[key] = compiled
+            self.fused_cache_unroll_request_by_bucket[key] = compiled.create_infer_request()
+            print(
+                f"compiled fused cache unroll{unroll_steps} bucket {bucket} on {self.device} "
+                f"in {time.time() - started:.1f}s",
+                flush=True,
+            )
+        return bucket, self.fused_cache_unroll_step_by_bucket[key], self.fused_cache_unroll_request_by_bucket[key]
+
+    def get_fused_cache_decode_unroll_step(
+        self,
+        required_len: int,
+        unroll_steps: int | None = None,
+        preferred_min_bucket: int | None = 112,
+    ):
+        unroll_steps = int(unroll_steps or self.codegen_unroll)
+        stateful_graphs = self.fused_cache_decode_unroll_stateful_mask_bucket_graphs_by_step.get(unroll_steps, {})
+        plain_graphs = self.fused_cache_decode_unroll_bucket_graphs_by_step.get(unroll_steps, {})
+        stateful_mask = bool(stateful_graphs)
+        bucket_graphs = (
+            stateful_graphs
+            if stateful_mask
+            else plain_graphs
+        )
+        compiled_buckets = [
+            bucket
+            for unroll, bucket, compiled_stateful_mask in self.fused_cache_decode_unroll_step_by_bucket
+            if unroll == unroll_steps and compiled_stateful_mask == stateful_mask
+        ]
+        bucket = self.select_runtime_bucket(bucket_graphs, required_len, compiled_buckets, preferred_min_bucket=preferred_min_bucket)
+        if bucket is None:
+            available = ", ".join(str(length) for length in bucket_graphs)
+            raise ValueError(
+                f"prompt_len + max_new_tokens requires fused decode unroll cache length {required_len}, "
+                f"but available fused decode unroll buckets are: {available}"
+            )
+        key = (unroll_steps, bucket, stateful_mask)
+        if key not in self.fused_cache_decode_unroll_step_by_bucket:
+            started = time.time()
+            graph = bucket_graphs[bucket]
+            compiled = compile_model(
+                self.core,
+                self.ir_dir / graph,
+                self.device,
+                self.cache_dir,
+                self.allow_cpu_fallback,
+                self.ov_profiler.enabled,
+                self.precision_hint,
+                self.compile_config,
+            )
+            if not self.allow_cpu_fallback and self.device == "GPU":
+                self.assert_gpu_execution([compiled])
+            self.fused_cache_decode_unroll_step_by_bucket[key] = compiled
+            self.fused_cache_decode_unroll_request_by_bucket[key] = compiled.create_infer_request()
+            mask_suffix = " statefulmask" if stateful_mask else ""
+            print(
+                f"compiled fused cache decode unroll{unroll_steps}{mask_suffix} bucket {bucket} on {self.device} "
+                f"in {time.time() - started:.1f}s",
+                flush=True,
+            )
+        return (
+            bucket,
+            self.fused_cache_decode_unroll_step_by_bucket[key],
+            self.fused_cache_decode_unroll_request_by_bucket[key],
+            stateful_mask,
+        )
+
+    def codegen_unroll_available(self, unroll_steps: int) -> bool:
+        return bool(self.fused_cache_unroll_bucket_graphs_by_step.get(int(unroll_steps), {}))
+
+    def select_codegen_unroll_for_step(self, generated_count: int) -> int:
+        if self.codegen_schedule == "ll-v2":
+            preferred = [4, 8, 6, 12] if generated_count < 8 else [12, 8, 6, 4]
+        elif self.codegen_schedule == "balanced-v2":
+            preferred = [8, 4, 6, 12] if generated_count < 8 else [12, 8, 6, 4]
+        else:
+            preferred = [self.codegen_unroll]
+        for unroll_steps in preferred:
+            if unroll_steps > 1 and self.codegen_unroll_available(unroll_steps):
+                return int(unroll_steps)
+        if self.codegen_unroll > 1 and self.codegen_unroll_available(self.codegen_unroll):
+            return int(self.codegen_unroll)
+        return 1
+
+    @staticmethod
+    def unroll_required_cache_len(prompt_len: int, max_new_tokens: int, unroll_steps: int) -> int:
+        if unroll_steps <= 1:
+            return prompt_len + max_new_tokens
+        batches = (max_new_tokens + unroll_steps - 1) // unroll_steps
+        return prompt_len + batches * unroll_steps - 1
+
+    @staticmethod
+    def _copy_matching_states(source_request, target_request) -> None:
+        source_states = {state.name: state for state in source_request.query_state()}
+        for target_state in target_request.query_state():
+            source_state = source_states.get(target_state.name)
+            if source_state is not None:
+                target_state.state = source_state.state
+
+    @staticmethod
+    def _set_request_state(request, name: str, value: np.ndarray) -> bool:
+        for state in request.query_state():
+            if state.name == name or state.name.startswith(name):
+                state.state = ov.Tensor(np.asarray(value))
+                return True
+        return False
+
+    def _native_codegen_mode(self) -> str:
+        return str(os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN", "")).strip().lower()
+
+    def _native_pipeline_mode(self) -> str:
+        return str(os.environ.get("QWEN3_TTS_OV_NATIVE_PIPELINE", "")).strip().lower()
+
+    def _try_generate_codes_native_unroll4_statefulmask(
+        self,
+        sequence: np.ndarray,
+        tts_pad_embed: np.ndarray,
+        prompt_len: int,
+        max_new_tokens: int,
+        min_new_tokens: int,
+        repetition_penalty: float,
+        initial_unroll: int,
+        unroll_required_len: int,
+        decode_unroll_enabled: bool,
+        decode_unroll_graph_available: bool,
+        stream_batches: bool = False,
+    ):
+        native_mode = self._native_codegen_mode()
+        if native_mode not in {"1", "true", "on", "require"}:
+            return None
+        require = native_mode == "require"
+        try:
+            if self.mode != "cache" or self.cache_step != "fused":
+                raise RuntimeError("native codegen requires cache + fused mode")
+            if initial_unroll <= 1 or self.codegen_schedule != "current":
+                raise RuntimeError("native codegen currently requires codegen_unroll>1 and codegen_schedule=current")
+            if not decode_unroll_enabled or not decode_unroll_graph_available:
+                raise RuntimeError("native codegen requires codegen_decode_unroll=auto/on and a decode-unroll graph")
+            no_repeat_codegen = abs(float(repetition_penalty) - 1.0) <= 1e-6
+            if is_fastest_or_norepeat_mode(self.requested_mode) and not no_repeat_codegen:
+                raise RuntimeError(f"{self.requested_mode} requires repetition_penalty=1.0")
+            no_repeat_prefill_graphs = self.fused_cache_unroll_norepeat_bucket_graphs_by_step.get(initial_unroll, {})
+            no_repeat_decode_graphs = self.fused_cache_decode_unroll_norepeat_bucket_graphs_by_step.get(initial_unroll, {})
+            use_no_repeat_graphs = bool(no_repeat_codegen and no_repeat_prefill_graphs and no_repeat_decode_graphs)
+            if is_fastest_or_norepeat_mode(self.requested_mode) and not use_no_repeat_graphs:
+                raise RuntimeError(
+                    f"{self.requested_mode} requires unroll{initial_unroll} no-repeat prefill and decode-unroll graphs"
+                )
+            prefill_graphs = (
+                no_repeat_prefill_graphs
+                if use_no_repeat_graphs
+                else self.fused_cache_unroll_bucket_graphs_by_step.get(initial_unroll, {})
+            )
+            decode_graphs = (
+                no_repeat_decode_graphs
+                if use_no_repeat_graphs
+                else self.fused_cache_decode_unroll_stateful_mask_bucket_graphs_by_step.get(initial_unroll, {})
+            )
+            if not prefill_graphs or not decode_graphs:
+                raise RuntimeError(f"native codegen requires unroll{initial_unroll} prefill and decode-unroll graphs")
+            bucket = self.select_runtime_bucket(
+                prefill_graphs,
+                unroll_required_len,
+                (),
+                preferred_min_bucket=self.preferred_cache_bucket,
+            )
+            if bucket is None:
+                raise RuntimeError("no native prefill bucket can satisfy requested generation length")
+            if bucket not in decode_graphs:
+                raise RuntimeError(f"decode-unroll graph is missing for bucket {bucket}")
+
+            prefill_graph = self.ir_dir / prefill_graphs[bucket]
+            decode_graph = self.ir_dir / decode_graphs[bucket]
+            cache_mode = str(self.compile_config.get("CACHE_MODE", "OPTIMIZE_SPEED"))
+            cache_dir = None if self.disable_ov_cache else self.cache_dir
+            key = (
+                str(prefill_graph),
+                str(decode_graph),
+                self.device,
+                str(cache_dir or ""),
+                cache_mode,
+            )
+            if key not in self.native_codegen_runners:
+                from .native_codegen import NativeCodegenRunner
+
+                started = time.time()
+                self.native_codegen_runners[key] = NativeCodegenRunner(
+                    prefill_graph=prefill_graph,
+                    decode_graph=decode_graph,
+                    device=self.device,
+                    cache_dir=cache_dir,
+                    cache_mode=cache_mode,
+                )
+                print(
+                    f"compiled native GenAI-style codegen unroll{initial_unroll} bucket {bucket} on {self.device} "
+                    f"in {time.time() - started:.1f}s",
+                    flush=True,
+                )
+            runner = self.native_codegen_runners[key]
+            self.codegen_unroll_fallback = False
+            self.last_codegen_info = {
+                "prompt_len": int(prompt_len),
+                "required_cache_len": int(prompt_len + max_new_tokens),
+                "unroll_required_cache_len": int(unroll_required_len),
+                "selected_bucket": int(bucket),
+                "preferred_cache_bucket": self.preferred_cache_bucket,
+                "selected_codegen_graph": str(decode_graph.name),
+                "selected_prefill_graph": str(prefill_graph.name),
+                "codegen_graph_kind": "native_decode_unroll_norepeat" if use_no_repeat_graphs else "native_decode_unroll_statefulmask",
+                "codegen_schedule": self.codegen_schedule,
+                "scheduled_unrolls": list(self.codegen_schedule_unrolls),
+                "active_codegen_unroll": int(initial_unroll),
+                "codegen_decode_unroll": self.codegen_decode_unroll,
+                "decode_unroll_graph_available": True,
+                "decode_unroll_available": True,
+                "decode_unroll_stateful_mask": not use_no_repeat_graphs,
+                "codegen_no_repeat": bool(use_no_repeat_graphs),
+                "native_codegen": True,
+                "native_streaming_callbacks": bool(stream_batches),
+            }
+            if stream_batches:
+                def _iter_native_batches():
+                    emitted = 0
+                    for batch in runner.iter_batches(
+                        sequence=sequence,
+                        tts_pad_embed=tts_pad_embed,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=min_new_tokens,
+                        repetition_penalty=repetition_penalty,
+                        vocab_size=int(self.ids["vocab_size"]),
+                        num_code_groups=self.num_code_groups,
+                        eos_token_id=int(self.ids["codec_eos_token_id"]),
+                    ):
+                        batch = np.asarray(batch, dtype=np.int64)
+                        for frame in batch:
+                            emitted += 1
+                            yield frame
+                    elapsed_ms = float(getattr(runner, "last_stream_elapsed_ms", 0.0) or 0.0)
+                    if elapsed_ms > 0:
+                        self.timings.add("fused_step", elapsed_ms / 1000.0)
+                    self.last_codegen_info.update(
+                        {
+                            "native_codegen_ms": elapsed_ms,
+                            "native_emitted_frames": int(emitted),
+                            "native_remote_embed": bool(getattr(runner, "last_remote_embed", False)),
+                        }
+                    )
+
+                return _iter_native_batches()
+            codes, elapsed_ms = runner.run(
+                sequence=sequence,
+                tts_pad_embed=tts_pad_embed,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                repetition_penalty=repetition_penalty,
+                vocab_size=int(self.ids["vocab_size"]),
+                num_code_groups=self.num_code_groups,
+                eos_token_id=int(self.ids["codec_eos_token_id"]),
+            )
+            self.timings.add("fused_step", elapsed_ms / 1000.0)
+            self.last_codegen_info.update(
+                {
+                    "native_codegen_ms": float(elapsed_ms),
+                    "native_emitted_frames": int(codes.shape[0]),
+                    "native_remote_embed": bool(getattr(runner, "last_remote_embed", False)),
+                }
+            )
+            return np.asarray(codes, dtype=np.int64)
+        except Exception as exc:
+            if require:
+                raise
+            print(f"warning: native GenAI-style codegen unavailable; falling back to Python runtime: {exc}", flush=True)
+            return None
+
+    def _try_stream_native_audio_pipeline(
+        self,
+        *,
+        text: str,
+        instruct: str,
+        language: str,
+        max_new_tokens: int,
+        min_new_tokens: int,
+        repetition_penalty: float,
+        max_prompt_tokens: int,
+        chunk_frames: int | None = None,
+        left_context_frames: int | None = None,
+        initial_chunk_frames: int | None = None,
+        chunk_strategy: str | None = None,
+        speaker: str | None = None,
+        voice_clone_prompt: VoiceClonePromptItem | None = None,
+        ref_text: str | None = None,
+        prefix_codes: np.ndarray | None = None,
+        do_sample: bool = False,
+    ):
+        native_mode = self._native_pipeline_mode()
+        if native_mode not in {"1", "true", "on", "require"}:
+            return None
+        require = native_mode == "require"
+        try:
+            if do_sample:
+                raise RuntimeError("native audio pipeline currently supports greedy decoding only")
+            if self.mode != "cache" or self.cache_step != "fused":
+                raise RuntimeError("native audio pipeline requires cache + fused mode")
+            initial_unroll = self.select_codegen_unroll_for_step(0)
+            if initial_unroll <= 1 or self.codegen_schedule != "current":
+                raise RuntimeError("native audio pipeline currently requires codegen_unroll>1 and codegen_schedule=current")
+            decode_unroll_enabled = self.codegen_decode_unroll in {"auto", "on"} and self.codegen_schedule == "current"
+            no_repeat_codegen = abs(float(repetition_penalty) - 1.0) <= 1e-6
+            if is_fastest_or_norepeat_mode(self.requested_mode) and not no_repeat_codegen:
+                raise RuntimeError(f"{self.requested_mode} requires repetition_penalty=1.0")
+            decode_unroll_graph_available = bool(
+                self.fused_cache_decode_unroll_bucket_graphs_by_step.get(initial_unroll, {})
+                or self.fused_cache_decode_unroll_stateful_mask_bucket_graphs_by_step.get(initial_unroll, {})
+                or self.fused_cache_decode_unroll_norepeat_bucket_graphs_by_step.get(initial_unroll, {})
+            )
+            if not decode_unroll_enabled or not decode_unroll_graph_available:
+                raise RuntimeError("native audio pipeline requires codegen_decode_unroll=auto/on and decode-unroll graphs")
+
+            stream_config = self._resolve_stream_chunk_config(
+                chunk_strategy=chunk_strategy,
+                chunk_frames=chunk_frames,
+                initial_chunk_frames=initial_chunk_frames,
+                left_context_frames=left_context_frames,
+            )
+            first_context = 0
+            first_chunk = int(stream_config["initial_chunk_frames"])
+            steady_context = int(stream_config["left_context_frames"])
+            steady_chunk = int(stream_config["chunk_frames"])
+            try:
+                first_decoder_graph = self.streaming_decoder_graphs_by_context[first_context][first_chunk]
+                steady_decoder_graph = self.streaming_decoder_graphs_by_context[steady_context][steady_chunk]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"native audio pipeline requires exact streaming decoder graphs c{first_context}_t{first_chunk} "
+                    f"and c{steady_context}_t{steady_chunk}"
+                ) from exc
+
+            native_prompt_pipeline = (
+                str(os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT", "")).strip().lower() in {"1", "true", "on", "yes"}
+                and speaker is None
+                and voice_clone_prompt is None
+                and ref_text is None
+                and prefix_codes is None
+                and bool((self.manifest.get("tokenizer_ir") or {}).get("tokenizer"))
+            )
+            codec_prefill = None
+            sequence = None
+            tts_pad_embed = None
+            if native_prompt_pipeline:
+                input_ids = self.tokenizer.encode(build_assistant_text(text))
+                instruct_ids = self.tokenizer.encode(build_instruct_text(instruct)) if instruct else []
+                if len(input_ids) > max_prompt_tokens:
+                    raise ValueError(f"text prompt has {len(input_ids)} tokens, max_prompt_tokens={max_prompt_tokens}")
+                if len(instruct_ids) > max_prompt_tokens:
+                    raise ValueError(f"instruct prompt has {len(instruct_ids)} tokens, max_prompt_tokens={max_prompt_tokens}")
+                codec_prefill = self.language_codec_prefill(language, speaker=None)
+                prompt_len = int(len(instruct_ids) + len(input_ids) + len(codec_prefill) - 3)
+            else:
+                sequence, tts_pad_embed = self.build_prompt(
+                    text,
+                    instruct,
+                    language,
+                    max_prompt_tokens,
+                    speaker=speaker,
+                    voice_clone_prompt=voice_clone_prompt,
+                    ref_text=ref_text,
+                )
+                prompt_len = int(sequence.shape[1])
+            unroll_required_len = self.unroll_required_cache_len(prompt_len, max_new_tokens, initial_unroll)
+            no_repeat_prefill_graphs = self.fused_cache_unroll_norepeat_bucket_graphs_by_step.get(initial_unroll, {})
+            no_repeat_decode_graphs = self.fused_cache_decode_unroll_norepeat_bucket_graphs_by_step.get(initial_unroll, {})
+            use_no_repeat_graphs = bool(no_repeat_codegen and no_repeat_prefill_graphs and no_repeat_decode_graphs)
+            if is_fastest_or_norepeat_mode(self.requested_mode) and not use_no_repeat_graphs:
+                raise RuntimeError(
+                    f"{self.requested_mode} requires unroll{initial_unroll} no-repeat prefill and decode-unroll graphs"
+                )
+            prefill_graphs = (
+                no_repeat_prefill_graphs
+                if use_no_repeat_graphs
+                else self.fused_cache_unroll_bucket_graphs_by_step.get(initial_unroll, {})
+            )
+            decode_graphs = (
+                no_repeat_decode_graphs
+                if use_no_repeat_graphs
+                else self.fused_cache_decode_unroll_stateful_mask_bucket_graphs_by_step.get(initial_unroll, {})
+            )
+            if not prefill_graphs or not decode_graphs:
+                raise RuntimeError(
+                    f"native audio pipeline requires unroll{initial_unroll} prefill and decode-unroll graphs"
+                )
+            bucket = self.select_runtime_bucket(
+                prefill_graphs,
+                unroll_required_len,
+                (),
+                preferred_min_bucket=self.preferred_cache_bucket,
+            )
+            if bucket is None or bucket not in decode_graphs:
+                raise RuntimeError("no native audio pipeline bucket can satisfy requested generation length")
+
+            cache_mode = str(self.compile_config.get("CACHE_MODE", "OPTIMIZE_SPEED"))
+            cache_dir = None if self.disable_ov_cache else self.cache_dir
+            prefill_graph = self.ir_dir / prefill_graphs[bucket]
+            decode_graph = self.ir_dir / decode_graphs[bucket]
+            first_decoder = self.ir_dir / first_decoder_graph
+            steady_decoder = self.ir_dir / steady_decoder_graph
+            key = (
+                str(prefill_graph),
+                str(decode_graph),
+                str(first_decoder),
+                str(steady_decoder),
+                self.device,
+                self.decoder_device,
+                str(cache_dir or ""),
+                cache_mode,
+                first_context,
+                first_chunk,
+                steady_context,
+                steady_chunk,
+            )
+            if key not in self.native_audio_runners:
+                from .native_codegen import NativeCodegenRunner
+
+                started = time.time()
+                runner = NativeCodegenRunner(
+                    prefill_graph=prefill_graph,
+                    decode_graph=decode_graph,
+                    device=self.device,
+                    cache_dir=cache_dir,
+                    cache_mode=cache_mode,
+                )
+                runner.set_stream_decoders(
+                    first_decoder_graph=first_decoder,
+                    steady_decoder_graph=steady_decoder,
+                    decoder_device=self.decoder_device,
+                    cache_dir=cache_dir,
+                    cache_mode=cache_mode,
+                    first_context_frames=first_context,
+                    first_chunk_frames=first_chunk,
+                    steady_context_frames=steady_context,
+                    steady_chunk_frames=steady_chunk,
+                    num_code_groups=self.num_code_groups,
+                    decode_upsample_rate=self.decode_upsample_rate,
+                )
+                self.native_audio_runners[key] = runner
+                print(
+                    f"compiled native GenAI C++ audio pipeline bucket {bucket} "
+                    f"stream c{first_context}_t{first_chunk}/c{steady_context}_t{steady_chunk} "
+                    f"on {self.device}/{self.decoder_device} in {time.time() - started:.1f}s",
+                    flush=True,
+                )
+            runner = self.native_audio_runners[key]
+            if native_prompt_pipeline and not getattr(runner, "voice_design_prompt_configured", False):
+                tokenizer_dir = self.ir_dir
+                tokenizer_ir = self.manifest.get("tokenizer_ir") or {}
+                if not (tokenizer_dir / tokenizer_ir.get("tokenizer", "openvino_tokenizer.xml")).exists():
+                    raise RuntimeError("native prompt pipeline requires openvino_tokenizer.xml in the IR directory")
+                runner.configure_voice_design_prompt(
+                    tokenizer_dir=tokenizer_dir,
+                    text_embedding_graph=self.ir_dir / self.graph_name(self.manifest["graphs"], "text_embedding"),
+                    codec_embedding_graph=self.ir_dir / self.graph_name(self.manifest["graphs"], "codec_embedding"),
+                    device=str(os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE") or "CPU"),
+                    ids=self.ids,
+                    cache_dir=cache_dir,
+                    cache_mode=cache_mode,
+                )
+                runner.voice_design_prompt_configured = True
+            self.codegen_unroll_fallback = False
+            self.last_codegen_info = {
+                "prompt_len": int(prompt_len),
+                "required_cache_len": int(prompt_len + max_new_tokens),
+                "unroll_required_cache_len": int(unroll_required_len),
+                "selected_bucket": int(bucket),
+                "preferred_cache_bucket": self.preferred_cache_bucket,
+                "selected_codegen_graph": str(decode_graph.name),
+                "selected_prefill_graph": str(prefill_graph.name),
+                "codegen_graph_kind": (
+                    "native_audio_pipeline_decode_unroll_norepeat"
+                    if use_no_repeat_graphs
+                    else "native_audio_pipeline_decode_unroll_statefulmask"
+                ),
+                "codegen_schedule": self.codegen_schedule,
+                "scheduled_unrolls": list(self.codegen_schedule_unrolls),
+                "active_codegen_unroll": int(initial_unroll),
+                "codegen_decode_unroll": self.codegen_decode_unroll,
+                "decode_unroll_graph_available": True,
+                "decode_unroll_available": True,
+                "decode_unroll_stateful_mask": not use_no_repeat_graphs,
+                "codegen_no_repeat": bool(use_no_repeat_graphs),
+                "native_codegen": True,
+                "native_audio_pipeline": True,
+                "native_prompt_pipeline": bool(native_prompt_pipeline),
+                "native_streaming_callbacks": True,
+            }
+
+            def _iter_audio_chunks():
+                chunk_index = 0
+                stream_started = time.time()
+                stream_audio_ms = 0.0
+                stream_compute_ms = 0.0
+                emitted_frames = 0
+                final_seen = False
+                if native_prompt_pipeline:
+                    source_iter = runner.iter_voice_design_audio_chunks(
+                        text=text,
+                        instruct=instruct,
+                        codec_prefill=codec_prefill,
+                        max_prompt_tokens=max_prompt_tokens,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=min_new_tokens,
+                        repetition_penalty=repetition_penalty,
+                        vocab_size=int(self.ids["vocab_size"]),
+                        num_code_groups=self.num_code_groups,
+                        eos_token_id=int(self.ids["codec_eos_token_id"]),
+                    )
+                else:
+                    source_iter = runner.iter_audio_chunks(
+                        sequence=sequence,
+                        tts_pad_embed=tts_pad_embed,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=min_new_tokens,
+                        repetition_penalty=repetition_penalty,
+                        vocab_size=int(self.ids["vocab_size"]),
+                        num_code_groups=self.num_code_groups,
+                        eos_token_id=int(self.ids["codec_eos_token_id"]),
+                        prefix_codes=prefix_codes,
+                    )
+                for item in source_iter:
+                    audio = np.asarray(item["audio"], dtype=np.float32)
+                    codes = np.asarray(item["codes"], dtype=np.int64).reshape(-1, self.num_code_groups)
+                    emitted_frames += int(codes.shape[0])
+                    codegen_ms = float(item.get("codegen_ms", 0.0))
+                    decode_ms = float(item.get("decode_ms", 0.0))
+                    audio_ms = (float(audio.shape[0]) / float(self.sample_rate) * 1000.0) if audio.size else 0.0
+                    compute_ms = codegen_ms + decode_ms
+                    if audio_ms > 0:
+                        stream_audio_ms += audio_ms
+                        stream_compute_ms += compute_ms
+                    stream_elapsed_ms = max(0.0, (time.time() - stream_started) * 1000.0)
+                    stream_rtf = (stream_elapsed_ms / stream_audio_ms) if stream_audio_ms > 0 else 0.0
+                    stream_compute_rtf = (stream_compute_ms / stream_audio_ms) if stream_audio_ms > 0 else 0.0
+                    is_final = bool(item.get("is_final", False))
+                    timings = {
+                        **self.timings.snapshot(emitted_frames),
+                        **dict(getattr(self, "last_codegen_info", {}) or {}),
+                        "decode_path": f"native:stream:c{first_context if chunk_index == 0 else steady_context}_t{first_chunk if chunk_index == 0 else steady_chunk}",
+                        "decode_context_frames": int(first_context if chunk_index == 0 else steady_context),
+                        "decode_chunk_graph_frames": int(first_chunk if chunk_index == 0 else steady_chunk),
+                        "decode_ms": decode_ms,
+                        "fallback": False,
+                        "codegen_ms": codegen_ms,
+                        "chunk_compute_ms": compute_ms,
+                        "chunk_audio_ms": audio_ms,
+                        "rtf": (compute_ms / audio_ms) if audio_ms > 0 else 0.0,
+                        "stream_audio_ms": stream_audio_ms,
+                        "stream_compute_ms": stream_compute_ms,
+                        "stream_elapsed_ms": stream_elapsed_ms,
+                        "stream_rtf": stream_rtf,
+                        "stream_compute_rtf": stream_compute_rtf,
+                        "queue_hint_ms": max(0.0, audio_ms - compute_ms),
+                        "queue_wait_ms": 0.0,
+                        "producer_lag_ms": max(0.0, codegen_ms - audio_ms),
+                        "strategy": stream_config["strategy"],
+                        "codegen_unroll": int(getattr(self, "codegen_unroll", 1)),
+                        "unroll_fallback": False,
+                        "initial_chunk_frames": int(first_chunk),
+                        "configured_chunk_frames": int(steady_chunk),
+                        "native_audio_pipeline": True,
+                        "native_prompt_pipeline": bool(native_prompt_pipeline),
+                        "native_remote_embed": bool(item.get("remote_embed", getattr(runner, "last_remote_embed", False))),
+                        "native_ov_profile": item.get("native_ov_profile"),
+                        "native_timing": item.get("native_timing"),
+                        "pipeline_decode": True,
+                        "chunk_frames": int(codes.shape[0]),
+                        "emitted_frames": int(emitted_frames),
+                        "prefix_frames": int(0 if prefix_codes is None else np.asarray(prefix_codes).reshape(-1, self.num_code_groups).shape[0]),
+                        "is_final": is_final,
+                    }
+                    chunk = StreamChunk(
+                        index=chunk_index,
+                        audio=audio,
+                        sample_rate=self.sample_rate,
+                        codes=codes,
+                        is_final=is_final,
+                        timings=timings,
+                    )
+                    chunk_index += 1
+                    yield chunk
+                    if is_final:
+                        final_seen = True
+                if final_seen:
+                    self.last_codegen_info.update(
+                        {
+                            "native_pipeline_ms": float(getattr(runner, "last_audio_stream_elapsed_ms", 0.0) or 0.0),
+                            "native_emitted_frames": int(getattr(runner, "last_audio_stream_count", emitted_frames) or emitted_frames),
+                            "native_remote_embed": bool(getattr(runner, "last_remote_embed", False)),
+                            "native_ov_profile": getattr(runner, "last_profile_json", None),
+                            "native_timing": getattr(runner, "last_timing_json", None),
+                        }
+                    )
+
+            return _iter_audio_chunks()
+        except Exception as exc:
+            if require:
+                raise
+            print(f"warning: native GenAI C++ audio pipeline unavailable; falling back to Python runtime: {exc}", flush=True)
+            return None
 
     def ensure_subcode_greedy(self):
         if self.subcode_greedy is not None:
@@ -1451,9 +2269,94 @@ class OpenVINOQwen3TTS:
         )
         prompt_len = int(sequence.shape[1])
         required_len = prompt_len + max_new_tokens
-        cache_len, fused_cache_step, fused_cache_request = self.get_fused_cache_step(required_len)
+        initial_unroll = self.select_codegen_unroll_for_step(0)
+        unroll_required_len = self.unroll_required_cache_len(prompt_len, max_new_tokens, initial_unroll)
+        use_unroll = initial_unroll > 1
+        fused_cache_step = None
+        fused_cache_request = None
+        unroll_cache_len = None
+        unroll_step = None
+        unroll_request = None
+        decode_unroll_cache_len = None
+        decode_unroll_step = None
+        decode_unroll_request = None
+        decode_unroll_stateful_mask = False
+        decode_unroll_ready = False
+        decode_unroll_graph_available = bool(
+            self.fused_cache_decode_unroll_bucket_graphs_by_step.get(initial_unroll, {})
+            or self.fused_cache_decode_unroll_stateful_mask_bucket_graphs_by_step.get(initial_unroll, {})
+            or self.fused_cache_decode_unroll_norepeat_bucket_graphs_by_step.get(initial_unroll, {})
+        )
+        decode_unroll_enabled = self.codegen_decode_unroll in {"auto", "on"} and self.codegen_schedule == "current"
+        native_codes = self._try_generate_codes_native_unroll4_statefulmask(
+            sequence=sequence,
+            tts_pad_embed=tts_pad_embed,
+            prompt_len=prompt_len,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            repetition_penalty=repetition_penalty,
+            initial_unroll=initial_unroll,
+            unroll_required_len=unroll_required_len,
+            decode_unroll_enabled=decode_unroll_enabled,
+            decode_unroll_graph_available=decode_unroll_graph_available,
+            stream_batches=True,
+        )
+        if native_codes is not None:
+            for frame in native_codes:
+                yield frame
+            return
+        if use_unroll:
+            try:
+                unroll_cache_len, unroll_step, unroll_request = self.get_fused_cache_unroll_step(
+                    unroll_required_len,
+                    initial_unroll,
+                )
+                if self.codegen_decode_unroll == "on" and self.codegen_schedule != "current":
+                    raise RuntimeError("codegen_decode_unroll=on is only supported with codegen_schedule=current")
+                if self.codegen_decode_unroll == "on" and not decode_unroll_graph_available:
+                    raise RuntimeError("codegen_decode_unroll=on requested, but no fused cache decode-unroll graph is available")
+                if decode_unroll_enabled and decode_unroll_graph_available:
+                    (
+                        decode_unroll_cache_len,
+                        decode_unroll_step,
+                        decode_unroll_request,
+                        decode_unroll_stateful_mask,
+                    ) = self.get_fused_cache_decode_unroll_step(unroll_required_len, initial_unroll)
+                self.codegen_unroll_fallback = False
+            except Exception as exc:
+                self.codegen_unroll_fallback = True
+                use_unroll = False
+                print(f"warning: fused cache unroll{initial_unroll} failed; falling back to single-step fused cache: {exc}", flush=True)
+        else:
+            self.codegen_unroll_fallback = self.codegen_unroll > 1
+        if not use_unroll:
+            cache_len, fused_cache_step, fused_cache_request = self.get_fused_cache_step(required_len)
 
-        fused_cache_request.reset_state()
+        if use_unroll:
+            unroll_request.reset_state()
+            if decode_unroll_request is not None:
+                decode_unroll_request.reset_state()
+        else:
+            fused_cache_request.reset_state()
+        self.last_codegen_info = {
+            "prompt_len": int(prompt_len),
+            "required_cache_len": int(required_len),
+            "unroll_required_cache_len": int(unroll_required_len),
+            "selected_bucket": int(unroll_cache_len if use_unroll else cache_len),
+            "selected_codegen_graph": (
+                self.fused_cache_unroll_bucket_graphs_by_step.get(initial_unroll, {}).get(unroll_cache_len)
+                if use_unroll
+                else self.fused_cache_bucket_graphs.get(cache_len)
+            ),
+            "codegen_graph_kind": "prefill_unroll" if use_unroll else "single_fused",
+            "codegen_schedule": self.codegen_schedule,
+            "scheduled_unrolls": list(self.codegen_schedule_unrolls),
+            "active_codegen_unroll": int(initial_unroll if use_unroll else 1),
+            "codegen_decode_unroll": self.codegen_decode_unroll,
+            "decode_unroll_graph_available": bool(decode_unroll_graph_available),
+            "decode_unroll_available": bool(decode_unroll_request is not None),
+            "decode_unroll_stateful_mask": bool(decode_unroll_stateful_mask),
+        }
         generated_count = 0
         generated_first_codes = []
         repeated_mask = np.zeros((1, int(self.ids["vocab_size"])), dtype=np.float32)
@@ -1462,9 +2365,118 @@ class OpenVINOQwen3TTS:
 
         next_inputs_embeds = sequence.astype(np.float32, copy=False)
         next_cache_position = np.arange(prompt_len, dtype=np.int64)
-        next_attention_mask = self.make_attention_mask(next_cache_position, prompt_len, prompt_len)
+        next_attention_mask = self.make_attention_mask(
+            next_cache_position,
+            prompt_len,
+            unroll_cache_len if use_unroll else prompt_len,
+        )
+        active_unroll = initial_unroll
+        active_request = unroll_request
+        initialized_unroll_requests = {(initial_unroll, unroll_cache_len)} if use_unroll else set()
 
-        for step in range(max_new_tokens):
+        while generated_count < max_new_tokens:
+            step = generated_count
+            if use_unroll:
+                scheduled_unroll = initial_unroll if decode_unroll_ready else self.select_codegen_unroll_for_step(generated_count)
+                if scheduled_unroll != active_unroll and not decode_unroll_ready:
+                    scheduled_required_len = self.unroll_required_cache_len(prompt_len, max_new_tokens, scheduled_unroll)
+                    scheduled_cache_len, scheduled_step, scheduled_request = self.get_fused_cache_unroll_step(
+                        scheduled_required_len,
+                        scheduled_unroll,
+                    )
+                    request_key = (scheduled_unroll, scheduled_cache_len)
+                    if request_key not in initialized_unroll_requests:
+                        scheduled_request.reset_state()
+                        self._copy_matching_states(active_request, scheduled_request)
+                        initialized_unroll_requests.add(request_key)
+                    active_unroll = scheduled_unroll
+                    active_request = scheduled_request
+                    unroll_cache_len = scheduled_cache_len
+                    unroll_step = scheduled_step
+                    unroll_request = scheduled_request
+                    unroll_required_len = scheduled_required_len
+                    next_attention_mask = self.make_attention_mask(next_cache_position, next_inputs_embeds.shape[1], unroll_cache_len)
+                current_request = decode_unroll_request if decode_unroll_ready else active_request
+                current_step = decode_unroll_step if decode_unroll_ready else unroll_step
+                current_label = (
+                    f"fused_cache_decode_unroll{active_unroll}"
+                    if decode_unroll_ready
+                    else f"fused_cache_unroll{active_unroll}"
+                )
+                current_kind = "decode_unroll_statefulmask" if decode_unroll_ready and decode_unroll_stateful_mask else (
+                    "decode_unroll" if decode_unroll_ready else "prefill_unroll"
+                )
+                allow_eos = np.asarray(
+                    [1.0 if step + offset >= min_new_tokens else 0.0 for offset in range(active_unroll)],
+                    dtype=np.float32,
+                )
+                inputs = {
+                    "inputs_embeds": next_inputs_embeds,
+                    "cache_position": next_cache_position,
+                    "tts_pad_embed": tts_pad_embed.astype(np.float32, copy=False),
+                    "allow_eos_steps": allow_eos,
+                    "repetition_penalty": penalty,
+                }
+                if decode_unroll_ready:
+                    if not decode_unroll_stateful_mask:
+                        inputs["repeated_mask"] = repeated_mask
+                else:
+                    inputs["attention_mask"] = next_attention_mask
+                    inputs["repeated_mask"] = repeated_mask
+                step_started = time.time()
+                outputs = run_request(
+                    current_request,
+                    current_step,
+                    inputs,
+                    self.ov_profiler,
+                    current_label,
+                )
+                self.timings.add("fused_step", time.time() - step_started)
+                first_codes, codes, frame_embed = outputs[:3]
+                repeated_mask_out = None if decode_unroll_stateful_mask else outputs[3]
+                self.last_codegen_info.update(
+                    {
+                        "selected_bucket": int(decode_unroll_cache_len if decode_unroll_ready else unroll_cache_len),
+                        "selected_codegen_graph": (
+                            (self.fused_cache_decode_unroll_stateful_mask_bucket_graphs if decode_unroll_stateful_mask else self.fused_cache_decode_unroll_bucket_graphs).get(decode_unroll_cache_len)
+                            if decode_unroll_ready
+                            else self.fused_cache_unroll_bucket_graphs_by_step.get(active_unroll, {}).get(unroll_cache_len)
+                        ),
+                        "codegen_graph_kind": current_kind,
+                        "active_codegen_unroll": int(active_unroll),
+                        "unroll_required_cache_len": int(unroll_required_len),
+                    }
+                )
+
+                first_codes = first_codes.reshape(-1).astype(np.int64, copy=False)
+                codes = codes.astype(np.int64, copy=False).reshape(-1, self.num_code_groups)
+                stop = False
+                for offset in range(min(active_unroll, max_new_tokens - generated_count)):
+                    first_code_int = int(first_codes[offset])
+                    if first_code_int == int(self.ids["codec_eos_token_id"]):
+                        stop = True
+                        break
+                    generated_count += 1
+                    generated_first_codes.append(first_code_int)
+                    if progress_interval and generated_count % progress_interval == 0:
+                        elapsed = time.time() - started
+                        print(f"generated {generated_count}/{max_new_tokens} codec tokens in {elapsed:.1f}s", flush=True)
+                    yield codes[offset]
+                if stop or generated_count >= max_new_tokens:
+                    break
+                if repeated_mask_out is not None:
+                    repeated_mask = repeated_mask_out.astype(np.float32, copy=False)
+                next_inputs_embeds = frame_embed.astype(np.float32, copy=False)
+                next_cache_position = np.asarray([prompt_len + generated_count - 1], dtype=np.int64)
+                if decode_unroll_request is not None and not decode_unroll_ready:
+                    self._copy_matching_states(active_request, decode_unroll_request)
+                    if decode_unroll_stateful_mask:
+                        self._set_request_state(decode_unroll_request, "repeated_mask", repeated_mask)
+                    decode_unroll_ready = True
+                if not decode_unroll_ready:
+                    next_attention_mask = self.make_attention_mask(next_cache_position, 1, unroll_cache_len)
+                continue
+
             allow_eos = np.asarray([1.0 if step >= min_new_tokens else 0.0], dtype=np.float32)
             step_started = time.time()
             first_code, codes, frame_embed = run_request(
@@ -1483,6 +2495,13 @@ class OpenVINOQwen3TTS:
                 "fused_cache_step",
             )
             self.timings.add("fused_step", time.time() - step_started)
+            self.last_codegen_info.update(
+                {
+                    "selected_bucket": int(cache_len),
+                    "selected_codegen_graph": self.fused_cache_bucket_graphs.get(cache_len),
+                    "codegen_graph_kind": "single_fused",
+                }
+            )
 
             first_code_int = int(first_code.reshape(-1)[0])
             if first_code_int == int(self.ids["codec_eos_token_id"]):
@@ -1498,7 +2517,7 @@ class OpenVINOQwen3TTS:
                 print(f"generated {generated_count}/{max_new_tokens} codec tokens in {elapsed:.1f}s", flush=True)
             yield codes[0]
 
-            if step + 1 >= max_new_tokens:
+            if generated_count >= max_new_tokens:
                 break
 
             next_inputs_embeds = frame_embed.astype(np.float32, copy=False)
@@ -1912,6 +2931,18 @@ class OpenVINOQwen3TTS:
 
     @classmethod
     def from_ir(cls, ir_dir: str | Path, **kwargs):
+        realtime_profile = kwargs.pop("realtime_profile", None)
+        if realtime_profile in {None, "fastest"} and "mode" not in kwargs:
+            kwargs.update(
+                {
+                    "mode": "fastest",
+                    "codegen_unroll": "4",
+                    "codegen_decode_unroll": "auto",
+                    "preferred_cache_bucket": "96",
+                }
+            )
+        elif realtime_profile not in {None, "fastest"}:
+            raise ValueError("Python API supports realtime_profile='fastest'; use low-level mode kwargs for dev experiments")
         return cls(str(ir_dir), **kwargs)
 
     @staticmethod
@@ -2383,6 +3414,7 @@ class OpenVINOQwen3TTS:
                 timings={
                     **self.timings.snapshot(max(emitted_frames - prefix_frames, 0)),
                     **decode_info,
+                    **dict(getattr(self, "last_codegen_info", {}) or {}),
                     "codegen_ms": codegen_ms,
                     "decode_ms": decode_ms,
                     "chunk_compute_ms": compute_ms,
@@ -2397,6 +3429,8 @@ class OpenVINOQwen3TTS:
                     "queue_wait_ms": 0.0,
                     "producer_lag_ms": producer_lag_ms,
                     "strategy": strategy,
+                    "codegen_unroll": int(getattr(self, "codegen_unroll", 1)),
+                    "unroll_fallback": bool(getattr(self, "codegen_unroll_fallback", False)),
                     "initial_chunk_frames": int(initial_chunk_frames),
                     "configured_chunk_frames": int(chunk_frames),
                     "chunk_frames": int(codes.shape[0]),
@@ -2535,6 +3569,7 @@ class OpenVINOQwen3TTS:
                         timings={
                             **self.timings.snapshot(emitted_relative),
                             **decode_info,
+                            **dict(getattr(self, "last_codegen_info", {}) or {}),
                             "codegen_ms": codegen_ms,
                             "decode_ms": decode_ms,
                             "chunk_compute_ms": effective_compute_ms,
@@ -2549,6 +3584,8 @@ class OpenVINOQwen3TTS:
                             "queue_wait_ms": queue_wait_ms,
                             "producer_lag_ms": producer_lag_ms,
                             "strategy": strategy,
+                            "codegen_unroll": int(getattr(self, "codegen_unroll", 1)),
+                            "unroll_fallback": bool(getattr(self, "codegen_unroll_fallback", False)),
                             "initial_chunk_frames": int(initial_chunk_frames),
                             "configured_chunk_frames": int(chunk_frames),
                             "pipeline_decode": True,
@@ -2628,6 +3665,23 @@ class OpenVINOQwen3TTS:
         top_p: float = 1.0,
         temperature: float = 0.9,
     ):
+        native_chunks = self._try_stream_native_audio_pipeline(
+            text=self._ensure_scalar(text, "text"),
+            instruct=self._ensure_scalar(instruct, "instruct") or "",
+            language=self._ensure_scalar(language if language is not None else "Auto", "language"),
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            repetition_penalty=repetition_penalty,
+            max_prompt_tokens=max_prompt_tokens,
+            chunk_frames=chunk_frames,
+            left_context_frames=left_context_frames,
+            initial_chunk_frames=initial_chunk_frames,
+            chunk_strategy=chunk_strategy,
+            do_sample=do_sample,
+        )
+        if native_chunks is not None:
+            yield from native_chunks
+            return
         codes = self.generate_codes_iter(
             text=self._ensure_scalar(text, "text"),
             instruct=self._ensure_scalar(instruct, "instruct") or "",
@@ -2670,6 +3724,24 @@ class OpenVINOQwen3TTS:
         top_p: float = 1.0,
         temperature: float = 0.9,
     ):
+        native_chunks = self._try_stream_native_audio_pipeline(
+            text=self._ensure_scalar(text, "text"),
+            instruct=self._ensure_scalar(instruct if instruct is not None else "", "instruct") or "",
+            language=self._ensure_scalar(language if language is not None else "Auto", "language"),
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            repetition_penalty=repetition_penalty,
+            max_prompt_tokens=max_prompt_tokens,
+            chunk_frames=chunk_frames,
+            left_context_frames=left_context_frames,
+            initial_chunk_frames=initial_chunk_frames,
+            chunk_strategy=chunk_strategy,
+            speaker=self._ensure_scalar(speaker, "speaker"),
+            do_sample=do_sample,
+        )
+        if native_chunks is not None:
+            yield from native_chunks
+            return
         codes = self.generate_codes_iter(
             text=self._ensure_scalar(text, "text"),
             instruct=self._ensure_scalar(instruct if instruct is not None else "", "instruct") or "",
@@ -2724,6 +3796,27 @@ class OpenVINOQwen3TTS:
         else:
             prompt = self._normalize_voice_clone_prompt(voice_clone_prompt, 1)[0]
         item_ref_text = prompt.ref_text if prompt.ref_text is not None else ref_text
+        prefix = np.asarray(prompt.ref_code, dtype=np.int64) if prompt.ref_code is not None else None
+        native_chunks = self._try_stream_native_audio_pipeline(
+            text=text,
+            instruct="",
+            language=language,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            repetition_penalty=repetition_penalty,
+            max_prompt_tokens=max_prompt_tokens,
+            chunk_frames=chunk_frames,
+            left_context_frames=left_context_frames,
+            initial_chunk_frames=initial_chunk_frames,
+            chunk_strategy=chunk_strategy,
+            voice_clone_prompt=prompt,
+            ref_text=item_ref_text,
+            prefix_codes=prefix,
+            do_sample=do_sample,
+        )
+        if native_chunks is not None:
+            yield from native_chunks
+            return
         codes = self.generate_codes_iter(
             text=text,
             instruct="",
@@ -2740,7 +3833,6 @@ class OpenVINOQwen3TTS:
             top_p=top_p,
             temperature=temperature,
         )
-        prefix = np.asarray(prompt.ref_code, dtype=np.int64) if prompt.ref_code is not None else None
         yield from self.stream_decode_codes(
             codes,
             prefix_codes=prefix,
@@ -2760,8 +3852,10 @@ class OpenVINOQwen3TTS:
         chunk_strategy: str | None = None,
         left_context_frames: int | None = None,
         max_new_tokens: int | None = None,
+        repetition_penalty: float = 1.05,
         preload_buckets: str = "warmup",
         run_generation: bool = True,
+        compile_fallback_decoder: bool = False,
     ) -> dict:
         started = time.time()
         stream_config = self._resolve_stream_chunk_config(
@@ -2780,12 +3874,23 @@ class OpenVINOQwen3TTS:
             "status": "running",
             "mode": self.mode,
             "cache_step": self.cache_step,
+            "codegen_unroll": int(self.codegen_unroll),
+            "codegen_schedule": self.codegen_schedule,
+            "scheduled_unrolls": list(self.codegen_schedule_unrolls),
+            "codegen_decode_unroll": self.codegen_decode_unroll,
+            "preferred_cache_bucket": self.preferred_cache_bucket,
+            "unroll_available": any(self.codegen_unroll_available(item) for item in self.codegen_schedule_unrolls),
+            "unroll_fallback": bool(self.codegen_unroll_fallback),
             "chunk_strategy": strategy,
             "initial_chunk_frames": initial_chunk_frames,
             "chunk_frames": chunk_frames,
             "left_context_frames": left_context_frames,
             "preload_buckets": preload_buckets,
+            "repetition_penalty": float(repetition_penalty),
+            "compile_fallback_decoder": bool(compile_fallback_decoder),
             "compiled_buckets": [],
+            "compiled_unroll_buckets": [],
+            "compiled_decode_unroll_buckets": [],
             "bucket_errors": {},
             "compiled_stream_decoders": [],
             "stream_decoder_errors": {},
@@ -2824,20 +3929,49 @@ class OpenVINOQwen3TTS:
         )
 
         if self.mode == "cache":
-            available_buckets = self.fused_cache_bucket_graphs if self.cache_step == "fused" else self.cache_bucket_graphs
+            scheduled_unrolls = [item for item in self.codegen_schedule_unrolls if item > 1 and self.codegen_unroll_available(item)]
+            if self.cache_step == "fused" and scheduled_unrolls:
+                available_buckets = {}
+                for unroll_steps in scheduled_unrolls:
+                    available_buckets.update(self.fused_cache_unroll_bucket_graphs_by_step.get(unroll_steps, {}))
+                available_buckets = dict(sorted(available_buckets.items()))
+            elif self.cache_step == "fused":
+                available_buckets = self.fused_cache_bucket_graphs
+            else:
+                available_buckets = self.cache_bucket_graphs
             bucket_mode = str(preload_buckets or "warmup").strip().lower()
             if bucket_mode == "all":
                 buckets = list(available_buckets)
             elif bucket_mode in {"", "none", "off", "false", "0"}:
                 buckets = []
             elif bucket_mode in {"warmup", "auto", "required", "first"}:
-                buckets = [min(available_buckets)] if available_buckets else []
+                preferred = self.preferred_cache_bucket or min(available_buckets, default=0)
+                buckets = [next((item for item in sorted(available_buckets) if item >= preferred), max(available_buckets))] if available_buckets else []
             else:
                 requested = [int(item.strip()) for item in bucket_mode.split(",") if item.strip()]
                 buckets = [bucket for bucket in requested if bucket in available_buckets]
             for bucket in buckets:
                 try:
-                    if self.cache_step == "fused":
+                    if self.cache_step == "fused" and scheduled_unrolls:
+                        for unroll_steps in scheduled_unrolls:
+                            if bucket not in self.fused_cache_unroll_bucket_graphs_by_step.get(unroll_steps, {}):
+                                continue
+                            self.get_fused_cache_unroll_step(bucket, unroll_steps, preferred_min_bucket=None)
+                            status["compiled_unroll_buckets"].append(
+                                {"unroll": int(unroll_steps), "bucket": int(bucket)}
+                            )
+                            if self.codegen_decode_unroll in {"auto", "on"} and self.codegen_schedule == "current":
+                                decode_graphs = self.fused_cache_decode_unroll_bucket_graphs_by_step.get(unroll_steps, {})
+                                decode_stateful_graphs = self.fused_cache_decode_unroll_stateful_mask_bucket_graphs_by_step.get(
+                                    unroll_steps,
+                                    {},
+                                )
+                                if bucket in decode_graphs or bucket in decode_stateful_graphs:
+                                    self.get_fused_cache_decode_unroll_step(bucket, unroll_steps, preferred_min_bucket=None)
+                                    status["compiled_decode_unroll_buckets"].append(
+                                        {"unroll": int(unroll_steps), "bucket": int(bucket)}
+                                    )
+                    elif self.cache_step == "fused":
                         self.get_fused_cache_step(bucket)
                     else:
                         self.get_talker_stateful(bucket)
@@ -2846,7 +3980,7 @@ class OpenVINOQwen3TTS:
                     status["bucket_errors"][str(bucket)] = str(exc)
                     break
 
-        if self.decoder_graphs:
+        if compile_fallback_decoder and self.decoder_graphs:
             try:
                 self.decode(np.zeros((1, self.num_code_groups), dtype=np.int64))
                 status["fallback_decoder_compiled"] = True
@@ -2866,6 +4000,7 @@ class OpenVINOQwen3TTS:
                         left_context_frames=left_context_frames,
                         max_new_tokens=max_new_tokens,
                         min_new_tokens=1,
+                        repetition_penalty=repetition_penalty,
                         progress_interval=0,
                     )
                 )
@@ -2973,10 +4108,14 @@ def main() -> None:
     parser.add_argument("--ir-dir", default="openvino/voice_design")
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
-    parser.add_argument("--mode", default="no-cache", choices=["no-cache", "cache", "fast-cache", "fused-no-cache"])
+    parser.add_argument("--mode", default="no-cache", choices=RUNTIME_MODE_CHOICES)
     parser.add_argument("--cache-kernel", default="exact", choices=["exact", "sdpa"])
     parser.add_argument("--cache-step", default="split", choices=["split", "fused"])
     parser.add_argument("--graph-variant", default="fp16")
+    parser.add_argument("--codegen-unroll", default="profile", choices=CODEGEN_UNROLL_CHOICES)
+    parser.add_argument("--codegen-schedule", default="current", choices=CODEGEN_SCHEDULE_CHOICES)
+    parser.add_argument("--codegen-decode-unroll", default="off", choices=["off", "auto", "on"])
+    parser.add_argument("--preferred-cache-bucket", default="112")
     parser.add_argument("--precision-hint", default="f16", choices=["f16", "f32"])
     parser.add_argument("--ov-cache-dir", default=None)
     parser.add_argument("--ov-cache-mode", default="optimize_speed", choices=["optimize_speed", "optimize_size"])
@@ -3029,6 +4168,10 @@ def main() -> None:
         cache_kernel=args.cache_kernel,
         cache_step=args.cache_step,
         graph_variant=args.graph_variant,
+        codegen_unroll=args.codegen_unroll,
+        codegen_schedule=args.codegen_schedule,
+        codegen_decode_unroll=args.codegen_decode_unroll,
+        preferred_cache_bucket=args.preferred_cache_bucket,
         precision_hint=args.precision_hint,
         compile_config=compile_config,
         ov_cache_dir=args.ov_cache_dir,

@@ -4,7 +4,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from qwen3_tts_ov.server import include_chunk_metadata, openai_speech_to_tts_request, stream_metadata
+from qwen3_tts_ov.server import (
+    include_chunk_metadata,
+    openai_speech_to_tts_request,
+    playback_buffer_for_stream,
+    stream_metadata,
+)
 
 
 def test_openai_speech_maps_custom_voice_request():
@@ -38,6 +43,24 @@ def test_stream_metadata_uses_strategy_defaults():
     assert metadata["initial_chunk_frames"] == 8
     assert metadata["chunk_frames"] == 12
     assert metadata["left_context_frames"] == 25
+
+
+def test_smooth_stream_metadata_and_playback_buffer_floor():
+    metadata = stream_metadata({"stream": {"chunk_strategy": "smooth"}})
+
+    assert metadata["chunk_strategy"] == "smooth"
+    assert metadata["initial_chunk_frames"] == 8
+    assert metadata["chunk_frames"] == 24
+    assert playback_buffer_for_stream(metadata, 250) == 1900
+
+
+def test_realtime_stream_metadata_uses_low_latency_chunks_with_larger_buffer():
+    metadata = stream_metadata({"stream": {"chunk_strategy": "realtime"}})
+
+    assert metadata["chunk_strategy"] == "realtime"
+    assert metadata["initial_chunk_frames"] == 8
+    assert metadata["chunk_frames"] == 12
+    assert playback_buffer_for_stream(metadata, 250) == 1900
 
 
 def test_include_chunk_metadata_accepts_stream_flag():
@@ -85,6 +108,35 @@ def test_server_default_model_root_falls_back_to_openvino_full(monkeypatch, tmp_
     assert seen["ir_dir"] == "openvino_full"
 
 
+def test_server_auto_model_root_resolves_voice_design_legacy_dir(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from qwen3_tts_ov import server
+
+    monkeypatch.chdir(tmp_path)
+    legacy = tmp_path / "openvino_full"
+    legacy.mkdir()
+    with open(legacy / "manifest.json", "w", encoding="utf-8") as handle:
+        json.dump({"tts_model_type": "voice_design"}, handle)
+
+    seen = {}
+
+    class FakeRuntime:
+        def __init__(self, ir_dir, *args, **kwargs):
+            seen["ir_dir"] = str(ir_dir)
+
+        def generate_voice_design(self, **kwargs):
+            return [np.zeros(16, dtype=np.float32)], 24000
+
+    monkeypatch.setattr(server, "OpenVINOQwen3TTS", FakeRuntime)
+    app = server.create_app(model_root="auto", warmup=False)
+    client = fastapi_testclient.TestClient(app)
+
+    response = client.post("/v1/tts", json={"mode": "voice_design", "text": "hello"})
+
+    assert response.status_code == 200
+    assert seen["ir_dir"] == "openvino_full"
+
+
 def test_websocket_can_send_optional_chunk_metadata(monkeypatch, tmp_path):
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
     from qwen3_tts_ov import server
@@ -120,9 +172,234 @@ def test_websocket_can_send_optional_chunk_metadata(monkeypatch, tmp_path):
                 "stream": {"format": "pcm_s16le", "include_chunk_metadata": True},
             }
         )
-        assert websocket.receive_json()["type"] == "metadata"
+        metadata = websocket.receive_json()
+        assert metadata["type"] == "metadata"
+        assert metadata["realtime_profile"] == "fastest"
+        assert metadata["graph_variant"] == "int8_sym_fused_cachedsub"
         audio_meta = websocket.receive_json()
         assert audio_meta["type"] == "audio"
         assert audio_meta["timings"]["stream_rtf"] == 0.8
         assert len(websocket.receive_bytes()) == 32
         assert websocket.receive_json()["type"] == "final"
+
+
+def test_server_realtime_profile_int8_reaches_runtime_and_health(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from qwen3_tts_ov import server
+
+    ir_dir = tmp_path / "openvino" / "voice_design"
+    ir_dir.mkdir(parents=True)
+    with open(ir_dir / "manifest.json", "w", encoding="utf-8") as handle:
+        json.dump({"tts_model_type": "voice_design"}, handle)
+
+    seen = {}
+
+    class FakeRuntime:
+        def __init__(self, ir_dir, *args, **kwargs):
+            seen["kwargs"] = kwargs
+            self.mode = kwargs["mode"]
+            self.requested_mode = kwargs["mode"]
+            self.cache_kernel = kwargs["cache_kernel"]
+            self.cache_step = kwargs["cache_step"]
+            self.graph_variant = kwargs["graph_variant"]
+            self.codegen_unroll = kwargs["codegen_unroll"]
+            self.codegen_schedule = kwargs.get("codegen_schedule", "current")
+            self.codegen_unroll_fallback = False
+            self.variant_graphs = {
+                "fused_cache_step_buckets": {
+                    "exact": {"128": "fused_cache_step_exact_cache128_int8_fused.xml"}
+                }
+            }
+            self.cache_dir = None
+            self.ov_cache_mode = "OPTIMIZE_SPEED"
+            self.disable_ov_cache = False
+            self.streaming_decoder_graphs_by_context = {}
+            self.streaming_decoders = {}
+            self.fused_cache_step_by_bucket = {}
+            self.fused_cache_bucket_graphs = {128: "fused_cache_step_exact_cache128_int8_fused.xml"}
+            self.fused_cache_unroll_bucket_graphs = {}
+            self.talker_stateful_by_bucket = {}
+
+        def generate_voice_design(self, **kwargs):
+            return [np.zeros(16, dtype=np.float32)], 24000
+
+    monkeypatch.setattr(server, "OpenVINOQwen3TTS", FakeRuntime)
+    app = server.create_app(model_root=tmp_path / "openvino", warmup=False, realtime_profile="int8")
+    client = fastapi_testclient.TestClient(app)
+
+    assert client.post("/v1/tts", json={"mode": "voice_design", "text": "hello"}).status_code == 200
+    health = client.get("/health").json()
+    runtime_status = next(iter(health["runtimes"].values()))
+
+    assert seen["kwargs"]["mode"] == "cache"
+    assert seen["kwargs"]["cache_kernel"] == "exact"
+    assert seen["kwargs"]["cache_step"] == "fused"
+    assert seen["kwargs"]["graph_variant"] == "int8_fused"
+    assert seen["kwargs"]["codegen_unroll"] == 1
+    assert health["warmup"]["realtime_profile"] == "int8"
+    assert runtime_status["graph_variant"] == "int8_fused"
+    assert runtime_status["codegen_unroll"] == 1
+    assert runtime_status["preferred_cache_bucket"] == 112
+    assert runtime_status["fused_cache_variant_active"] is True
+
+
+def test_server_realtime_profile_int8_sym_sets_unroll4(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from qwen3_tts_ov import server
+
+    ir_dir = tmp_path / "openvino" / "voice_design"
+    ir_dir.mkdir(parents=True)
+    with open(ir_dir / "manifest.json", "w", encoding="utf-8") as handle:
+        json.dump({"tts_model_type": "voice_design"}, handle)
+
+    seen = {}
+
+    class FakeRuntime:
+        def __init__(self, ir_dir, *args, **kwargs):
+            seen["kwargs"] = kwargs
+            self.mode = kwargs["mode"]
+            self.requested_mode = kwargs["mode"]
+            self.cache_kernel = kwargs["cache_kernel"]
+            self.cache_step = kwargs["cache_step"]
+            self.graph_variant = kwargs["graph_variant"]
+            self.codegen_unroll = kwargs["codegen_unroll"]
+            self.codegen_unroll_fallback = False
+            self.variant_graphs = {
+                "fused_cache_step_buckets": {
+                    "exact": {"128": "fused_cache_step_exact_cache128_int8_sym_fused.xml"}
+                },
+                "fused_cache_step_unroll_buckets": {
+                    "exact": {"4": {"128": "fused_cache_step_unroll4_exact_cache128_int8_sym_fused.xml"}}
+                },
+            }
+            self.cache_dir = None
+            self.ov_cache_mode = "OPTIMIZE_SPEED"
+            self.disable_ov_cache = False
+            self.streaming_decoder_graphs_by_context = {}
+            self.streaming_decoders = {}
+            self.fused_cache_step_by_bucket = {}
+            self.fused_cache_bucket_graphs = {128: "fused_cache_step_exact_cache128_int8_sym_fused.xml"}
+            self.fused_cache_unroll_bucket_graphs = {128: "fused_cache_step_unroll4_exact_cache128_int8_sym_fused.xml"}
+            self.talker_stateful_by_bucket = {}
+
+        def generate_voice_design(self, **kwargs):
+            return [np.zeros(16, dtype=np.float32)], 24000
+
+    monkeypatch.setattr(server, "OpenVINOQwen3TTS", FakeRuntime)
+    app = server.create_app(model_root=tmp_path / "openvino", warmup=False, realtime_profile="int8-sym")
+    client = fastapi_testclient.TestClient(app)
+
+    assert client.post("/v1/tts", json={"mode": "voice_design", "text": "hello"}).status_code == 200
+    health = client.get("/health").json()
+    runtime_status = next(iter(health["runtimes"].values()))
+
+    assert seen["kwargs"]["mode"] == "cache"
+    assert seen["kwargs"]["cache_kernel"] == "exact"
+    assert seen["kwargs"]["cache_step"] == "fused"
+    assert seen["kwargs"]["graph_variant"] == "int8_sym_fused"
+    assert seen["kwargs"]["codegen_unroll"] == 4
+    assert seen["kwargs"]["codegen_schedule"] == "current"
+    assert health["warmup"]["realtime_profile"] == "int8-sym"
+    assert runtime_status["graph_variant"] == "int8_sym_fused"
+    assert runtime_status["codegen_unroll"] == 4
+    assert runtime_status["codegen_schedule"] == "current"
+    assert runtime_status["preferred_cache_bucket"] == 112
+    assert runtime_status["unroll_available"] is True
+
+
+def test_server_realtime_profile_int8_sym_norepeat_defaults_penalty(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from qwen3_tts_ov import server
+
+    ir_dir = tmp_path / "openvino" / "voice_design"
+    ir_dir.mkdir(parents=True)
+    with open(ir_dir / "manifest.json", "w", encoding="utf-8") as handle:
+        json.dump({"tts_model_type": "voice_design"}, handle)
+
+    seen = {}
+
+    class FakeRuntime:
+        def __init__(self, ir_dir, *args, **kwargs):
+            seen["kwargs"] = kwargs
+            self.mode = kwargs["mode"]
+            self.requested_mode = kwargs["mode"]
+            self.cache_kernel = kwargs["cache_kernel"]
+            self.cache_step = kwargs["cache_step"]
+            self.graph_variant = kwargs["graph_variant"]
+            self.codegen_unroll = kwargs["codegen_unroll"]
+            self.codegen_schedule = kwargs.get("codegen_schedule", "current")
+            self.codegen_decode_unroll = kwargs.get("codegen_decode_unroll", "off")
+            self.codegen_unroll_fallback = False
+            self.variant_graphs = {
+                "fused_cache_step_buckets": {
+                    "exact": {"96": "fused_cache_step_exact_cache96_int8_sym_fused.xml"}
+                },
+                "fused_cache_step_unroll_norepeat_buckets": {
+                    "exact": {"4": {"96": "fused_cache_step_unroll4_exact_norepeat_cache96_int8_sym_fused.xml"}}
+                },
+            }
+            self.cache_dir = None
+            self.ov_cache_mode = "OPTIMIZE_SPEED"
+            self.disable_ov_cache = False
+            self.streaming_decoder_graphs_by_context = {}
+            self.streaming_decoders = {}
+            self.fused_cache_step_by_bucket = {}
+            self.fused_cache_bucket_graphs = {96: "fused_cache_step_exact_cache96_int8_sym_fused.xml"}
+            self.fused_cache_unroll_bucket_graphs = {
+                96: "fused_cache_step_unroll4_exact_norepeat_cache96_int8_sym_fused.xml"
+            }
+            self.talker_stateful_by_bucket = {}
+
+        def generate_voice_design(self, **kwargs):
+            seen["generate_kwargs"] = kwargs
+            return [np.zeros(16, dtype=np.float32)], 24000
+
+    monkeypatch.setattr(server, "OpenVINOQwen3TTS", FakeRuntime)
+    app = server.create_app(model_root=tmp_path / "openvino", warmup=False, realtime_profile="int8-sym-norepeat")
+    client = fastapi_testclient.TestClient(app)
+
+    assert client.post("/v1/tts", json={"mode": "voice_design", "text": "hello"}).status_code == 200
+    health = client.get("/health").json()
+    runtime_status = next(iter(health["runtimes"].values()))
+
+    assert seen["kwargs"]["mode"] == "cache"
+    assert seen["kwargs"]["graph_variant"] == "int8_sym_fused"
+    assert seen["kwargs"]["codegen_unroll"] == 4
+    assert seen["generate_kwargs"]["repetition_penalty"] == 1.0
+    assert health["warmup"]["realtime_profile"] == "int8-sym-norepeat"
+    assert health["warmup"]["default_repetition_penalty"] == 1.0
+    assert runtime_status["graph_variant"] == "int8_sym_fused"
+    assert runtime_status["unroll_available"] is True
+
+
+def test_server_auto_realtime_profile_selects_best_stable_benchmark(tmp_path):
+    from qwen3_tts_ov import server
+
+    report = {
+        "summaries": [
+            {
+                "profile": "native_int8_sym_fused_cachedsub_norepeat_bucket96",
+                "accepted": True,
+                "p90_stream_rtf": 0.97,
+            },
+            {
+                "profile": "int8_sym_ll_v2",
+                "accepted": False,
+                "p90_stream_rtf": 0.90,
+            },
+        ],
+        "runs": [
+            {"profile": "int8_sym_unroll4", "status": "ok", "worker_exit_code": 0, "stream_compute_rtf": 1.08},
+            {"profile": "int8_sym_ll_v2", "status": "ok", "worker_exit_code": 0, "stream_compute_rtf": 0.92},
+            {"profile": "int8_sym_balanced_v2", "status": "ok", "worker_exit_code": 139, "stream_compute_rtf": 0.80},
+        ]
+    }
+    path = tmp_path / "bench.json"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(report, handle)
+
+    selected = server.select_auto_realtime_profile(path)
+
+    assert selected["profile"] == "native_int8_sym_fused_cachedsub_norepeat_bucket96"
+    assert selected["codegen_decode_unroll"] == "auto"
+    assert selected["summary_metric"] == "p90_stream_rtf"
