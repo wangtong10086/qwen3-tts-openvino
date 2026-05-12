@@ -393,7 +393,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
             <div class="metric"><span>播放队列</span><strong id="queueDepth">0ms</strong></div>
             <div class="metric"><span>Underrun</span><strong id="underrunCount">0</strong></div>
             <div class="metric"><span>RTF</span><strong id="rtfValue">-</strong></div>
-            <div class="metric"><span>策略</span><strong id="strategyValue">realtime</strong></div>
+            <div class="metric"><span>策略</span><strong id="strategyValue">smooth</strong></div>
             <div class="metric"><span>Profile</span><strong id="profileValue">fp16</strong></div>
             <div class="metric"><span>Unroll</span><strong id="unrollValue">1</strong></div>
             <div class="metric"><span>Schedule</span><strong id="scheduleValue">current</strong></div>
@@ -480,6 +480,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
     let latestRtf = 0;
     let pendingAudioTiming = null;
     let timer = null;
+    let forcedChunkStrategy = null;
     const strategyDefaults = {
       realtime: { initialChunkFrames: 8, chunkFrames: 12, leftContextFrames: 25 },
       low_latency: { initialChunkFrames: 8, chunkFrames: 12, leftContextFrames: 25 },
@@ -534,6 +535,18 @@ WEB_CLIENT_HTML = r"""<!doctype html>
             `unroll_fallback=${runtime.unroll_fallback ? "yes" : "no"}, fused_int8=${runtime.fused_cache_variant_active ? "yes" : "no"}`
           );
         }
+        const warmup = data.warmup || {};
+        const serverForcedStrategy = warmup.forced_stream_strategy || null;
+        if (serverForcedStrategy && strategyDefaults[serverForcedStrategy]) {
+          forcedChunkStrategy = serverForcedStrategy;
+          els.chunkStrategy.value = forcedChunkStrategy;
+          els.chunkStrategy.disabled = true;
+          updateChunkStrategyFields();
+          log(`server locked chunk_strategy=${forcedChunkStrategy}; 页面将忽略旧的浏览器表单状态`);
+        } else {
+          forcedChunkStrategy = null;
+          els.chunkStrategy.disabled = false;
+        }
       } catch (err) {
         setHealth(false, "服务未连接");
       }
@@ -556,7 +569,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
 
     function requestPayload() {
       const mode = els.mode.value;
-      const strategy = els.chunkStrategy.value;
+      const strategy = forcedChunkStrategy || els.chunkStrategy.value;
       const defaults = strategyDefaults[strategy] || strategyDefaults.low_latency;
       const payload = {
         mode,
@@ -980,6 +993,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
     }
 
     els.wsUrl.value = defaultWsUrl();
+    els.chunkStrategy.value = "smooth";
     els.mode.addEventListener("change", updateModeFields);
     els.chunkStrategy.addEventListener("change", updateChunkStrategyFields);
     els.startBtn.addEventListener("click", start);

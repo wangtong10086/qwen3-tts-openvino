@@ -156,11 +156,24 @@ def normalize_chunk_strategy(strategy: str | None, default: str = "low_latency")
     return normalized
 
 
-def stream_kwargs(request: dict, default_strategy: str = "low_latency") -> dict:
+def stream_kwargs(
+    request: dict,
+    default_strategy: str = "low_latency",
+    forced_strategy: str | None = None,
+) -> dict:
     stream = request.get("stream") if isinstance(request.get("stream"), dict) else {}
     fmt = stream.get("format", "pcm_s16le")
     if fmt != "pcm_s16le":
         raise ValueError("only stream.format=pcm_s16le is supported")
+    if forced_strategy:
+        strategy = normalize_chunk_strategy(forced_strategy, default_strategy)
+        defaults = DEFAULT_STREAM_CHUNK_STRATEGIES[strategy]
+        return {
+            "chunk_strategy": strategy,
+            "initial_chunk_frames": int(defaults["initial_chunk_frames"]),
+            "chunk_frames": int(defaults["chunk_frames"]),
+            "left_context_frames": int(defaults["left_context_frames"]),
+        }
     kwargs = {
         "chunk_strategy": stream.get("chunk_strategy", request.get("chunk_strategy", default_strategy)),
     }
@@ -177,10 +190,25 @@ def include_chunk_metadata(request: dict) -> bool:
     return bool(stream.get("include_chunk_metadata", request.get("include_chunk_metadata", False)))
 
 
-def stream_metadata(request: dict, default_strategy: str = "low_latency") -> dict:
+def stream_metadata(
+    request: dict,
+    default_strategy: str = "low_latency",
+    forced_strategy: str | None = None,
+) -> dict:
     stream = request.get("stream") if isinstance(request.get("stream"), dict) else {}
-    strategy = normalize_chunk_strategy(stream.get("chunk_strategy", request.get("chunk_strategy")), default_strategy)
+    strategy = normalize_chunk_strategy(
+        forced_strategy if forced_strategy else stream.get("chunk_strategy", request.get("chunk_strategy")),
+        default_strategy,
+    )
     defaults = DEFAULT_STREAM_CHUNK_STRATEGIES[strategy]
+    if forced_strategy:
+        return {
+            "chunk_strategy": strategy,
+            "initial_chunk_frames": int(defaults["initial_chunk_frames"]),
+            "chunk_frames": int(defaults["chunk_frames"]),
+            "left_context_frames": int(defaults["left_context_frames"]),
+            "forced_chunk_strategy": True,
+        }
     return {
         "chunk_strategy": strategy,
         "initial_chunk_frames": int(stream.get("initial_chunk_frames", request.get("initial_chunk_frames", defaults["initial_chunk_frames"]))),
@@ -358,6 +386,7 @@ def create_app(
         else variant_profile_names.get(graph_variant, realtime_profile)
     )
     default_stream_strategy = FASTEST_CHUNK_STRATEGY if reported_realtime_profile == FASTEST_PROFILE_NAME else "low_latency"
+    forced_stream_strategy = FASTEST_CHUNK_STRATEGY if reported_realtime_profile == FASTEST_PROFILE_NAME else None
     runtimes = {}
     app.state.warmup = {
         "enabled": bool(warmup),
@@ -382,6 +411,8 @@ def create_app(
         "native_prompt_device": os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE") or "CPU",
         "native_ov_profile": os.environ.get("QWEN3_TTS_OV_NATIVE_PERF_COUNT") or "off",
         "warmup_strategy": warmup_strategy,
+        "default_stream_strategy": default_stream_strategy,
+        "forced_stream_strategy": forced_stream_strategy,
         "ov_cache_dir": None if disable_ov_cache else str(ov_cache_dir or "auto"),
         "ov_cache_mode": ov_cache_mode,
         "loaded_modes": [],
@@ -530,7 +561,7 @@ def create_app(
     def stream_chunks(request: dict):
         gen_kwargs = generation_kwargs(request, default_repetition_penalty=default_repetition_penalty)
         mode_name, runtime = get_runtime(request.get("mode"), do_sample=bool(gen_kwargs["do_sample"]))
-        kwargs = {**gen_kwargs, **stream_kwargs(request, default_stream_strategy)}
+        kwargs = {**gen_kwargs, **stream_kwargs(request, default_stream_strategy, forced_strategy=forced_stream_strategy)}
         text = request.get("text")
         language = request.get("language", "Auto")
         if not text:
@@ -664,7 +695,7 @@ def create_app(
         def iter_lines():
             started = time.time()
             try:
-                metadata = stream_metadata(request, default_stream_strategy)
+                metadata = stream_metadata(request, default_stream_strategy, forced_strategy=forced_stream_strategy)
                 playback_buffer_ms = playback_buffer_for_stream(metadata, recommended_playback_buffer_ms)
                 yield json.dumps(
                     {
@@ -770,7 +801,7 @@ def create_app(
         try:
             request = await websocket.receive_json()
             started = time.time()
-            metadata = stream_metadata(request, default_stream_strategy)
+            metadata = stream_metadata(request, default_stream_strategy, forced_strategy=forced_stream_strategy)
             playback_buffer_ms = playback_buffer_for_stream(metadata, recommended_playback_buffer_ms)
             await websocket.send_json(
                 {

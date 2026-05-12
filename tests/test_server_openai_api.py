@@ -63,6 +63,27 @@ def test_realtime_stream_metadata_uses_low_latency_chunks_with_larger_buffer():
     assert playback_buffer_for_stream(metadata, 250) == 1900
 
 
+def test_forced_stream_metadata_ignores_requested_realtime_strategy():
+    metadata = stream_metadata(
+        {
+            "stream": {
+                "chunk_strategy": "realtime",
+                "initial_chunk_frames": 8,
+                "chunk_frames": 12,
+                "left_context_frames": 25,
+            }
+        },
+        default_strategy="smooth",
+        forced_strategy="smooth",
+    )
+
+    assert metadata["chunk_strategy"] == "smooth"
+    assert metadata["initial_chunk_frames"] == 8
+    assert metadata["chunk_frames"] == 24
+    assert metadata["left_context_frames"] == 25
+    assert metadata["forced_chunk_strategy"] is True
+
+
 def test_include_chunk_metadata_accepts_stream_flag():
     assert include_chunk_metadata({"stream": {"include_chunk_metadata": True}}) is True
     assert include_chunk_metadata({"include_chunk_metadata": True}) is True
