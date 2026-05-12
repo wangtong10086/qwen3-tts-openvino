@@ -8,6 +8,7 @@ from qwen3_tts_ov.server import (
     include_chunk_metadata,
     openai_speech_to_tts_request,
     playback_buffer_for_stream,
+    split_text_for_fastest_stream,
     stream_metadata,
 )
 
@@ -82,6 +83,15 @@ def test_forced_stream_metadata_ignores_requested_realtime_strategy():
     assert metadata["chunk_frames"] == 24
     assert metadata["left_context_frames"] == 25
     assert metadata["forced_chunk_strategy"] is True
+
+
+def test_fastest_text_splitter_breaks_long_text_into_short_segments():
+    text = "你好，这是第一段较长的测试文本，用来验证自动切分。这里还有第二段内容，确保不会因为最大生成帧数太小而截断。"
+    segments = split_text_for_fastest_stream(text, max_new_tokens=48)
+
+    assert len(segments) > 1
+    assert "".join(segments) == text
+    assert all(segment.strip() for segment in segments)
 
 
 def test_include_chunk_metadata_accepts_stream_flag():
@@ -202,6 +212,65 @@ def test_websocket_can_send_optional_chunk_metadata(monkeypatch, tmp_path):
         assert audio_meta["timings"]["stream_rtf"] == 0.8
         assert len(websocket.receive_bytes()) == 32
         assert websocket.receive_json()["type"] == "final"
+
+
+def test_fastest_websocket_segments_long_voice_design_text(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from qwen3_tts_ov import server
+
+    ir_dir = tmp_path / "openvino" / "voice_design"
+    ir_dir.mkdir(parents=True)
+    with open(ir_dir / "manifest.json", "w", encoding="utf-8") as handle:
+        json.dump({"tts_model_type": "voice_design"}, handle)
+
+    calls = []
+
+    class FakeRuntime:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def stream_voice_design(self, **kwargs):
+            calls.append(kwargs)
+            yield SimpleNamespace(
+                audio=np.ones(16, dtype=np.float32),
+                sample_rate=24000,
+                codes=np.zeros((1, 16), dtype=np.int64),
+                is_final=True,
+                timings={"stream_rtf": 0.8},
+                index=0,
+            )
+
+    monkeypatch.setattr(server, "OpenVINOQwen3TTS", FakeRuntime)
+    app = server.create_app(model_root=tmp_path / "openvino", warmup=False)
+    client = fastapi_testclient.TestClient(app)
+    text = "你好，这是第一段较长的测试文本，用来验证自动切分。这里还有第二段内容，确保不会因为最大生成帧数太小而截断。"
+
+    with client.websocket_connect("/v1/tts/stream") as websocket:
+        websocket.send_json(
+            {
+                "mode": "voice_design",
+                "text": text,
+                "stream": {"format": "pcm_s16le", "include_chunk_metadata": True},
+                "generation": {"max_new_tokens": 160},
+            }
+        )
+        metadata = websocket.receive_json()
+        assert metadata["forced_chunk_strategy"] is True
+
+        audio_messages = 0
+        while True:
+            message = websocket.receive_json()
+            if message["type"] == "final":
+                break
+            assert message["type"] == "audio"
+            assert message["timings"]["text_segmented"] is True
+            websocket.receive_bytes()
+            audio_messages += 1
+
+    assert audio_messages == len(calls)
+    assert len(calls) > 1
+    assert all(call["max_new_tokens"] == 48 for call in calls)
+    assert "".join(call["text"] for call in calls) == text
 
 
 def test_server_realtime_profile_int8_reaches_runtime_and_health(monkeypatch, tmp_path):

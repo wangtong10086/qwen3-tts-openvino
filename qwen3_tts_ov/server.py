@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -35,7 +36,7 @@ from .profiles import (
     is_fastest_or_norepeat_mode,
     normalize_codegen_schedule,
 )
-from .runtime import DEFAULT_STREAM_CHUNK_STRATEGIES, OpenVINOQwen3TTS
+from .runtime import DEFAULT_STREAM_CHUNK_STRATEGIES, OpenVINOQwen3TTS, StreamChunk
 from .web_client import WEB_CLIENT_HTML
 
 
@@ -48,6 +49,48 @@ MODE_DIR = {
     "voice-clone": "base",
     "base": "base",
 }
+FASTEST_SEGMENT_MAX_NEW_TOKENS = 48
+TEXT_TOKEN_RE = re.compile(r"\s+|[A-Za-z0-9]+|[\u3400-\u9fff]|[^\s]")
+SOFT_SPLIT_PUNCT = set("。！？!?；;，,、")
+
+
+def speech_text_units(token: str) -> int:
+    if not token or token.isspace():
+        return 0
+    if re.fullmatch(r"[A-Za-z0-9]+", token):
+        return 2
+    if re.fullmatch(r"[\u3400-\u9fff]", token):
+        return 1
+    return 0 if token in SOFT_SPLIT_PUNCT or token in set(".:：") else 1
+
+
+def split_text_for_fastest_stream(text: str, max_new_tokens: int = FASTEST_SEGMENT_MAX_NEW_TOKENS) -> list[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    token_budget = max(10, min(24, int(max_new_tokens) // 3))
+    hard_budget = max(token_budget + 4, int(token_budget * 1.4))
+    segments: list[str] = []
+    current: list[str] = []
+    units = 0
+
+    def flush():
+        nonlocal current, units
+        piece = "".join(current).strip()
+        if piece:
+            segments.append(piece)
+        current = []
+        units = 0
+
+    for token in TEXT_TOKEN_RE.findall(raw):
+        current.append(token)
+        units += speech_text_units(token)
+        if units >= token_budget and token in SOFT_SPLIT_PUNCT:
+            flush()
+        elif units >= hard_budget:
+            flush()
+    flush()
+    return segments or [raw]
 
 
 def audio_to_pcm16(audio) -> bytes:
@@ -568,6 +611,55 @@ def create_app(
             raise ValueError("text is required")
         if mode_name == "voice_design":
             instruct = request.get("instruct", "")
+            if forced_stream_strategy == FASTEST_CHUNK_STRATEGY:
+                segments = split_text_for_fastest_stream(text, FASTEST_SEGMENT_MAX_NEW_TOKENS)
+                if len(segments) > 1 or int(kwargs.get("max_new_tokens", 0)) > FASTEST_SEGMENT_MAX_NEW_TOKENS:
+                    segment_kwargs = dict(kwargs)
+                    segment_kwargs["max_new_tokens"] = min(
+                        int(segment_kwargs.get("max_new_tokens", FASTEST_SEGMENT_MAX_NEW_TOKENS)),
+                        FASTEST_SEGMENT_MAX_NEW_TOKENS,
+                    )
+
+                    def iter_segmented_voice_design():
+                        output_index = 0
+                        last_empty_final: StreamChunk | None = None
+                        for segment_index, segment in enumerate(segments):
+                            is_last_segment = segment_index == len(segments) - 1
+                            for chunk in runtime.stream_voice_design(
+                                text=segment,
+                                instruct=instruct,
+                                language=language,
+                                **segment_kwargs,
+                            ):
+                                timings = dict(chunk.timings or {})
+                                timings.update(
+                                    {
+                                        "text_segmented": True,
+                                        "text_segment_index": segment_index,
+                                        "text_segment_count": len(segments),
+                                        "segment_max_new_tokens": int(segment_kwargs["max_new_tokens"]),
+                                    }
+                                )
+                                is_final = bool(is_last_segment and chunk.is_final)
+                                if not chunk.audio.size and not is_final:
+                                    continue
+                                out = StreamChunk(
+                                    index=output_index,
+                                    audio=chunk.audio,
+                                    sample_rate=chunk.sample_rate,
+                                    codes=chunk.codes,
+                                    is_final=is_final,
+                                    timings=timings,
+                                )
+                                if out.audio.size:
+                                    output_index += 1
+                                    yield out
+                                elif is_final:
+                                    last_empty_final = out
+                        if last_empty_final is not None:
+                            yield last_empty_final
+
+                    return iter_segmented_voice_design()
             return runtime.stream_voice_design(text=text, instruct=instruct, language=language, **kwargs)
         if mode_name == "custom_voice":
             speaker = request.get("speaker")
