@@ -19,6 +19,7 @@ if(NOT OPENVINO_GENAI_LIB)
 endif()
 
 add_library(qwen3_tts_ov_genai SHARED qwen3_tts_codegen.cpp)
+set_target_properties(qwen3_tts_ov_genai PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 target_include_directories(
   qwen3_tts_ov_genai
   PRIVATE
