@@ -131,3 +131,20 @@ def test_package_release_dry_run_uses_server_entry_and_native_lib(tmp_path):
     assert payload["target"] == target
     assert payload["native_lib"] == str(native_lib)
     assert "qwen3_tts_ov_server_entry.py" in " ".join(payload["cmd"])
+
+
+def test_build_native_codegen_parses_dumpbin_exports():
+    build_native = load_script("scripts/build_native_codegen.py")
+    output = """
+          ordinal hint RVA      name
+
+                1    0 00001000 ?Tokenizer@genai@ov@@QEAA@XZ
+                2    1 00002000 plain_c_symbol
+                3    2 00003000 [NONAME]
+                4    3 00004000 ?Tokenizer@genai@ov@@QEAA@XZ
+    """
+
+    assert build_native.parse_dumpbin_exports(output) == [
+        "?Tokenizer@genai@ov@@QEAA@XZ",
+        "plain_c_symbol",
+    ]

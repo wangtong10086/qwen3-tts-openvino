@@ -7,6 +7,7 @@ import argparse
 import os
 import pathlib
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,87 @@ def find_first(root: pathlib.Path, names: tuple[str, ...]) -> pathlib.Path | Non
         if matches:
             return matches[0]
     return None
+
+
+def find_windows_tool(name: str) -> str:
+    found = shutil.which(name) or shutil.which(f"{name}.exe")
+    if found:
+        return found
+
+    vswhere = pathlib.Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if vswhere.exists():
+        result = subprocess.run(
+            [
+                str(vswhere),
+                "-latest",
+                "-products",
+                "*",
+                "-requires",
+                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                "-find",
+                rf"VC\Tools\MSVC\**\bin\Hostx64\x64\{name}.exe",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        candidates = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if candidates:
+            return candidates[0]
+
+    roots = [
+        pathlib.Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio",
+        pathlib.Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Microsoft Visual Studio",
+    ]
+    for root in roots:
+        if not root.exists():
+            continue
+        matches = sorted(root.rglob(f"{name}.exe"), reverse=True)
+        if matches:
+            return str(matches[0])
+    raise FileNotFoundError(f"{name}.exe not found; install Visual Studio C++ build tools")
+
+
+def parse_dumpbin_exports(text: str) -> list[str]:
+    symbols: list[str] = []
+    seen = set()
+    row = re.compile(r"^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)")
+    for line in text.splitlines():
+        match = row.match(line)
+        if not match:
+            continue
+        symbol = match.group(1)
+        if symbol == "[NONAME]" or symbol in seen:
+            continue
+        seen.add(symbol)
+        symbols.append(symbol)
+    return symbols
+
+
+def ensure_windows_import_library(dll_or_lib: pathlib.Path, output_dir: pathlib.Path, label: str) -> pathlib.Path:
+    if os.name != "nt" or dll_or_lib.suffix.lower() == ".lib":
+        return dll_or_lib
+    if dll_or_lib.suffix.lower() != ".dll":
+        return dll_or_lib
+
+    output = output_dir / f"{dll_or_lib.stem}.lib"
+    if output.exists():
+        return output
+    dumpbin = find_windows_tool("dumpbin")
+    lib_tool = find_windows_tool("lib")
+    result = subprocess.run([dumpbin, "/exports", str(dll_or_lib)], text=True, capture_output=True, check=True)
+    symbols = parse_dumpbin_exports(result.stdout)
+    if not symbols:
+        raise RuntimeError(f"no exports found in {label} DLL: {dll_or_lib}")
+    def_file = output_dir / f"{dll_or_lib.stem}.def"
+    def_file.write_text(
+        "LIBRARY " + dll_or_lib.name + "\nEXPORTS\n" + "\n".join(f"    {symbol}" for symbol in symbols) + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run([lib_tool, f"/def:{def_file}", f"/out:{output}", "/machine:x64"], check=True)
+    if not output.exists():
+        raise FileNotFoundError(f"failed to create import library for {label}: {output}")
+    return output
 
 
 def resolve_build_paths():
@@ -133,6 +215,8 @@ def run_cmake_build(args, paths: dict[str, pathlib.Path], output_dir: pathlib.Pa
     cmake = args.cmake or shutil.which("cmake")
     if not cmake:
         raise SystemExit("cmake not found; install CMake or use --backend direct on Linux")
+    openvino_lib = ensure_windows_import_library(paths["openvino_lib"], output_dir, "OpenVINO")
+    genai_lib = ensure_windows_import_library(paths["genai_lib"], output_dir, "OpenVINO GenAI")
     build_dir = output_dir / "cmake-build"
     cmd = [
         cmake,
@@ -143,9 +227,9 @@ def run_cmake_build(args, paths: dict[str, pathlib.Path], output_dir: pathlib.Pa
         f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={output_dir}",
         f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY={output_dir}",
         f"-DOPENVINO_INCLUDE_DIR={paths['openvino_include']}",
-        f"-DOPENVINO_LIB={paths['openvino_lib']}",
+        f"-DOPENVINO_LIB={openvino_lib}",
         f"-DOPENVINO_GENAI_INCLUDE_DIR={paths['genai_include']}",
-        f"-DOPENVINO_GENAI_LIB={paths['genai_lib']}",
+        f"-DOPENVINO_GENAI_LIB={genai_lib}",
         f"-DOPENVINO_TOKENIZERS_PATH={paths['tokenizers_ext']}",
         f"-DBUILD_NATIVE_CLI={'OFF' if args.no_cli else 'ON'}",
     ]
