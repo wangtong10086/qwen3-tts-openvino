@@ -1,4 +1,5 @@
 import json
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -526,3 +527,22 @@ def test_server_auto_realtime_profile_selects_best_stable_benchmark(tmp_path):
     assert selected["profile"] == "native_int8_sym_fused_cachedsub_norepeat_bucket96"
     assert selected["codegen_decode_unroll"] == "auto"
     assert selected["summary_metric"] == "p90_stream_rtf"
+
+
+def test_fastest_profile_uses_cpu_native_device_for_cpu_server(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from qwen3_tts_ov import server
+
+    monkeypatch.setenv("QWEN3_TTS_OV_NATIVE_GPU_LARGE_ALLOCATIONS", "1")
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        realtime_profile="fastest",
+        device="CPU",
+    )
+    client = fastapi_testclient.TestClient(app)
+
+    health = client.get("/health").json()
+
+    assert health["warmup"]["native_codegen_device"] == "CPU"
+    assert "QWEN3_TTS_OV_NATIVE_GPU_LARGE_ALLOCATIONS" not in os.environ

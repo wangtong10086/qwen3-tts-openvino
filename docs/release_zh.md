@@ -9,6 +9,17 @@ Release 面向最终调用方，只提供本地 sidecar 服务。调用方通过
 
 App 包包含可执行入口、Python runtime、OpenVINO runtime、OpenVINO GenAI/tokenizers 依赖和 native 加速库。IR 包单独包含 `openvino/voice_design/manifest.json` 及其引用的 `.xml/.bin`。
 
+也可以从公开 Hugging Face model repo 下载已验证的 realtime IR：
+
+```bash
+uv run --with huggingface_hub python scripts/download_hf_ir.py \
+  --repo-id waston10086/qwen3-tts-openvino-voice-design \
+  --local-dir build/hf-ir \
+  --allow-pattern "openvino_realtime/**"
+```
+
+下载后启动时把 `--model-root` 指向 `build/hf-ir/openvino_realtime`。
+
 ## Linux
 
 ```bash

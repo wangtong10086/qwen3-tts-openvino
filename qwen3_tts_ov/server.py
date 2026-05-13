@@ -1003,6 +1003,10 @@ def create_app(
 
     app = FastAPI(title="Qwen3-TTS OpenVINO Engine")
     model_root = Path(model_root)
+    requested_devices = [str(device or "")]
+    if decoder_device:
+        requested_devices.append(str(decoder_device))
+    uses_gpu_device = any("GPU" in item.upper() for item in requested_devices)
     if realtime_profile not in REALTIME_PROFILE_CHOICES:
         raise ValueError(f"realtime_profile must be one of {', '.join(REALTIME_PROFILE_CHOICES)}")
     long_output_memory_policy = str(long_output_memory_policy or "stable").strip().lower()
@@ -1038,9 +1042,14 @@ def create_app(
         os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION"] = (
             "1" if FASTEST_NATIVE_PAGED_KV_SCORE_AGGREGATION == "on" else "0"
         )
-        os.environ["QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE"] = FASTEST_NATIVE_CODEGEN_DEVICE
+        os.environ["QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE"] = (
+            FASTEST_NATIVE_CODEGEN_DEVICE if uses_gpu_device else str(device or "CPU")
+        )
     if long_output_memory_policy == "stable":
-        os.environ["QWEN3_TTS_OV_NATIVE_GPU_LARGE_ALLOCATIONS"] = "1"
+        if uses_gpu_device:
+            os.environ["QWEN3_TTS_OV_NATIVE_GPU_LARGE_ALLOCATIONS"] = "1"
+        else:
+            os.environ.pop("QWEN3_TTS_OV_NATIVE_GPU_LARGE_ALLOCATIONS", None)
         os.environ["QWEN3_TTS_OV_NATIVE_REMOTE_EMBED"] = "0"
         os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_TENSOR_REUSE"] = "1"
         os.environ["QWEN3_TTS_OV_NATIVE_RELEASE_RUN_BUFFERS_AFTER_RUN"] = "1"

@@ -550,7 +550,10 @@ class OpenVINOQwen3TTS:
     ):
         self.ir_dir = resolve_ir_dir(ir_dir, fallback_to_local_voice_design=True, warn=True)
         self.manifest = load_manifest(self.ir_dir)
-        self.model_dir = self.manifest["model_dir"]
+        model_dir = Path(self.manifest["model_dir"])
+        if not model_dir.is_absolute():
+            model_dir = self.ir_dir / model_dir
+        self.model_dir = str(model_dir)
         self.ids = self.manifest["ids"]
         self.num_code_groups = int(self.manifest["num_code_groups"])
         self.sample_rate = int(self.manifest["sample_rate"])

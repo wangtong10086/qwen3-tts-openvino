@@ -1,4 +1,6 @@
+import json
 import types
+from pathlib import Path
 
 import numpy as np
 
@@ -241,3 +243,56 @@ def test_fastest_profile_resolves_to_paged_kv_split_talker_variant():
     assert defaults["native_paged_kv_gqa"] == "on"
     assert defaults["native_paged_kv_block_size"] == 16
     assert defaults["native_paged_kv_split_subcode"] == "on"
+
+
+def test_runtime_resolves_relative_manifest_model_dir_from_ir_dir(monkeypatch, tmp_path):
+    from qwen3_tts_ov import runtime as runtime_mod
+
+    ir_dir = tmp_path / "voice_design"
+    ir_dir.mkdir()
+    manifest = {
+        "model_dir": ".",
+        "ids": {},
+        "num_code_groups": 1,
+        "sample_rate": 24000,
+        "decode_upsample_rate": 80,
+        "graphs": {
+            "text_embedding": "text_embedding.xml",
+            "codec_embedding": "codec_embedding.xml",
+            "speech_decoder": {"256": "speech_decoder_t256.xml"},
+        },
+    }
+    (ir_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    seen = {}
+
+    class FakeTokenizer:
+        def __init__(self, model_dir):
+            seen["model_dir"] = Path(model_dir)
+
+    class FakeCore:
+        available_devices = ["CPU"]
+
+    class FakeCompiled:
+        def create_infer_request(self):
+            return object()
+
+    def fake_compile_model(core, path, *args, **kwargs):
+        seen.setdefault("compiled", []).append(Path(path))
+        return FakeCompiled()
+
+    monkeypatch.setattr(runtime_mod.ov, "Core", FakeCore)
+    monkeypatch.setattr(runtime_mod, "Qwen2BPETokenizer", FakeTokenizer)
+    monkeypatch.setattr(runtime_mod, "compile_model", fake_compile_model)
+
+    runtime = OpenVINOQwen3TTS(
+        ir_dir,
+        "CPU",
+        mode="cache",
+        cache_step="fused",
+        native_pipeline="require",
+    )
+
+    assert Path(runtime.model_dir) == ir_dir
+    assert seen["model_dir"] == ir_dir
+    assert [path.name for path in seen["compiled"]] == ["text_embedding.xml", "codec_embedding.xml"]

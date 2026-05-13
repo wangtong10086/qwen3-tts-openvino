@@ -1,0 +1,89 @@
+name: real-tts
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version
+        required: true
+        default: real-smoke
+      hf_repo:
+        description: Public Hugging Face model repo with OpenVINO IR
+        required: true
+        default: waston10086/qwen3-tts-openvino-voice-design
+      hf_revision:
+        description: Optional Hugging Face revision
+        required: false
+        default: main
+      device:
+        description: OpenVINO device used by GitHub-hosted smoke tests
+        required: true
+        default: CPU
+      max_new_tokens:
+        description: Max codec frames for the real smoke request
+        required: true
+        default: "8"
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            archive_ext: tar.zst
+            port: 17970
+            native_backend: direct
+          - os: windows-latest
+            target: windows-x64
+            archive_ext: zip
+            port: 17971
+            native_backend: cmake
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra native --extra server --extra release
+      - name: Build native library
+        run: uv run python scripts/build_native_codegen.py --backend ${{ matrix.native_backend }}
+      - name: Package release
+        run: |
+          uv run python scripts/package_release.py \
+            --target ${{ matrix.target }} \
+            --version "${{ inputs.version }}"
+        shell: bash
+      - name: Download OpenVINO IR from Hugging Face
+        run: |
+          uv run --with huggingface_hub python scripts/download_hf_ir.py \
+            --repo-id "${{ inputs.hf_repo }}" \
+            --revision "${{ inputs.hf_revision }}" \
+            --local-dir build/hf-ir \
+            --allow-pattern "openvino_realtime/**"
+        shell: bash
+      - name: Real streaming TTS smoke
+        run: |
+          uv run python scripts/smoke_release_tts.py \
+            --archive "dist/release/qwen3-tts-ov-server-${{ matrix.target }}-${{ inputs.version }}.${{ matrix.archive_ext }}" \
+            --model-root build/hf-ir/openvino_realtime \
+            --work-dir "build/real-tts-${{ matrix.target }}" \
+            --port ${{ matrix.port }} \
+            --device "${{ inputs.device }}" \
+            --max-new-tokens "${{ inputs.max_new_tokens }}" \
+            --summary-out "build/real-tts-${{ matrix.target }}/summary.json"
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: real-tts-${{ matrix.target }}-${{ inputs.version }}
+          path: |
+            build/real-tts-${{ matrix.target }}/server.log
+            build/real-tts-${{ matrix.target }}/summary.json
