@@ -7,21 +7,33 @@
 #include <openvino/genai/speech_generation/speech_generation_config.hpp>
 #include <openvino/genai/speech_generation/speech_generation_perf_metrics.hpp>
 #include <openvino/genai/tokenizer.hpp>
+#include <openvino/op/constant.hpp>
+#include <openvino/op/parameter.hpp>
+#include <openvino/op/read_value.hpp>
+#include <openvino/op/reshape.hpp>
+#include <openvino/op/result.hpp>
+#include <openvino/pass/sdpa_to_paged_attention.hpp>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cctype>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
 #include <filesystem>
+#include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <regex>
+#include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -32,18 +44,25 @@ namespace {
 
 constexpr float NEG_INF = -3.4028234663852886e38f;
 
+struct NamedTensor {
+    std::string name;
+    ov::Tensor tensor;
+};
+
 struct NativeCodegen {
     ov::Core core;
     ov::CompiledModel prefill_model;
     ov::CompiledModel decode_model;
     ov::CompiledModel text_embedding_model;
     ov::CompiledModel codec_embedding_model;
+    ov::CompiledModel subcode_model;
     ov::CompiledModel first_stream_decoder_model;
     ov::CompiledModel steady_stream_decoder_model;
     ov::InferRequest prefill_request;
     ov::InferRequest decode_request;
     ov::InferRequest text_embedding_request;
     ov::InferRequest codec_embedding_request;
+    ov::InferRequest subcode_request;
     ov::InferRequest first_stream_decoder_request;
     ov::InferRequest steady_stream_decoder_request;
     std::unique_ptr<ov::genai::Tokenizer> tokenizer;
@@ -52,6 +71,18 @@ struct NativeCodegen {
     bool stream_decoders_ready = false;
     bool voice_design_prompt_ready = false;
     bool profile_enabled = false;
+    bool paged_kv_enabled = false;
+    bool paged_split_subcode = false;
+    bool paged_static_decode_enabled = false;
+    int64_t paged_kv_block_size = 8;
+    int64_t paged_kv_heads = 16;
+    int64_t paged_kv_head_dim = 128;
+    int64_t paged_static_decode_block_capacity = 0;
+    std::string paged_static_decode_mode = "dynamic";
+    std::string paged_kv_precision = "f16";
+    std::string paged_kv_cache_input_precision = "f32";
+    int64_t paged_kv_cache_tensor_blocks = 0;
+    std::vector<NamedTensor> paged_kv_cache_tensors;
     int64_t tts_bos_token_id = 0;
     int64_t tts_eos_token_id = 0;
     int64_t tts_pad_token_id = 0;
@@ -76,9 +107,11 @@ struct NativeCodegen {
     struct RunTiming {
         bool buffer_reuse = true;
         bool no_repeat_fast_path = false;
+        bool kv_cache_tensor_reuse = false;
         double host_prepare_ms = 0.0;
         double tensor_bind_ms = 0.0;
         double codegen_infer_ms = 0.0;
+        double sampling_ms = 0.0;
         double decode_infer_ms = 0.0;
         double callback_ms = 0.0;
         double codegen_callback_ms = 0.0;
@@ -97,6 +130,14 @@ struct NativeCodegen {
     std::unordered_map<std::string, ProfileEntry> profile_ops;
     RunTiming last_timing;
     ScratchBuffers scratch;
+};
+
+struct NativeSamplingConfig {
+    bool do_sample = false;
+    int64_t top_k = 50;
+    float top_p = 1.0f;
+    float temperature = 0.9f;
+    uint64_t seed = 0;
 };
 
 using FrameCallback = int (*)(const int64_t* codes, int64_t num_frames, int64_t num_code_groups, void* user_data);
@@ -204,7 +245,7 @@ ov::AnyMap compile_config(const char* cache_dir, const char* cache_mode) {
     if (cache_mode && std::strlen(cache_mode) > 0) {
         config["CACHE_MODE"] = std::string(cache_mode);
     }
-    if (!disabled_env_value(std::getenv("QWEN3_TTS_OV_NATIVE_GPU_LARGE_ALLOCATIONS"))) {
+    if (enabled_env("QWEN3_TTS_OV_NATIVE_GPU_LARGE_ALLOCATIONS", false)) {
         config["GPU_ENABLE_LARGE_ALLOCATIONS"] = std::string("YES");
     }
     if (enabled_env("QWEN3_TTS_OV_NATIVE_LATENCY_HIGH", false)) {
@@ -221,12 +262,298 @@ ov::AnyMap compile_config(const char* cache_dir, const char* cache_mode) {
     apply_env_property(config, "QWEN3_TTS_OV_NATIVE_GPU_QUEUE_PRIORITY", "GPU_QUEUE_PRIORITY");
     apply_env_property(config, "QWEN3_TTS_OV_NATIVE_GPU_HOST_TASK_PRIORITY", "GPU_HOST_TASK_PRIORITY");
     apply_env_property(config, "QWEN3_TTS_OV_NATIVE_GPU_QUEUE_THROTTLE", "GPU_QUEUE_THROTTLE");
+    apply_env_property(config, "QWEN3_TTS_OV_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE", "DYNAMIC_QUANTIZATION_GROUP_SIZE");
+    apply_env_property(config, "QWEN3_TTS_OV_NATIVE_ACTIVATIONS_SCALE_FACTOR", "ACTIVATIONS_SCALE_FACTOR");
     const char* perf_count = std::getenv("QWEN3_TTS_OV_NATIVE_PERF_COUNT");
     if (perf_count && std::strcmp(perf_count, "0") != 0 && std::strcmp(perf_count, "false") != 0 &&
         std::strcmp(perf_count, "off") != 0) {
         config["PERF_COUNT"] = std::string("YES");
     }
     return config;
+}
+
+ov::element::Type parse_element_type(const std::string& value) {
+    const std::string text = lower_text(value);
+    if (text == "f16" || text == "float16") {
+        return ov::element::f16;
+    }
+    if (text == "bf16" || text == "bfloat16") {
+        return ov::element::bf16;
+    }
+    if (text == "f32" || text == "float32") {
+        return ov::element::f32;
+    }
+    if (text == "u8" || text == "uint8") {
+        return ov::element::u8;
+    }
+    if (text == "i8" || text == "int8") {
+        return ov::element::i8;
+    }
+    if (text == "u4" || text == "uint4") {
+        return ov::element::u4;
+    }
+    if (text == "i4" || text == "int4") {
+        return ov::element::i4;
+    }
+    throw std::runtime_error("unsupported KV cache precision: " + value);
+}
+
+ov::Shape concrete_shape(const ov::PartialShape& partial_shape, int64_t dynamic_value) {
+    if (partial_shape.rank().is_dynamic()) {
+        throw std::runtime_error("dynamic rank is not supported for paged KV cache tensor allocation");
+    }
+    ov::Shape shape;
+    shape.reserve(partial_shape.rank().get_length());
+    for (const auto& dim : partial_shape) {
+        shape.push_back(static_cast<size_t>(dim.is_static() ? dim.get_length() : dynamic_value));
+    }
+    return shape;
+}
+
+size_t add_readvalue_initializers(const std::shared_ptr<ov::Model>& model) {
+    size_t changed = 0;
+    for (const auto& node : model->get_ordered_ops()) {
+        auto read_value = std::dynamic_pointer_cast<ov::op::v6::ReadValue>(node);
+        if (!read_value || read_value->get_input_size() != 0) {
+            continue;
+        }
+        auto variable = read_value->get_variable();
+        if (!variable) {
+            continue;
+        }
+        const auto pshape = read_value->get_output_partial_shape(0);
+        if (pshape.rank().is_dynamic()) {
+            continue;
+        }
+        ov::Shape init_shape;
+        init_shape.reserve(pshape.rank().get_length());
+        for (const auto& dim : pshape) {
+            init_shape.push_back(dim.is_static() ? static_cast<size_t>(dim.get_length()) : 0);
+        }
+        auto init = ov::op::v0::Constant::create(read_value->get_output_element_type(0), init_shape, std::vector<float>{});
+        auto replacement = std::make_shared<ov::op::v6::ReadValue>(init, variable);
+        replacement->set_friendly_name(read_value->get_friendly_name());
+        ov::copy_runtime_info(read_value, replacement);
+        read_value->output(0).replace(replacement->output(0));
+        ++changed;
+    }
+    return changed;
+}
+
+size_t restore_unregistered_parameters(const std::shared_ptr<ov::Model>& model) {
+    ov::ParameterVector missing;
+    std::set<const ov::Node*> registered;
+    for (const auto& param : model->get_parameters()) {
+        registered.insert(param.get());
+    }
+    for (const auto& op : model->get_ops()) {
+        auto param = ov::as_type_ptr<ov::op::v0::Parameter>(op);
+        if (param && registered.count(param.get()) == 0) {
+            missing.push_back(param);
+            registered.insert(param.get());
+        }
+    }
+    if (!missing.empty()) {
+        model->add_parameters(missing);
+    }
+    return missing.size();
+}
+
+size_t specialize_kv_cache_parameters(
+    const std::shared_ptr<ov::Model>& model,
+    int64_t heads,
+    int64_t block_size,
+    int64_t head_dim,
+    ov::element::Type cache_element_type) {
+    size_t changed = 0;
+    for (const auto& parameter : model->get_parameters()) {
+        bool is_kv_cache = false;
+        for (const auto& name : parameter->get_output_tensor(0).get_names()) {
+            if (name.rfind("key_cache.", 0) == 0 || name.rfind("value_cache.", 0) == 0) {
+                is_kv_cache = true;
+                break;
+            }
+        }
+        if (!is_kv_cache) {
+            continue;
+        }
+        parameter->set_element_type(cache_element_type);
+        parameter->set_partial_shape(
+            ov::PartialShape{ov::Dimension::dynamic(), heads, head_dim, block_size});
+        parameter->validate_and_infer_types();
+        ++changed;
+    }
+    return changed;
+}
+
+bool flatten_frame_embed_result(const std::shared_ptr<ov::Model>& model) {
+    auto results = model->get_results();
+    if (results.size() < 3) {
+        return false;
+    }
+    auto result = results[2];
+    if (!result || result->get_input_size() == 0) {
+        return false;
+    }
+    const auto source = result->input_value(0);
+    const auto rank = source.get_partial_shape().rank();
+    if (rank.is_dynamic() || rank.get_length() != 3) {
+        return false;
+    }
+    auto target_shape = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, std::vector<int64_t>{1, -1});
+    auto reshape = std::make_shared<ov::op::v1::Reshape>(source, target_shape, false);
+    reshape->set_friendly_name("frame_embed_flatten");
+    ov::copy_runtime_info(result, reshape);
+    result->input(0).replace_source_output(reshape->output(0));
+    return true;
+}
+
+std::string model_input_summary(const std::shared_ptr<ov::Model>& model);
+
+int64_t infer_paged_hidden_size(const std::shared_ptr<ov::Model>& model) {
+    if (!model) {
+        return 0;
+    }
+    for (const auto& input : model->inputs()) {
+        std::string name;
+        try {
+            name = input.get_any_name();
+        } catch (...) {
+            continue;
+        }
+        if (name != "tts_pad_embed") {
+            continue;
+        }
+        const auto pshape = input.get_partial_shape();
+        if (pshape.rank().is_dynamic() || pshape.rank().get_length() == 0) {
+            continue;
+        }
+        const auto dim = pshape[pshape.rank().get_length() - 1];
+        if (dim.is_static()) {
+            return dim.get_length();
+        }
+    }
+    return 0;
+}
+
+bool reshape_paged_decode_model(
+    std::shared_ptr<ov::Model>& model,
+    int64_t heads,
+    int64_t block_size,
+    int64_t head_dim,
+    int64_t block_capacity,
+    const std::string& static_mode) {
+    if (!model) {
+        return false;
+    }
+    const int64_t hidden_size = infer_paged_hidden_size(model);
+    if (hidden_size <= 0 || heads <= 0 || block_size <= 0 || head_dim <= 0 || block_capacity <= 0) {
+        return false;
+    }
+    std::map<ov::Output<ov::Node>, ov::PartialShape> shapes;
+    bool changed = false;
+    const bool reshape_cache_buffers = static_mode == "full";
+    for (const auto& input : model->inputs()) {
+        std::string name;
+        try {
+            name = input.get_any_name();
+        } catch (...) {
+            continue;
+        }
+        const auto pshape = input.get_partial_shape();
+        const auto rank = pshape.rank();
+        if (rank.is_dynamic()) {
+            continue;
+        }
+        const auto rank_len = rank.get_length();
+        const auto set_shape = [&](const ov::PartialShape& shape) {
+            shapes[input] = shape;
+            changed = true;
+        };
+        if (name == "inputs_embeds") {
+            if (rank_len == 2) {
+                set_shape(ov::PartialShape{1, hidden_size});
+            } else if (rank_len == 3) {
+                set_shape(ov::PartialShape{1, 1, hidden_size});
+            }
+        } else if (name == "position_ids") {
+            if (rank_len == 2) {
+                set_shape(ov::PartialShape{3, 1});
+            } else if (rank_len == 3) {
+                set_shape(ov::PartialShape{3, 1, 1});
+            }
+        } else if (name == "attention_mask") {
+            if (rank_len == 4) {
+                set_shape(ov::PartialShape{1, 1, 1, ov::Dimension::dynamic()});
+            }
+        } else if (name == "allow_eos" || name == "allow_eos_steps" || name == "beam_idx" ||
+                   name == "past_lens" || name == "score_aggregation_window") {
+            set_shape(ov::PartialShape{1});
+        } else if (name == "subsequence_begins" || name == "block_indices_begins") {
+            set_shape(ov::PartialShape{2});
+        } else if (name == "block_indices" && reshape_cache_buffers) {
+            set_shape(ov::PartialShape{block_capacity});
+        } else if (name == "max_context_len") {
+            set_shape(ov::PartialShape{});
+        } else if (reshape_cache_buffers && (name.rfind("key_cache.", 0) == 0 || name.rfind("value_cache.", 0) == 0)) {
+            set_shape(ov::PartialShape{block_capacity, heads, head_dim, block_size});
+        }
+    }
+    if (!changed) {
+        return false;
+    }
+    model->reshape(shapes);
+    model->validate_nodes_and_infer_types();
+    if (enabled_env("QWEN3_TTS_OV_NATIVE_DEBUG_GRAPH", false)) {
+        std::cerr << "paged_kv_static_decode mode=" << static_mode
+                  << " inputs=[" << model_input_summary(model) << "]" << std::endl;
+    }
+    return true;
+}
+
+std::shared_ptr<ov::Model> convert_paged_kv_seed_model(
+    ov::Core& core,
+    const char* seed_xml,
+    int64_t heads,
+    int64_t block_size,
+    int64_t head_dim,
+    ov::element::Type cache_element_type) {
+    auto model = core.read_model(seed_xml);
+    add_readvalue_initializers(model);
+    const bool allow_score_aggregation = enabled_env("QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION", true);
+    try {
+        ov::pass::SDPAToPagedAttention(
+            false,
+            false,
+            allow_score_aggregation,
+            false,
+            false,
+            false)
+            .run_on_model(model);
+    } catch (const std::exception& exc) {
+        if (enabled_env("QWEN3_TTS_OV_NATIVE_DEBUG_GRAPH", false)) {
+            std::cerr << "SDPAToPagedAttention reported non-fatal error: " << exc.what() << std::endl;
+        }
+    }
+    const size_t restored_parameters = restore_unregistered_parameters(model);
+    specialize_kv_cache_parameters(model, heads, block_size, head_dim, cache_element_type);
+    if (restored_parameters == 0) {
+        flatten_frame_embed_result(model);
+    }
+    if (enabled_env("QWEN3_TTS_OV_NATIVE_DEBUG_GRAPH", false)) {
+        std::cerr << "paged_kv_seed restored_parameters=" << restored_parameters
+                  << " inputs=[" << model_input_summary(model) << "]" << std::endl;
+    }
+    try {
+        model->validate_nodes_and_infer_types();
+    } catch (const std::exception&) {
+        // SDPAToPagedAttention may leave beam_idx in a state where model
+        // validation still reports it as undeclared, while the converted graph
+        // is accepted by compile_model and beam_idx is bound as a normal input.
+        // Treat compile_model as the authoritative check for this experimental
+        // paged-KV path.
+    }
+    return model;
 }
 
 std::vector<float> make_attention_mask(int64_t prompt_len, int64_t bucket) {
@@ -332,6 +659,36 @@ bool compiled_model_has_input(const ov::CompiledModel& model, const std::string&
     return false;
 }
 
+int64_t compiled_model_static_input_size(const ov::CompiledModel& model, const std::string& name) {
+    for (const auto& input : model.inputs()) {
+        const auto names = input.get_names();
+        if (names.find(name) == names.end()) {
+            continue;
+        }
+        const auto pshape = input.get_partial_shape();
+        if (pshape.rank().is_static() && pshape.rank().get_length() == 1 && pshape[0].is_static()) {
+            return pshape[0].get_length();
+        }
+        return 0;
+    }
+    return 0;
+}
+
+int64_t compiled_model_input_rank(const ov::CompiledModel& model, const std::string& name) {
+    for (const auto& input : model.inputs()) {
+        const auto names = input.get_names();
+        if (names.find(name) == names.end()) {
+            continue;
+        }
+        const auto rank = input.get_partial_shape().rank();
+        if (rank.is_static()) {
+            return rank.get_length();
+        }
+        return 0;
+    }
+    return 0;
+}
+
 bool request_has_repeated_mask_state(ov::InferRequest& request) {
     for (const auto& state : request.query_state()) {
         const auto name = state.get_name();
@@ -383,6 +740,64 @@ std::string json_escape_native(const std::string& value) {
     return out;
 }
 
+std::string profile_scope(const NativeCodegen::ProfileEntry& item) {
+    const std::string name = lower_text(item.node_name);
+    if (name.find("code_predictor") != std::string::npos ||
+        name.find("subcode") != std::string::npos ||
+        name.find("mtp") != std::string::npos) {
+        return "subcode_predictor";
+    }
+    if (item.node_type == "PagedAttentionExtension") {
+        return "talker_attention";
+    }
+    if ((item.node_type == "SDPA" ||
+         item.node_type == "ScaledDotProductAttention") &&
+        name.find("talker") != std::string::npos) {
+        return "talker_attention";
+    }
+    if (name.find("__module.talker.model.layers") != std::string::npos) {
+        if (name.find(".mlp.") != std::string::npos) {
+            return "talker_mlp";
+        }
+        if (name.find("self_attn") != std::string::npos ||
+            item.node_type == "SDPA" ||
+            item.node_type == "PagedAttentionExtension") {
+            return "talker_attention";
+        }
+        if (item.node_type == "RMS") {
+            return "talker_norm";
+        }
+        return "talker_layer_other";
+    }
+    if (name.find("__module.talker.codec_head") != std::string::npos) {
+        return "talker_codec_head";
+    }
+    if (name.find("stream_decoder") != std::string::npos ||
+        name.find("speech_decoder") != std::string::npos ||
+        name.find("__module.decoder") != std::string::npos) {
+        return "audio_decoder";
+    }
+    return "other";
+}
+
+std::string model_input_summary(const std::shared_ptr<ov::Model>& model) {
+    std::ostringstream out;
+    bool first = true;
+    for (const auto& input : model->inputs()) {
+        if (!first) {
+            out << ", ";
+        }
+        first = false;
+        try {
+            out << input.get_any_name();
+        } catch (...) {
+            out << "<unnamed>";
+        }
+        out << ":" << input.get_partial_shape().to_string() << ":" << input.get_element_type();
+    }
+    return out.str();
+}
+
 void record_request_profile(NativeCodegen* runner, const std::string& label, const ov::InferRequest& request) {
     if (!runner || !runner->profile_enabled) {
         return;
@@ -419,7 +834,7 @@ std::string native_profile_json(const NativeCodegen& runner) {
     auto aggregate = [&](const std::string& field) {
         std::unordered_map<std::string, NativeCodegen::ProfileEntry> totals;
         for (const auto& item : entries) {
-            const std::string key = field == "label" ? item.label : item.node_type;
+            const std::string key = field == "label" ? item.label : (field == "scope" ? profile_scope(item) : item.node_type);
             auto& total = totals[key];
             total.label = key;
             total.node_type = key;
@@ -456,6 +871,7 @@ std::string native_profile_json(const NativeCodegen& runner) {
     json += "  \"enabled\": true,\n";
     append_totals(json, aggregate("label"), "by_label");
     append_totals(json, aggregate("node_type"), "by_type");
+    append_totals(json, aggregate("scope"), "by_scope");
     json += "  \"top\": [\n";
     const size_t limit = std::min<size_t>(50, entries.size());
     for (size_t i = 0; i < limit; ++i) {
@@ -481,9 +897,19 @@ std::string native_timing_json(const NativeCodegen& runner) {
     json += item.buffer_reuse ? "true" : "false";
     json += ", \"no_repeat_fast_path\": ";
     json += item.no_repeat_fast_path ? "true" : "false";
+    json += ", \"kv_cache_tensor_reuse\": ";
+    json += item.kv_cache_tensor_reuse ? "true" : "false";
+    json += ", \"paged_kv_precision\": \"" + json_escape_native(runner.paged_kv_precision) + "\"";
+    json += ", \"paged_kv_cache_input_precision\": \"" + json_escape_native(runner.paged_kv_cache_input_precision) + "\"";
+    json += ", \"paged_split_subcode\": ";
+    json += runner.paged_split_subcode ? "true" : "false";
+    json += ", \"paged_static_decode_enabled\": ";
+    json += runner.paged_static_decode_enabled ? "true" : "false";
+    json += ", \"paged_static_decode_mode\": \"" + json_escape_native(runner.paged_static_decode_mode) + "\"";
     json += ", \"host_prepare_ms\": " + std::to_string(item.host_prepare_ms);
     json += ", \"tensor_bind_ms\": " + std::to_string(item.tensor_bind_ms);
     json += ", \"codegen_infer_ms\": " + std::to_string(item.codegen_infer_ms);
+    json += ", \"sampling_ms\": " + std::to_string(item.sampling_ms);
     json += ", \"decode_infer_ms\": " + std::to_string(item.decode_infer_ms);
     json += ", \"callback_ms\": " + std::to_string(item.callback_ms);
     json += ", \"codegen_callback_ms\": " + std::to_string(item.codegen_callback_ms);
@@ -532,6 +958,33 @@ RemoteEmbedChain make_remote_embed_chain(NativeCodegen* runner, int64_t hidden_s
     chain.enabled = static_cast<bool>(chain.prefill_output) &&
                     static_cast<bool>(chain.decode_outputs[0]) &&
                     static_cast<bool>(chain.decode_outputs[1]);
+    return chain;
+}
+
+RemoteEmbedChain make_paged_remote_embed_chain(NativeCodegen* runner, int64_t hidden_size) {
+    RemoteEmbedChain chain;
+    const char* remote_embed_value = std::getenv("QWEN3_TTS_OV_NATIVE_REMOTE_EMBED");
+    const std::string remote_embed_env = lower_text(remote_embed_value ? remote_embed_value : "1");
+    if (!runner || hidden_size <= 0 ||
+        remote_embed_env == "0" || remote_embed_env == "false" ||
+        remote_embed_env == "off" || remote_embed_env == "no") {
+        return chain;
+    }
+    try {
+        const auto input_rank = runner->prefill_model.input("inputs_embeds").get_partial_shape().rank();
+        const auto output_rank = runner->prefill_model.output(2).get_partial_shape().rank();
+        if (input_rank.is_dynamic() || output_rank.is_dynamic() ||
+            input_rank.get_length() != 2 || output_rank.get_length() != 2) {
+            return chain;
+        }
+    } catch (...) {
+        return chain;
+    }
+
+    const ov::Shape frame_embed_shape{1, static_cast<size_t>(hidden_size)};
+    chain.decode_outputs[0] = try_create_remote_tensor(runner->prefill_model, ov::element::f32, frame_embed_shape);
+    chain.decode_outputs[1] = try_create_remote_tensor(runner->prefill_model, ov::element::f32, frame_embed_shape);
+    chain.enabled = static_cast<bool>(chain.decode_outputs[0]) && static_cast<bool>(chain.decode_outputs[1]);
     return chain;
 }
 
@@ -886,6 +1339,608 @@ int native_audio_frame_callback(const int64_t* codes, int64_t num_frames, int64_
     return 0;
 }
 
+void set_i32_tensor(ov::InferRequest& request, const std::string& name, const std::vector<int32_t>& values) {
+    ov::Tensor tensor(ov::element::i32, ov::Shape{values.size()});
+    std::copy(values.begin(), values.end(), tensor.data<int32_t>());
+    request.set_tensor(name, tensor);
+}
+
+void set_scalar_i32_tensor(ov::InferRequest& request, const std::string& name, int32_t value) {
+    ov::Tensor tensor(ov::element::i32, ov::Shape{});
+    tensor.data<int32_t>()[0] = value;
+    request.set_tensor(name, tensor);
+}
+
+std::vector<NamedTensor> make_paged_kv_cache_tensors(ov::CompiledModel& model, int64_t num_blocks) {
+    bool all_gpu_device = false;
+    ov::RemoteContext remote_context;
+    try {
+        std::vector<std::string> execution_devices = model.get_property(ov::execution_devices);
+        all_gpu_device = !execution_devices.empty() &&
+            std::all_of(execution_devices.begin(), execution_devices.end(), [](const std::string& device) {
+                return device.find("GPU") != std::string::npos;
+            });
+        if (all_gpu_device) {
+            remote_context = model.get_context();
+        }
+    } catch (...) {
+        all_gpu_device = false;
+    }
+    std::vector<NamedTensor> tensors;
+    for (const auto& input : model.inputs()) {
+        std::string name;
+        try {
+            name = input.get_any_name();
+        } catch (...) {
+            continue;
+        }
+        if (name.rfind("key_cache.", 0) != 0 && name.rfind("value_cache.", 0) != 0) {
+            continue;
+        }
+        const auto shape = concrete_shape(input.get_partial_shape(), num_blocks);
+        ov::Tensor tensor = all_gpu_device
+            ? remote_context.create_tensor(input.get_element_type(), shape)
+            : ov::Tensor(input.get_element_type(), shape);
+        if (!all_gpu_device) {
+            std::memset(tensor.data(), 0, tensor.get_byte_size());
+        }
+        tensors.push_back(NamedTensor{name, tensor});
+    }
+    return tensors;
+}
+
+const std::vector<NamedTensor>& get_paged_kv_cache_tensors(NativeCodegen* runner, ov::CompiledModel& model, int64_t num_blocks) {
+    if (!runner) {
+        throw std::runtime_error("paged KV cache tensor reuse requires a runner");
+    }
+    const bool reuse_enabled = env_enabled("QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_TENSOR_REUSE", true);
+    const bool can_reuse =
+        reuse_enabled &&
+        !runner->paged_kv_cache_tensors.empty() &&
+        runner->paged_kv_cache_tensor_blocks == num_blocks;
+    runner->last_timing.kv_cache_tensor_reuse = can_reuse;
+    if (!reuse_enabled ||
+        runner->paged_kv_cache_tensors.empty() ||
+        runner->paged_kv_cache_tensor_blocks != num_blocks) {
+        runner->paged_kv_cache_tensors = make_paged_kv_cache_tensors(model, num_blocks);
+        runner->paged_kv_cache_tensor_blocks = num_blocks;
+    }
+    return runner->paged_kv_cache_tensors;
+}
+
+void bind_named_tensors(ov::InferRequest& request, const std::vector<NamedTensor>& tensors) {
+    for (const auto& item : tensors) {
+        request.set_tensor(item.name, item.tensor);
+    }
+}
+
+void bind_paged_kv_cache_tensors(ov::CompiledModel& model, ov::InferRequest& request, int64_t num_blocks) {
+    bind_named_tensors(request, make_paged_kv_cache_tensors(model, num_blocks));
+}
+
+void bind_paged_step_inputs(
+    ov::InferRequest& request,
+    const float* embeds,
+    int64_t seq_len,
+    int64_t hidden_size,
+    int64_t position_start,
+    int64_t past_len,
+    int64_t block_size,
+    const float* tts_pad_embed,
+    const std::vector<float>& allow_eos_values,
+    std::vector<int64_t>& position_ids,
+    std::vector<int32_t>& block_indices,
+    std::vector<float>& allow_eos_buffer,
+    std::vector<int64_t>& beam_idx_buffer) {
+    if (seq_len <= 0 || hidden_size <= 0 || block_size <= 0) {
+        throw std::runtime_error("invalid paged KV step shape");
+    }
+    position_ids.resize(static_cast<size_t>(3 * seq_len));
+    for (int64_t row = 0; row < 3; ++row) {
+        for (int64_t i = 0; i < seq_len; ++i) {
+            position_ids[static_cast<size_t>(row * seq_len + i)] = position_start + i;
+        }
+    }
+
+    const int64_t total_len = past_len + seq_len;
+    const int64_t blocks_used = std::max<int64_t>(1, (total_len + block_size - 1) / block_size);
+    const int64_t block_indices_len = std::max<int64_t>(
+        blocks_used,
+        compiled_model_static_input_size(request.get_compiled_model(), "block_indices"));
+    block_indices.assign(static_cast<size_t>(block_indices_len), 0);
+    for (int64_t i = 0; i < blocks_used; ++i) {
+        block_indices[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+    }
+
+    const auto& compiled = request.get_compiled_model();
+    const int64_t inputs_rank = compiled_model_input_rank(compiled, "inputs_embeds");
+    if (inputs_rank == 3) {
+        request.set_tensor(
+            "inputs_embeds",
+            ov::Tensor(
+                ov::element::f32,
+                ov::Shape{static_cast<size_t>(seq_len), 1, static_cast<size_t>(hidden_size)},
+                const_cast<float*>(embeds)));
+    } else {
+        request.set_tensor(
+            "inputs_embeds",
+            ov::Tensor(
+                ov::element::f32,
+                ov::Shape{static_cast<size_t>(seq_len), static_cast<size_t>(hidden_size)},
+                const_cast<float*>(embeds)));
+    }
+    const int64_t position_rank = compiled_model_input_rank(compiled, "position_ids");
+    if (position_rank == 3) {
+        request.set_tensor(
+            "position_ids",
+            ov::Tensor(ov::element::i64, ov::Shape{3, static_cast<size_t>(seq_len), 1}, position_ids.data()));
+    } else {
+        request.set_tensor(
+            "position_ids",
+            ov::Tensor(ov::element::i64, ov::Shape{3, static_cast<size_t>(seq_len)}, position_ids.data()));
+    }
+    if (compiled_model_has_input(compiled, "tts_pad_embed")) {
+        request.set_tensor(
+            "tts_pad_embed",
+            ov::Tensor(ov::element::f32, ov::Shape{1, 1, static_cast<size_t>(hidden_size)}, const_cast<float*>(tts_pad_embed)));
+    }
+    allow_eos_buffer = allow_eos_values;
+    if (allow_eos_buffer.empty()) {
+        allow_eos_buffer.assign(1, 0.0f);
+    }
+    if (compiled_model_has_input(request.get_compiled_model(), "allow_eos")) {
+        request.set_tensor("allow_eos", ov::Tensor(ov::element::f32, ov::Shape{1}, allow_eos_buffer.data()));
+    }
+    if (compiled_model_has_input(request.get_compiled_model(), "allow_eos_steps")) {
+        request.set_tensor(
+            "allow_eos_steps",
+            ov::Tensor(ov::element::f32, ov::Shape{allow_eos_buffer.size()}, allow_eos_buffer.data()));
+    }
+    if (compiled_model_has_input(request.get_compiled_model(), "beam_idx")) {
+        beam_idx_buffer.assign(static_cast<size_t>(seq_len), 0);
+        request.set_tensor("beam_idx", ov::Tensor(ov::element::i64, ov::Shape{beam_idx_buffer.size()}, beam_idx_buffer.data()));
+    }
+    if (compiled_model_has_input(request.get_compiled_model(), "score_aggregation_window")) {
+        set_i32_tensor(request, "score_aggregation_window", {1});
+    }
+    set_i32_tensor(request, "past_lens", {static_cast<int32_t>(past_len)});
+    set_i32_tensor(request, "subsequence_begins", {0, static_cast<int32_t>(seq_len)});
+    request.set_tensor("block_indices", ov::Tensor(ov::element::i32, ov::Shape{block_indices.size()}, block_indices.data()));
+    set_i32_tensor(request, "block_indices_begins", {0, static_cast<int32_t>(blocks_used)});
+    set_scalar_i32_tensor(request, "max_context_len", static_cast<int32_t>(total_len));
+}
+
+int64_t select_first_code_from_logits(
+    const ov::Tensor& logits_tensor,
+    int64_t generated,
+    int64_t min_new_tokens,
+    int64_t vocab_size,
+    int64_t eos_token_id,
+    const std::vector<uint8_t>* repeated_mask = nullptr,
+    float repetition_penalty = 1.0f,
+    const NativeSamplingConfig* sampling = nullptr,
+    std::mt19937_64* rng = nullptr) {
+    const size_t size = logits_tensor.get_size();
+    const float* logits_base = tensor_data<float>(logits_tensor);
+    if (!logits_base || size == 0 || vocab_size <= 0 || static_cast<size_t>(vocab_size) > size) {
+        throw std::runtime_error("invalid paged split logits tensor");
+    }
+    const size_t rows = std::max<size_t>(1, size / static_cast<size_t>(vocab_size));
+    const float* logits = logits_base + (rows - 1) * static_cast<size_t>(vocab_size);
+    const int64_t suppress_from = std::max<int64_t>(0, vocab_size - 1024);
+    std::vector<std::pair<int64_t, float>> candidates;
+    candidates.reserve(static_cast<size_t>(vocab_size));
+    for (int64_t token_id = 0; token_id < vocab_size; ++token_id) {
+        float score = logits[static_cast<size_t>(token_id)];
+        if (token_id >= suppress_from && token_id != eos_token_id) {
+            score = NEG_INF;
+        }
+        if (token_id == eos_token_id && generated < min_new_tokens) {
+            score = NEG_INF;
+        }
+        if (
+            repeated_mask &&
+            repetition_penalty != 1.0f &&
+            token_id >= 0 &&
+            static_cast<size_t>(token_id) < repeated_mask->size() &&
+            (*repeated_mask)[static_cast<size_t>(token_id)] != 0 &&
+            score > NEG_INF / 2.0f) {
+            score = score < 0.0f ? score * repetition_penalty : score / repetition_penalty;
+        }
+        if (score > NEG_INF / 2.0f && std::isfinite(score)) {
+            candidates.emplace_back(token_id, score);
+        }
+    }
+    if (candidates.empty()) {
+        return eos_token_id;
+    }
+
+    const bool do_sample = sampling && sampling->do_sample;
+    if (!do_sample) {
+        return std::max_element(
+            candidates.begin(),
+            candidates.end(),
+            [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; })->first;
+    }
+    if (!rng) {
+        throw std::runtime_error("sampling requested without RNG");
+    }
+
+    const float temperature = std::max<float>(1.0e-6f, sampling->temperature);
+    for (auto& item : candidates) {
+        item.second /= temperature;
+    }
+
+    const int64_t top_k = sampling->top_k;
+    if (top_k > 0 && static_cast<size_t>(top_k) < candidates.size()) {
+        std::nth_element(
+            candidates.begin(),
+            candidates.begin() + static_cast<std::ptrdiff_t>(top_k),
+            candidates.end(),
+            [](const auto& lhs, const auto& rhs) { return lhs.second > rhs.second; });
+        candidates.resize(static_cast<size_t>(top_k));
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.second > rhs.second;
+    });
+
+    const double max_score = static_cast<double>(candidates.front().second);
+    std::vector<double> weights;
+    weights.reserve(candidates.size());
+    double total = 0.0;
+    for (const auto& item : candidates) {
+        const double weight = std::exp(static_cast<double>(item.second) - max_score);
+        weights.push_back(weight);
+        total += weight;
+    }
+    if (!(total > 0.0) || !std::isfinite(total)) {
+        return candidates.front().first;
+    }
+
+    const float top_p = sampling->top_p;
+    if (top_p > 0.0f && top_p < 1.0f && candidates.size() > 1) {
+        double kept = 0.0;
+        size_t keep_count = 0;
+        for (; keep_count < weights.size(); ++keep_count) {
+            kept += weights[keep_count];
+            if (kept / total >= static_cast<double>(top_p)) {
+                ++keep_count;
+                break;
+            }
+        }
+        keep_count = std::max<size_t>(1, std::min(keep_count, candidates.size()));
+        candidates.resize(keep_count);
+        weights.resize(keep_count);
+    }
+
+    std::discrete_distribution<size_t> distribution(weights.begin(), weights.end());
+    return candidates[distribution(*rng)].first;
+}
+
+const float* last_hidden_vector_ptr(const ov::Tensor& last_hidden_tensor, int64_t hidden_size) {
+    const float* base = tensor_data<float>(last_hidden_tensor);
+    const size_t size = last_hidden_tensor.get_size();
+    if (!base || hidden_size <= 0 || size < static_cast<size_t>(hidden_size)) {
+        throw std::runtime_error("invalid paged split last_hidden tensor");
+    }
+    const size_t rows = std::max<size_t>(1, size / static_cast<size_t>(hidden_size));
+    return base + (rows - 1) * static_cast<size_t>(hidden_size);
+}
+
+void run_paged_split_subcode_step(
+    NativeCodegen* runner,
+    const ov::Tensor& last_hidden_tensor,
+    int64_t first_code,
+    const float* tts_pad_embed,
+    int64_t hidden_size,
+    int64_t num_code_groups,
+    std::vector<int64_t>& frame_codes,
+    std::vector<float>& next_embed) {
+    if (!runner || !tts_pad_embed || hidden_size <= 0 || num_code_groups <= 0) {
+        throw std::runtime_error("invalid paged split subcode arguments");
+    }
+    if (!runner->paged_split_subcode) {
+        throw std::runtime_error("paged split subcode graph is not configured");
+    }
+    auto& request = runner->subcode_request;
+    const float* last_hidden = last_hidden_vector_ptr(last_hidden_tensor, hidden_size);
+    int64_t first_code_buffer[1] = {first_code};
+    measure_ms(runner->last_timing.tensor_bind_ms, [&]() {
+        request.set_tensor(
+            "past_hidden",
+            ov::Tensor(
+                ov::element::f32,
+                ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
+                const_cast<float*>(last_hidden)));
+        request.set_tensor(
+            "first_code",
+            ov::Tensor(ov::element::i64, ov::Shape{1, 1}, first_code_buffer));
+    });
+    measure_ms(runner->last_timing.codegen_infer_ms, [&]() {
+        request.infer();
+    });
+    record_request_profile(runner, "codegen_paged_kv_subcode", request);
+    auto codes_tensor = request.get_output_tensor(0);
+    auto sum_embed_tensor = request.get_output_tensor(1);
+    const int64_t* codes = tensor_data<int64_t>(codes_tensor);
+    const float* sum_embed = tensor_data<float>(sum_embed_tensor);
+    if (static_cast<int64_t>(codes_tensor.get_size()) < num_code_groups) {
+        throw std::runtime_error("paged split subcode graph returned too few codec groups");
+    }
+    frame_codes.assign(codes, codes + num_code_groups);
+    next_embed.resize(static_cast<size_t>(hidden_size));
+    for (int64_t i = 0; i < hidden_size; ++i) {
+        next_embed[static_cast<size_t>(i)] =
+            sum_embed[static_cast<size_t>(i)] + tts_pad_embed[static_cast<size_t>(i)];
+    }
+}
+
+void run_paged_kv_impl(
+    NativeCodegen* runner,
+    const float* sequence,
+    int64_t prompt_len,
+    int64_t hidden_size,
+    const float* tts_pad_embed,
+    int64_t max_new_tokens,
+    int64_t min_new_tokens,
+    float repetition_penalty,
+    int64_t vocab_size,
+    int64_t num_code_groups,
+    int64_t eos_token_id,
+    const NativeSamplingConfig& sampling,
+    int64_t* out_codes,
+    int64_t* out_count,
+    double* elapsed_ms,
+    FrameCallback callback,
+    void* user_data) {
+    if (!runner || !sequence || !tts_pad_embed || !out_count || (!out_codes && !callback)) {
+        throw std::runtime_error("invalid null pointer passed to native paged KV codegen");
+    }
+    if (prompt_len <= 0 || hidden_size <= 0 || max_new_tokens <= 0 || num_code_groups <= 0) {
+        throw std::runtime_error("invalid native paged KV shape argument");
+    }
+    const auto started = std::chrono::steady_clock::now();
+    *out_count = 0;
+    runner->last_timing = NativeCodegen::RunTiming{};
+    runner->last_timing.buffer_reuse = runner->paged_static_decode_enabled;
+    runner->last_timing.no_repeat_fast_path = true;
+    const bool use_repetition_penalty = std::abs(repetition_penalty - 1.0f) > 1e-6f;
+    if (sampling.do_sample && !runner->paged_split_subcode) {
+        throw std::runtime_error(
+            "native paged-KV fused codegen does not support do_sample=true; "
+            "use split-subcode paged-KV or the full-AR reference path");
+    }
+    if (use_repetition_penalty && !runner->paged_split_subcode) {
+        throw std::runtime_error(
+            "native paged-KV fused codegen does not support repetition_penalty != 1.0; "
+            "use the full-AR reference path or export a paged graph with host-side logits");
+    }
+
+    const int64_t total_capacity_tokens = prompt_len + max_new_tokens + 1;
+    const int64_t num_blocks = std::max<int64_t>(
+        1,
+        (total_capacity_tokens + runner->paged_kv_block_size - 1) / runner->paged_kv_block_size);
+    const bool static_decode_capacity_ok =
+        runner->paged_static_decode_enabled && num_blocks <= runner->paged_static_decode_block_capacity;
+    const int64_t cache_blocks = static_decode_capacity_ok ? runner->paged_static_decode_block_capacity : num_blocks;
+    auto& prefill_request = runner->prefill_request;
+    auto* decode_request = &runner->prefill_request;
+    const auto& cache_tensors = get_paged_kv_cache_tensors(runner, runner->prefill_model, cache_blocks);
+    bind_named_tensors(prefill_request, cache_tensors);
+    bool use_static_decode = static_decode_capacity_ok;
+    if (use_static_decode) {
+        try {
+            bind_named_tensors(runner->decode_request, cache_tensors);
+            decode_request = &runner->decode_request;
+        } catch (const std::exception& exc) {
+            if (enabled_env("QWEN3_TTS_OV_NATIVE_DEBUG_GRAPH", false)) {
+                std::cerr << "paged static decode cache bind failed; falling back to dynamic request: "
+                          << exc.what() << std::endl;
+            }
+            use_static_decode = false;
+            decode_request = &runner->prefill_request;
+        }
+    }
+
+    std::vector<int64_t> position_ids;
+    std::vector<int32_t> block_indices;
+    std::vector<float> allow_eos_buffer;
+    std::vector<int64_t> beam_idx_buffer;
+    std::vector<float> next_embed(static_cast<size_t>(hidden_size));
+    std::vector<uint8_t> repeated_first_codes;
+    if (use_repetition_penalty) {
+        repeated_first_codes.assign(static_cast<size_t>(vocab_size), 0);
+        runner->last_timing.no_repeat_fast_path = false;
+    }
+    std::mt19937_64 rng(
+        sampling.seed
+            ? sampling.seed
+            : static_cast<uint64_t>(
+                  std::chrono::high_resolution_clock::now().time_since_epoch().count()));
+    RemoteEmbedChain remote_embed = make_paged_remote_embed_chain(runner, hidden_size);
+    if (runner->paged_split_subcode) {
+        remote_embed.enabled = false;
+    }
+    if (use_static_decode && !env_enabled("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_REMOTE_EMBED", false)) {
+        remote_embed.enabled = false;
+    }
+    runner->last_remote_embed_used = remote_embed.enabled;
+    const int64_t graph_unroll = std::max<int64_t>(1, runner->unroll);
+
+    int64_t generated = 0;
+    bool stop = false;
+    auto make_allow_eos_values = [&](int64_t frame_count) {
+        std::vector<float> values(static_cast<size_t>(std::max<int64_t>(1, frame_count)), 0.0f);
+        for (int64_t i = 0; i < static_cast<int64_t>(values.size()); ++i) {
+            values[static_cast<size_t>(i)] = (generated + i) >= min_new_tokens ? 1.0f : 0.0f;
+        }
+        return values;
+    };
+    auto emit_many = [&](const int64_t* first_codes, const int64_t* codes, int64_t frame_count) {
+        if (!first_codes || !codes || stop || generated >= max_new_tokens || frame_count <= 0) {
+            return;
+        }
+        for (int64_t frame = 0; frame < frame_count && !stop && generated < max_new_tokens; ++frame) {
+            const int64_t* first_code = first_codes + frame;
+            const int64_t* frame_codes = codes + frame * num_code_groups;
+            if (*first_code == eos_token_id && generated >= min_new_tokens) {
+                stop = true;
+                return;
+            }
+            if (out_codes) {
+                std::memcpy(
+                    out_codes + generated * num_code_groups,
+                    frame_codes,
+                    static_cast<size_t>(num_code_groups) * sizeof(int64_t));
+            }
+            if (callback) {
+                int callback_rc = 0;
+                double callback_ms = 0.0;
+                measure_ms(callback_ms, [&]() {
+                    callback_rc = callback(frame_codes, 1, num_code_groups, user_data);
+                });
+                runner->last_timing.codegen_callback_ms += callback_ms;
+                runner->last_timing.callback_ms += callback_ms;
+                if (callback_rc != 0) {
+                    throw std::runtime_error("native paged KV callback requested stop");
+                }
+            }
+            generated += 1;
+        }
+    };
+
+    auto run_step = [&](
+        ov::InferRequest& step_request,
+        const std::string& step_request_label,
+        const float* embeds,
+        int64_t seq_len,
+        int64_t position_start,
+        int64_t past_len,
+        const std::vector<float>& allow_eos_values,
+        const ov::Tensor* remote_input,
+        ov::Tensor* remote_output) {
+        measure_ms(runner->last_timing.tensor_bind_ms, [&]() {
+            bind_paged_step_inputs(
+                step_request,
+                embeds,
+                seq_len,
+                hidden_size,
+                position_start,
+                past_len,
+                runner->paged_kv_block_size,
+                tts_pad_embed,
+                allow_eos_values,
+                position_ids,
+                block_indices,
+                allow_eos_buffer,
+                beam_idx_buffer);
+            if (remote_input && static_cast<bool>(*remote_input)) {
+                step_request.set_tensor("inputs_embeds", *remote_input);
+            }
+            if (remote_output && static_cast<bool>(*remote_output)) {
+                step_request.set_output_tensor(2, *remote_output);
+            }
+        });
+        measure_ms(runner->last_timing.codegen_infer_ms, [&]() {
+            step_request.infer();
+        });
+        record_request_profile(runner, step_request_label, step_request);
+        if (runner->paged_split_subcode) {
+            auto logits_tensor = step_request.get_output_tensor(0);
+            auto last_hidden_tensor = step_request.get_output_tensor(1);
+            int64_t first_code = 0;
+            measure_ms(runner->last_timing.sampling_ms, [&]() {
+                first_code = select_first_code_from_logits(
+                    logits_tensor,
+                    generated,
+                    min_new_tokens,
+                    vocab_size,
+                    eos_token_id,
+                    use_repetition_penalty ? &repeated_first_codes : nullptr,
+                    repetition_penalty,
+                    &sampling,
+                    &rng);
+            });
+            if (first_code == eos_token_id && generated >= min_new_tokens) {
+                stop = true;
+                return;
+            }
+            std::vector<int64_t> frame_codes;
+            run_paged_split_subcode_step(
+                runner,
+                last_hidden_tensor,
+                first_code,
+                tts_pad_embed,
+                hidden_size,
+                num_code_groups,
+                frame_codes,
+                next_embed);
+            emit_many(&first_code, frame_codes.data(), 1);
+            if (
+                use_repetition_penalty &&
+                first_code >= 0 &&
+                static_cast<size_t>(first_code) < repeated_first_codes.size()) {
+                repeated_first_codes[static_cast<size_t>(first_code)] = 1;
+            }
+        } else {
+            auto first_codes_tensor = step_request.get_output_tensor(0);
+            auto codes_tensor = step_request.get_output_tensor(1);
+            auto frame_embed_tensor = step_request.get_output_tensor(2);
+            const int64_t output_frames = static_cast<int64_t>(codes_tensor.get_size()) / num_code_groups;
+            emit_many(tensor_data<int64_t>(first_codes_tensor), tensor_data<int64_t>(codes_tensor), output_frames);
+            if (!remote_output || !static_cast<bool>(*remote_output)) {
+                const float* frame_embed = tensor_data<float>(frame_embed_tensor);
+                std::memcpy(next_embed.data(), frame_embed, static_cast<size_t>(hidden_size) * sizeof(float));
+            }
+        }
+    };
+
+    ov::Tensor* current_remote_output = remote_embed.enabled ? &remote_embed.decode_outputs[0] : nullptr;
+    const ov::Tensor* next_remote_input = nullptr;
+    run_step(
+        prefill_request,
+        "codegen_paged_kv_prefill",
+        sequence,
+        prompt_len,
+        0,
+        0,
+        make_allow_eos_values(graph_unroll),
+        nullptr,
+        current_remote_output);
+    if (remote_embed.enabled) {
+        next_remote_input = current_remote_output;
+        remote_embed.next_decode_output = 1;
+    }
+    while (!stop && generated < max_new_tokens) {
+        const int64_t position = prompt_len + generated - 1;
+        current_remote_output = remote_embed.enabled ? &remote_embed.decode_outputs[remote_embed.next_decode_output] : nullptr;
+        run_step(
+            *decode_request,
+            use_static_decode ? "codegen_paged_kv_decode_static" : "codegen_paged_kv_decode_dynamic",
+            next_embed.data(),
+            1,
+            position,
+            position,
+            make_allow_eos_values(graph_unroll),
+            next_remote_input,
+            current_remote_output);
+        if (remote_embed.enabled) {
+            next_remote_input = current_remote_output;
+            remote_embed.next_decode_output = 1 - remote_embed.next_decode_output;
+        }
+    }
+
+    *out_count = generated;
+    if (generated == 0) {
+        throw std::runtime_error("native paged KV codegen stopped before producing any codec token");
+    }
+    runner->last_timing.total_ms = elapsed_ms_since(started);
+    if (elapsed_ms) {
+        *elapsed_ms = runner->last_timing.total_ms;
+    }
+}
+
 void run_unroll4_statefulmask_impl(
     NativeCodegen* runner,
     const float* sequence,
@@ -1175,6 +2230,106 @@ public:
         m_runner.decode_request = m_runner.decode_model.create_infer_request();
     }
 
+    Qwen3TTSGenAIPipeline(
+        const char* paged_seed_xml,
+        const char* device,
+        const char* cache_dir,
+        const char* cache_mode,
+        const char* kv_cache_precision,
+        int64_t kv_heads,
+        int64_t kv_block_size,
+        int64_t kv_head_dim,
+        const char* subcode_xml = nullptr) {
+        if (!paged_seed_xml || !device) {
+            throw std::runtime_error("paged_seed_xml and device are required");
+        }
+        const bool split_subcode = subcode_xml && std::strlen(subcode_xml) > 0;
+        if (kv_heads <= 0 || kv_block_size <= 0 || kv_head_dim <= 0) {
+            throw std::runtime_error("invalid paged KV cache shape");
+        }
+        auto config = compile_config(cache_dir, cache_mode);
+        const std::string precision = kv_cache_precision && std::strlen(kv_cache_precision) > 0 ? kv_cache_precision : "f16";
+        const char* cache_input_precision_env = std::getenv("QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_INPUT_PRECISION");
+        const std::string cache_input_precision =
+            cache_input_precision_env && std::strlen(cache_input_precision_env) > 0
+                ? cache_input_precision_env
+                : "f32";
+        config[ov::hint::kv_cache_precision.name()] = parse_element_type(precision);
+        m_runner.profile_enabled = env_enabled("QWEN3_TTS_OV_NATIVE_PERF_COUNT", false);
+        m_runner.paged_kv_enabled = true;
+        m_runner.paged_kv_block_size = kv_block_size;
+        m_runner.paged_kv_heads = kv_heads;
+        m_runner.paged_kv_head_dim = kv_head_dim;
+        m_runner.paged_kv_precision = precision;
+        m_runner.paged_kv_cache_input_precision = cache_input_precision;
+        m_runner.paged_split_subcode = split_subcode;
+        m_runner.bucket = 0;
+        m_runner.unroll = parse_unroll_steps(paged_seed_xml);
+        auto model = convert_paged_kv_seed_model(
+            m_runner.core,
+            paged_seed_xml,
+            kv_heads,
+            kv_block_size,
+            kv_head_dim,
+            parse_element_type(cache_input_precision));
+        auto decode_model = model->clone();
+        const bool want_static_decode = env_enabled("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE", false);
+        const char* static_blocks_env = std::getenv("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_BLOCKS");
+        int64_t static_blocks = 128;
+        if (static_blocks_env && std::strlen(static_blocks_env) > 0) {
+            static_blocks = std::max<int64_t>(1, std::stoll(static_blocks_env));
+        }
+        const char* static_mode_env = std::getenv("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE_MODE");
+        std::string static_mode = lower_text(static_mode_env && std::strlen(static_mode_env) > 0 ? static_mode_env : "minimal");
+        if (static_mode != "minimal" && static_mode != "full") {
+            throw std::runtime_error("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE_MODE must be minimal or full");
+        }
+        m_runner.paged_static_decode_block_capacity = static_blocks;
+        m_runner.paged_static_decode_mode = want_static_decode ? static_mode : "dynamic";
+        bool static_decode_ready = false;
+        if (want_static_decode) {
+            try {
+                static_decode_ready = reshape_paged_decode_model(
+                    decode_model,
+                    kv_heads,
+                    kv_block_size,
+                    kv_head_dim,
+                    static_blocks,
+                    static_mode);
+            } catch (const std::exception& exc) {
+                static_decode_ready = false;
+                if (enabled_env("QWEN3_TTS_OV_NATIVE_DEBUG_GRAPH", false)) {
+                    std::cerr << "paged static decode reshape failed: " << exc.what() << std::endl;
+                }
+            }
+        }
+        m_runner.prefill_model = m_runner.core.compile_model(model, device, config);
+        m_runner.prefill_request = m_runner.prefill_model.create_infer_request();
+        if (static_decode_ready) {
+            try {
+                m_runner.decode_model = m_runner.core.compile_model(decode_model, device, config);
+                m_runner.decode_request = m_runner.decode_model.create_infer_request();
+                m_runner.paged_static_decode_enabled = true;
+            } catch (const std::exception& exc) {
+                m_runner.paged_static_decode_enabled = false;
+                m_runner.paged_static_decode_mode = "dynamic";
+                if (enabled_env("QWEN3_TTS_OV_NATIVE_DEBUG_GRAPH", false)) {
+                    std::cerr << "paged static decode compile failed: " << exc.what() << std::endl;
+                }
+            }
+        } else {
+            m_runner.paged_static_decode_mode = "dynamic";
+        }
+        if (split_subcode) {
+            const char* subcode_device_env = std::getenv("QWEN3_TTS_OV_NATIVE_SUBCODE_DEVICE");
+            const std::string subcode_device =
+                subcode_device_env && std::strlen(subcode_device_env) > 0 ? subcode_device_env : device;
+            auto subcode_config = compile_config(cache_dir, cache_mode);
+            m_runner.subcode_model = m_runner.core.compile_model(subcode_xml, subcode_device, subcode_config);
+            m_runner.subcode_request = m_runner.subcode_model.create_infer_request();
+        }
+    }
+
     NativeCodegen& runner() {
         return m_runner;
     }
@@ -1321,12 +2476,47 @@ public:
         int64_t vocab_size,
         int64_t num_code_groups,
         int64_t eos_token_id,
+        int64_t do_sample,
+        int64_t top_k,
+        float top_p,
+        float temperature,
+        uint64_t seed,
         int64_t* out_codes,
         int64_t* out_count,
         double* elapsed_ms,
         FrameCallback callback,
         void* user_data) {
         const auto config = make_generation_config(max_new_tokens, min_new_tokens, repetition_penalty, eos_token_id);
+        NativeSamplingConfig sampling;
+        sampling.do_sample = do_sample != 0;
+        sampling.top_k = top_k;
+        sampling.top_p = top_p;
+        sampling.temperature = temperature;
+        sampling.seed = seed;
+        if (m_runner.paged_kv_enabled) {
+            run_paged_kv_impl(
+                &m_runner,
+                sequence,
+                prompt_len,
+                hidden_size,
+                tts_pad_embed,
+                static_cast<int64_t>(config.max_new_tokens),
+                static_cast<int64_t>(config.min_new_tokens),
+                config.repetition_penalty,
+                vocab_size,
+                num_code_groups,
+                config.eos_token_id,
+                sampling,
+                out_codes,
+                out_count,
+                elapsed_ms,
+                callback,
+                user_data);
+            return;
+        }
+        if (sampling.do_sample) {
+            throw std::runtime_error("native stateful bucket codegen does not support do_sample=true");
+        }
         run_unroll4_statefulmask_impl(
             &m_runner,
             sequence,
@@ -1389,6 +2579,11 @@ public:
         int64_t vocab_size,
         int64_t num_code_groups,
         int64_t eos_token_id,
+        int64_t do_sample,
+        int64_t top_k,
+        float top_p,
+        float temperature,
+        uint64_t seed,
         const int64_t* prefix_codes,
         int64_t prefix_frames,
         AudioCallback callback,
@@ -1438,6 +2633,11 @@ public:
                 vocab_size,
                 num_code_groups,
                 eos_token_id,
+                do_sample,
+                top_k,
+                top_p,
+                temperature,
+                seed,
                 nullptr,
                 out_count,
                 elapsed_ms,
@@ -1469,6 +2669,11 @@ public:
         int64_t vocab_size,
         int64_t num_code_groups,
         int64_t eos_token_id,
+        int64_t do_sample,
+        int64_t top_k,
+        float top_p,
+        float temperature,
+        uint64_t seed,
         AudioCallback callback,
         void* user_data,
         int64_t* out_count,
@@ -1493,6 +2698,11 @@ public:
             vocab_size,
             num_code_groups,
             eos_token_id,
+            do_sample,
+            top_k,
+            top_p,
+            temperature,
+            seed,
             nullptr,
             0,
             callback,
@@ -1515,6 +2725,41 @@ public:
 
     void reset_profile() {
         m_runner.profile_ops.clear();
+    }
+
+    void release_run_buffers() {
+        m_runner.paged_kv_cache_tensors.clear();
+        m_runner.paged_kv_cache_tensors.shrink_to_fit();
+        m_runner.paged_kv_cache_tensor_blocks = 0;
+        m_runner.last_remote_embed_used = false;
+        m_runner.scratch.positions.clear();
+        m_runner.scratch.decode_cache_position.clear();
+        m_runner.scratch.attention_mask.clear();
+        m_runner.scratch.repeated_mask.clear();
+        m_runner.scratch.allow_eos.clear();
+        m_runner.scratch.penalty.clear();
+        m_runner.scratch.next_embed.clear();
+        if (static_cast<bool>(m_runner.prefill_model)) {
+            m_runner.prefill_request = m_runner.prefill_model.create_infer_request();
+        }
+        if (static_cast<bool>(m_runner.decode_model)) {
+            m_runner.decode_request = m_runner.decode_model.create_infer_request();
+        }
+        if (static_cast<bool>(m_runner.text_embedding_model)) {
+            m_runner.text_embedding_request = m_runner.text_embedding_model.create_infer_request();
+        }
+        if (static_cast<bool>(m_runner.codec_embedding_model)) {
+            m_runner.codec_embedding_request = m_runner.codec_embedding_model.create_infer_request();
+        }
+        if (static_cast<bool>(m_runner.subcode_model)) {
+            m_runner.subcode_request = m_runner.subcode_model.create_infer_request();
+        }
+        if (static_cast<bool>(m_runner.first_stream_decoder_model)) {
+            m_runner.first_stream_decoder_request = m_runner.first_stream_decoder_model.create_infer_request();
+        }
+        if (static_cast<bool>(m_runner.steady_stream_decoder_model)) {
+            m_runner.steady_stream_decoder_request = m_runner.steady_stream_decoder_model.create_infer_request();
+        }
     }
 
 private:
@@ -1543,6 +2788,64 @@ int qwen3_tts_codegen_create(
     });
 }
 
+int qwen3_tts_codegen_create_paged_kv(
+    const char* paged_seed_xml,
+    const char* device,
+    const char* cache_dir,
+    const char* cache_mode,
+    const char* kv_cache_precision,
+    int64_t kv_heads,
+    int64_t kv_block_size,
+    int64_t kv_head_dim,
+    void** out_handle,
+    char** error) {
+    return guarded(error, [&]() {
+        if (!paged_seed_xml || !device || !out_handle) {
+            throw std::runtime_error("paged_seed_xml, device, and out_handle are required");
+        }
+        auto pipeline = std::make_unique<Qwen3TTSGenAIPipeline>(
+            paged_seed_xml,
+            device,
+            cache_dir,
+            cache_mode,
+            kv_cache_precision,
+            kv_heads,
+            kv_block_size,
+            kv_head_dim);
+        *out_handle = pipeline.release();
+    });
+}
+
+int qwen3_tts_codegen_create_paged_kv_split(
+    const char* paged_talker_seed_xml,
+    const char* subcode_xml,
+    const char* device,
+    const char* cache_dir,
+    const char* cache_mode,
+    const char* kv_cache_precision,
+    int64_t kv_heads,
+    int64_t kv_block_size,
+    int64_t kv_head_dim,
+    void** out_handle,
+    char** error) {
+    return guarded(error, [&]() {
+        if (!paged_talker_seed_xml || !subcode_xml || !device || !out_handle) {
+            throw std::runtime_error("paged_talker_seed_xml, subcode_xml, device, and out_handle are required");
+        }
+        auto pipeline = std::make_unique<Qwen3TTSGenAIPipeline>(
+            paged_talker_seed_xml,
+            device,
+            cache_dir,
+            cache_mode,
+            kv_cache_precision,
+            kv_heads,
+            kv_block_size,
+            kv_head_dim,
+            subcode_xml);
+        *out_handle = pipeline.release();
+    });
+}
+
 int qwen3_tts_codegen_destroy(void* handle, char** error) {
     return guarded(error, [&]() {
         delete static_cast<Qwen3TTSGenAIPipeline*>(handle);
@@ -1561,6 +2864,11 @@ int qwen3_tts_codegen_run_unroll4_statefulmask(
     int64_t vocab_size,
     int64_t num_code_groups,
     int64_t eos_token_id,
+    int64_t do_sample,
+    int64_t top_k,
+    float top_p,
+    float temperature,
+    uint64_t seed,
     int64_t* out_codes,
     int64_t* out_count,
     double* elapsed_ms,
@@ -1580,6 +2888,11 @@ int qwen3_tts_codegen_run_unroll4_statefulmask(
             vocab_size,
             num_code_groups,
             eos_token_id,
+            do_sample,
+            top_k,
+            top_p,
+            temperature,
+            seed,
             out_codes,
             out_count,
             elapsed_ms,
@@ -1600,6 +2913,11 @@ int qwen3_tts_codegen_run_unroll4_statefulmask_stream(
     int64_t vocab_size,
     int64_t num_code_groups,
     int64_t eos_token_id,
+    int64_t do_sample,
+    int64_t top_k,
+    float top_p,
+    float temperature,
+    uint64_t seed,
     FrameCallback callback,
     void* user_data,
     int64_t* out_count,
@@ -1620,6 +2938,11 @@ int qwen3_tts_codegen_run_unroll4_statefulmask_stream(
             vocab_size,
             num_code_groups,
             eos_token_id,
+            do_sample,
+            top_k,
+            top_p,
+            temperature,
+            seed,
             nullptr,
             out_count,
             elapsed_ms,
@@ -1706,6 +3029,11 @@ int qwen3_tts_codegen_run_unroll4_statefulmask_audio_stream(
     int64_t vocab_size,
     int64_t num_code_groups,
     int64_t eos_token_id,
+    int64_t do_sample,
+    int64_t top_k,
+    float top_p,
+    float temperature,
+    uint64_t seed,
     const int64_t* prefix_codes,
     int64_t prefix_frames,
     AudioCallback callback,
@@ -1728,6 +3056,11 @@ int qwen3_tts_codegen_run_unroll4_statefulmask_audio_stream(
             vocab_size,
             num_code_groups,
             eos_token_id,
+            do_sample,
+            top_k,
+            top_p,
+            temperature,
+            seed,
             prefix_codes,
             prefix_frames,
             callback,
@@ -1750,6 +3083,11 @@ int qwen3_tts_codegen_run_voice_design_audio_stream(
     int64_t vocab_size,
     int64_t num_code_groups,
     int64_t eos_token_id,
+    int64_t do_sample,
+    int64_t top_k,
+    float top_p,
+    float temperature,
+    uint64_t seed,
     AudioCallback callback,
     void* user_data,
     int64_t* out_count,
@@ -1771,6 +3109,11 @@ int qwen3_tts_codegen_run_voice_design_audio_stream(
             vocab_size,
             num_code_groups,
             eos_token_id,
+            do_sample,
+            top_k,
+            top_p,
+            temperature,
+            seed,
             callback,
             user_data,
             out_count,
@@ -1817,6 +3160,15 @@ int qwen3_tts_codegen_get_last_timing_json(void* handle, char** out_json, char**
         if (!*out_json) {
             throw std::runtime_error("failed to allocate native timing JSON");
         }
+    });
+}
+
+int qwen3_tts_codegen_release_run_buffers(void* handle, char** error) {
+    return guarded(error, [&]() {
+        if (!handle) {
+            throw std::runtime_error("handle is required");
+        }
+        static_cast<Qwen3TTSGenAIPipeline*>(handle)->release_run_buffers();
     });
 }
 

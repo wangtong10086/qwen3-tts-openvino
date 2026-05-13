@@ -1,7 +1,10 @@
 import argparse
+from contextlib import contextmanager
+import gc
 import json
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -41,6 +44,7 @@ from .profiles import (
 
 PRETOKENIZE_REGEX = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
 NEG_INF = -3.4028234663852886e38
+_CACHE_SPACE_WARNED: set[str] = set()
 DEFAULT_STREAM_CHUNK_STRATEGIES = {
     "realtime": {
         "initial_chunk_frames": 8,
@@ -80,6 +84,119 @@ def normalize_preferred_cache_bucket(value) -> int | None:
         return None
     bucket = int(text)
     return bucket if bucket > 0 else None
+
+
+def env_flag_enabled(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def effective_paged_kv_unroll(requested: int | str | None, experimental_enabled: bool = False) -> int:
+    value = int(requested or 1)
+    if value > 1 and not experimental_enabled:
+        return 1
+    return max(1, value)
+
+
+def paged_kv_seed_uses_gqa(seed_key: str | None) -> bool:
+    key = str(seed_key or "")
+    return key.endswith("_gqa") or "_gqa_" in key
+
+
+def select_paged_kv_seed_key(
+    paged_seed_graphs: dict,
+    *,
+    prefer_gqa: bool = True,
+    split_subcode: bool = False,
+    requested_unroll: int = 1,
+    subcode_attention: str = "auto",
+) -> tuple[str, str, bool]:
+    """Select the paged-KV seed graph key, effective subcode mode, and fallback flag."""
+    subcode_mode = str(subcode_attention or "auto").strip().lower().replace("-", "_")
+    if subcode_mode not in {"auto", "sdpa", "exact"}:
+        raise ValueError("QWEN3_TTS_OV_NATIVE_PAGED_KV_SUBCODE_ATTENTION must be one of: auto, sdpa, exact")
+    seed_key = (
+        ("talker_stateful_gqa" if prefer_gqa else "talker_stateful")
+        if split_subcode
+        else ("fused_cache_step_gqa" if prefer_gqa else "fused_cache_step")
+    )
+    if int(requested_unroll or 1) > 1 and not split_subcode:
+        unroll_key = (
+            f"fused_cache_step_unroll{int(requested_unroll)}_gqa"
+            if prefer_gqa
+            else f"fused_cache_step_unroll{int(requested_unroll)}"
+        )
+        if paged_seed_graphs.get(unroll_key):
+            seed_key = unroll_key
+    fallback = False
+    selected_subcode_attention = "split" if split_subcode else "sdpa"
+    if subcode_mode == "exact" and not split_subcode:
+        exact_key = f"{seed_key}_subcode_exact"
+        if paged_seed_graphs.get(exact_key):
+            seed_key = exact_key
+            selected_subcode_attention = "exact"
+        else:
+            non_gqa_exact_key = exact_key.replace("_gqa", "")
+            if prefer_gqa and paged_seed_graphs.get(non_gqa_exact_key):
+                seed_key = non_gqa_exact_key
+                selected_subcode_attention = "exact"
+            else:
+                fallback = True
+    elif subcode_mode == "exact" and split_subcode:
+        fallback = True
+    if not paged_seed_graphs.get(seed_key):
+        non_gqa_key = seed_key.replace("_gqa", "")
+        if prefer_gqa and paged_seed_graphs.get(non_gqa_key):
+            seed_key = non_gqa_key
+    return seed_key, selected_subcode_attention, fallback
+
+
+@contextmanager
+def temporary_env(updates: dict[str, str | None]):
+    previous = {key: os.environ.get(key) for key in updates}
+    try:
+        for key, value in updates.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def usable_ov_cache_dir(cache_dir: str | Path | None) -> Path | None:
+    if cache_dir is None:
+        return None
+    try:
+        min_free_gb = float(os.environ.get("QWEN3_TTS_OV_CACHE_MIN_FREE_GB") or "4")
+    except ValueError:
+        min_free_gb = 4.0
+    if min_free_gb <= 0:
+        return Path(cache_dir).expanduser()
+    path = Path(cache_dir).expanduser()
+    probe = path
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    try:
+        free_bytes = shutil.disk_usage(probe).free
+    except Exception:
+        return path
+    min_free_bytes = int(min_free_gb * 1024 * 1024 * 1024)
+    if free_bytes >= min_free_bytes:
+        return path
+    warning_key = str(path)
+    if warning_key not in _CACHE_SPACE_WARNED:
+        _CACHE_SPACE_WARNED.add(warning_key)
+        print(
+            f"warning: disabling OpenVINO cache for this compile because {path} has "
+            f"{free_bytes / (1024 ** 3):.2f} GiB free, below QWEN3_TTS_OV_CACHE_MIN_FREE_GB={min_free_gb:g}",
+            flush=True,
+        )
+    return None
 
 
 @dataclass
@@ -248,11 +365,12 @@ def compile_model(
     ov_cache_mode: str | None = "optimize_speed",
     disable_ov_cache: bool = False,
 ):
+    cache_dir = None if disable_ov_cache else usable_ov_cache_dir(cache_dir)
     config = {
         "INFERENCE_PRECISION_HINT": precision_hint,
     }
-    config.update(build_ov_cache_config(cache_dir, ov_cache_mode=ov_cache_mode, disable_ov_cache=disable_ov_cache))
-    if cache_dir is not None and not disable_ov_cache:
+    config.update(build_ov_cache_config(cache_dir, ov_cache_mode=ov_cache_mode, disable_ov_cache=False))
+    if cache_dir is not None:
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
     if extra_config:
         config.update({key: value for key, value in extra_config.items() if value is not None})
@@ -422,6 +540,9 @@ class OpenVINOQwen3TTS:
         disable_ov_cache: bool = False,
         native_codegen: str | None = None,
         native_pipeline: str | None = None,
+        native_paged_kv: str | None = None,
+        native_paged_kv_gqa: str | bool | None = None,
+        native_paged_kv_split_subcode: str | bool | None = None,
         calibration_dir: str | None = None,
         calibration_limit: int = 64,
         profile: bool = False,
@@ -452,6 +573,13 @@ class OpenVINOQwen3TTS:
         self.stream_pipeline_decode = True
         self.native_codegen_override = None if native_codegen is None else str(native_codegen).strip().lower()
         self.native_pipeline_override = None if native_pipeline is None else str(native_pipeline).strip().lower()
+        self.native_paged_kv_override = None if native_paged_kv is None else str(native_paged_kv).strip().lower()
+        self.native_paged_kv_gqa_override = (
+            None if native_paged_kv_gqa is None else str(native_paged_kv_gqa).strip().lower()
+        )
+        self.native_paged_kv_split_subcode_override = (
+            None if native_paged_kv_split_subcode is None else str(native_paged_kv_split_subcode).strip().lower()
+        )
         self.paged_kv_enabled = False
         self.paged_kv_backend = "stateful_bucket"
         self.paged_kv_unavailable_reason = (
@@ -460,12 +588,29 @@ class OpenVINOQwen3TTS:
         )
         if mode == "fastest":
             fastest = fastest_runtime_defaults()
+            mode = fastest["mode"]
+            cache_kernel = fastest["cache_kernel"]
+            cache_step = fastest["cache_step"]
+            graph_variant = fastest["graph_variant"]
             codegen_unroll = fastest["codegen_unroll"]
             codegen_schedule = fastest["codegen_schedule"]
             codegen_decode_unroll = fastest["codegen_decode_unroll"]
             preferred_cache_bucket = fastest["preferred_cache_bucket"]
             os.environ["QWEN3_TTS_OV_NATIVE_PIPELINE"] = "require"
-            os.environ["QWEN3_TTS_OV_NATIVE_BUFFER_REUSE"] = "1"
+            os.environ["QWEN3_TTS_OV_NATIVE_BUFFER_REUSE"] = "1" if fastest["native_buffer_reuse"] == "on" else "0"
+            os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV"] = fastest["native_paged_kv"]
+            os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA"] = (
+                "1" if fastest["native_paged_kv_gqa"] == "on" else "0"
+            )
+            os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION"] = fastest["native_paged_kv_precision"]
+            os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE"] = str(fastest["native_paged_kv_block_size"])
+            os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE"] = (
+                "1" if fastest["native_paged_kv_split_subcode"] == "on" else "0"
+            )
+            os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION"] = (
+                "1" if fastest["native_paged_kv_score_aggregation"] == "on" else "0"
+            )
+            os.environ["QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE"] = fastest["native_codegen_device"]
         self.requested_mode = mode
         mode, cache_kernel, cache_step, graph_variant = effective_runtime_options(
             mode,
@@ -560,9 +705,15 @@ class OpenVINOQwen3TTS:
         self.calibration_counts = {}
         if self.calibration_dir is not None:
             self.calibration_dir.mkdir(parents=True, exist_ok=True)
-        if self.mode == "cache" and not self.cache_bucket_graphs:
+        native_pipeline_required = self._native_pipeline_mode() == "require"
+        if self.mode == "cache" and not self.cache_bucket_graphs and not native_pipeline_required:
             raise ValueError(f"cache mode requested, but manifest has no {self.cache_kernel!r} stateful talker graph")
-        if self.mode == "cache" and self.cache_step == "fused" and not self.fused_cache_bucket_graphs:
+        if (
+            self.mode == "cache"
+            and self.cache_step == "fused"
+            and not self.fused_cache_bucket_graphs
+            and not native_pipeline_required
+        ):
             raise ValueError(f"cache_step=fused requested, but manifest has no {self.cache_kernel!r} fused cache graph")
         if self.mode == "fused-no-cache" and "fused_no_cache_step" not in self.manifest.get("graphs", {}):
             raise ValueError("fused-no-cache mode requested, but manifest has no fused_no_cache_step graph")
@@ -596,12 +747,13 @@ class OpenVINOQwen3TTS:
         self.fused_step = None
         self.fused_request = None
         self.last_codegen_info = {}
-        if self.mode == "fused-no-cache":
+        compile_python_codegen_core = not native_pipeline_required
+        if compile_python_codegen_core and self.mode == "fused-no-cache":
             self.fused_step = compile_model(
                 self.core, self.ir_dir / self.graph_name(graphs, "fused_no_cache_step"), device, self.cache_dir, allow_cpu_fallback, ov_profile, self.precision_hint, self.compile_config
             )
             self.fused_request = self.fused_step.create_infer_request()
-        elif self.mode != "cache":
+        elif compile_python_codegen_core and self.mode != "cache":
             self.talker = compile_model(
                 self.core,
                 self.ir_dir / self.graph_name(graphs, "talker"),
@@ -615,7 +767,11 @@ class OpenVINOQwen3TTS:
             self.talker_request = self.talker.create_infer_request()
         self.subcode_greedy = None
         self.subcode_request = None
-        if self.mode != "fused-no-cache" and not (self.mode == "cache" and self.cache_step == "fused"):
+        if (
+            compile_python_codegen_core
+            and self.mode != "fused-no-cache"
+            and not (self.mode == "cache" and self.cache_step == "fused")
+        ):
             subcode_graph = self.graph_name(graphs, "subcode_greedy")
             self.subcode_graph_name = subcode_graph
             self.subcode_greedy = compile_model(
@@ -1101,6 +1257,24 @@ class OpenVINOQwen3TTS:
             return self.native_pipeline_override
         return str(os.environ.get("QWEN3_TTS_OV_NATIVE_PIPELINE", "")).strip().lower()
 
+    def _native_paged_kv_mode(self) -> str:
+        if self.native_paged_kv_override is not None:
+            return self.native_paged_kv_override
+        return str(os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV", "")).strip().lower()
+
+    def _native_paged_kv_gqa_enabled(self) -> bool:
+        value = (
+            self.native_paged_kv_gqa_override
+            if self.native_paged_kv_gqa_override is not None
+            else str(os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA", "1")).strip().lower()
+        )
+        return value not in {"0", "false", "off", "no"}
+
+    def _native_paged_kv_split_subcode_enabled(self) -> bool:
+        if self.native_paged_kv_split_subcode_override is not None:
+            return self.native_paged_kv_split_subcode_override in {"1", "true", "on", "yes", "require"}
+        return env_flag_enabled(os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE"))
+
     def _try_generate_codes_native_unroll4_statefulmask(
         self,
         sequence: np.ndarray,
@@ -1162,7 +1336,7 @@ class OpenVINOQwen3TTS:
             prefill_graph = self.ir_dir / prefill_graphs[bucket]
             decode_graph = self.ir_dir / decode_graphs[bucket]
             cache_mode = str(self.compile_config.get("CACHE_MODE", "OPTIMIZE_SPEED"))
-            cache_dir = None if self.disable_ov_cache else self.cache_dir
+            cache_dir = None if self.disable_ov_cache else usable_ov_cache_dir(self.cache_dir)
             key = (
                 str(prefill_graph),
                 str(decode_graph),
@@ -1280,20 +1454,37 @@ class OpenVINOQwen3TTS:
         voice_clone_prompt: VoiceClonePromptItem | None = None,
         ref_text: str | None = None,
         prefix_codes: np.ndarray | None = None,
+        append_prefix_codes_to_prompt: bool = False,
         do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
     ):
         native_mode = self._native_pipeline_mode()
         if native_mode not in {"1", "true", "on", "require"}:
             return None
         require = native_mode == "require"
         try:
-            if do_sample:
-                raise RuntimeError("native audio pipeline currently supports greedy decoding only")
-            if self.mode != "cache" or self.cache_step != "fused":
+            paged_kv_requested = self._native_paged_kv_mode() in {"1", "true", "on", "yes", "require"}
+            if not paged_kv_requested and (self.mode != "cache" or self.cache_step != "fused"):
                 raise RuntimeError("native audio pipeline requires cache + fused mode")
             initial_unroll = self.select_codegen_unroll_for_step(0)
-            if initial_unroll <= 1 or self.codegen_schedule != "current":
-                raise RuntimeError("native audio pipeline currently requires codegen_unroll>1 and codegen_schedule=current")
+            if not paged_kv_requested and self.codegen_schedule != "current":
+                raise RuntimeError("native audio pipeline currently requires codegen_schedule=current")
+            if not paged_kv_requested and initial_unroll <= 1:
+                requested_unroll = self.codegen_unroll
+                available_unrolls = sorted(
+                    set(self.fused_cache_unroll_bucket_graphs_by_step)
+                    | set(self.fused_cache_decode_unroll_bucket_graphs_by_step)
+                    | set(self.fused_cache_decode_unroll_stateful_mask_bucket_graphs_by_step)
+                    | set(self.fused_cache_unroll_norepeat_bucket_graphs_by_step)
+                    | set(self.fused_cache_decode_unroll_norepeat_bucket_graphs_by_step)
+                )
+                available = ", ".join(str(item) for item in available_unrolls) or "none"
+                raise RuntimeError(
+                    f"native audio pipeline requires an available codegen_unroll>1 graph; "
+                    f"requested {requested_unroll}, available unrolls: {available}"
+                )
             decode_unroll_enabled = self.codegen_decode_unroll in {"auto", "on"} and self.codegen_schedule == "current"
             no_repeat_codegen = abs(float(repetition_penalty) - 1.0) <= 1e-6
             if is_fastest_or_norepeat_mode(self.requested_mode) and not no_repeat_codegen:
@@ -1303,7 +1494,7 @@ class OpenVINOQwen3TTS:
                 or self.fused_cache_decode_unroll_stateful_mask_bucket_graphs_by_step.get(initial_unroll, {})
                 or self.fused_cache_decode_unroll_norepeat_bucket_graphs_by_step.get(initial_unroll, {})
             )
-            if not decode_unroll_enabled or not decode_unroll_graph_available:
+            if not paged_kv_requested and (not decode_unroll_enabled or not decode_unroll_graph_available):
                 raise RuntimeError("native audio pipeline requires codegen_decode_unroll=auto/on and decode-unroll graphs")
 
             stream_config = self._resolve_stream_chunk_config(
@@ -1355,50 +1546,183 @@ class OpenVINOQwen3TTS:
                     voice_clone_prompt=voice_clone_prompt,
                     ref_text=ref_text,
                 )
-                prompt_len = int(sequence.shape[1])
+                if append_prefix_codes_to_prompt:
+                    sequence = self.append_prefix_code_frames_to_prompt(sequence, tts_pad_embed, prefix_codes)
+            prompt_len = int(sequence.shape[1])
             unroll_required_len = self.unroll_required_cache_len(prompt_len, max_new_tokens, initial_unroll)
-            no_repeat_prefill_graphs = self.fused_cache_unroll_norepeat_bucket_graphs_by_step.get(initial_unroll, {})
-            no_repeat_decode_graphs = self.fused_cache_decode_unroll_norepeat_bucket_graphs_by_step.get(initial_unroll, {})
-            use_no_repeat_graphs = bool(no_repeat_codegen and no_repeat_prefill_graphs and no_repeat_decode_graphs)
-            if is_fastest_or_norepeat_mode(self.requested_mode) and not use_no_repeat_graphs:
-                raise RuntimeError(
-                    f"{self.requested_mode} requires unroll{initial_unroll} no-repeat prefill and decode-unroll graphs"
+            if paged_kv_requested:
+                paged_seed_graphs = dict((self.manifest.get("graphs", {}) or {}).get("paged_kv_seed", {}) or {})
+                paged_seed_graphs.update((self.variant_graphs or {}).get("paged_kv_seed", {}) or {})
+                paged_meta = self.manifest.get("paged_kv") or {}
+                native_async_env = os.environ.get("QWEN3_TTS_OV_NATIVE_ASYNC_DECODE")
+                effective_native_async_decode = (
+                    env_flag_enabled(native_async_env)
+                    if native_async_env is not None
+                    else False
                 )
-            prefill_graphs = (
-                no_repeat_prefill_graphs
-                if use_no_repeat_graphs
-                else self.fused_cache_unroll_bucket_graphs_by_step.get(initial_unroll, {})
-            )
-            decode_graphs = (
-                no_repeat_decode_graphs
-                if use_no_repeat_graphs
-                else self.fused_cache_decode_unroll_stateful_mask_bucket_graphs_by_step.get(initial_unroll, {})
-            )
-            if not prefill_graphs or not decode_graphs:
-                raise RuntimeError(
-                    f"native audio pipeline requires unroll{initial_unroll} prefill and decode-unroll graphs"
+                prefer_gqa = self._native_paged_kv_gqa_enabled()
+                paged_split_subcode = self._native_paged_kv_split_subcode_enabled()
+                if do_sample and not paged_split_subcode:
+                    raise RuntimeError("native paged-KV sampling requires split-subcode mode")
+                requested_paged_unroll = int(
+                    os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_UNROLL")
+                    or paged_meta.get("default_unroll")
+                    or 1
                 )
-            bucket = self.select_runtime_bucket(
-                prefill_graphs,
-                unroll_required_len,
-                (),
-                preferred_min_bucket=self.preferred_cache_bucket,
-            )
-            if bucket is None or bucket not in decode_graphs:
-                raise RuntimeError("no native audio pipeline bucket can satisfy requested generation length")
+                paged_unroll_experimental = env_flag_enabled(
+                    os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_EXPERIMENTAL_UNROLL")
+                )
+                requested_paged_unroll = effective_paged_kv_unroll(
+                    requested_paged_unroll,
+                    experimental_enabled=paged_unroll_experimental,
+                )
+                if paged_split_subcode:
+                    requested_paged_unroll = 1
+                subcode_attention = (
+                    str(os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SUBCODE_ATTENTION") or "auto")
+                    .strip()
+                    .lower()
+                    .replace("-", "_")
+                )
+                paged_seed_key, selected_subcode_attention, paged_subcode_attention_fallback = select_paged_kv_seed_key(
+                    paged_seed_graphs,
+                    prefer_gqa=prefer_gqa,
+                    split_subcode=paged_split_subcode,
+                    requested_unroll=requested_paged_unroll,
+                    subcode_attention=subcode_attention,
+                )
+                paged_seed_graph = paged_seed_graphs.get(paged_seed_key)
+                if not paged_seed_graph:
+                    raise RuntimeError(
+                        "native paged-KV pipeline requires graphs.paged_kv_seed.fused_cache_step[_gqa] "
+                        "or talker_stateful[_gqa] for split-subcode mode; "
+                        "export with --export-paged-kv-seed"
+                )
+                paged_split_subcode_graph = None
+                if paged_split_subcode:
+                    graphs_root = self.manifest["graphs"]
+                    split_subcode_mode = (
+                        str(os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE_MODE") or "cached")
+                        .strip()
+                        .lower()
+                    )
+                    if split_subcode_mode not in {"cached", "recompute", "cached_exact", "recompute_exact"}:
+                        raise RuntimeError(
+                            "QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE_MODE must be one of: "
+                            "cached, recompute, cached_exact, recompute_exact"
+                        )
+                    if split_subcode_mode == "recompute_exact":
+                        subcode_graph_name = (
+                            (self.variant_graphs or {}).get("subcode_greedy_exact")
+                            or graphs_root.get("subcode_greedy_exact")
+                        )
+                    elif split_subcode_mode == "cached_exact":
+                        subcode_graph_name = (
+                            (self.variant_graphs or {}).get("subcode_greedy_cached_exact")
+                            or graphs_root.get("subcode_greedy_cached_exact")
+                        )
+                    elif split_subcode_mode == "recompute":
+                        subcode_graph_name = (
+                            (self.variant_graphs or {}).get("subcode_greedy")
+                            or graphs_root.get("subcode_greedy")
+                            or (self.variant_graphs or {}).get("subcode_greedy_cached")
+                            or graphs_root.get("subcode_greedy_cached")
+                        )
+                    else:
+                        subcode_graph_name = (
+                            (self.variant_graphs or {}).get("subcode_greedy_cached")
+                            or graphs_root.get("subcode_greedy_cached")
+                            or (self.variant_graphs or {}).get("subcode_greedy")
+                            or graphs_root.get("subcode_greedy")
+                        )
+                    if not subcode_graph_name and split_subcode_mode.endswith("_exact"):
+                        raise RuntimeError(
+                            f"native paged-KV split-subcode mode {split_subcode_mode!r} requires "
+                            f"graphs.subcode_greedy{'_cached' if split_subcode_mode.startswith('cached') else ''}_exact; "
+                            "re-export with `--subcode-attention-kernels exact`"
+                        )
+                    if not subcode_graph_name:
+                        raise RuntimeError(
+                            "native paged-KV split-subcode mode requires graphs.subcode_greedy_cached "
+                            "or graphs.subcode_greedy"
+                    )
+                    paged_split_subcode_graph = self.ir_dir / subcode_graph_name
+                paged_kv_heads = int(
+                    paged_meta.get("kv_cache_gqa_heads" if paged_kv_seed_uses_gqa(paged_seed_key) else "kv_cache_heads")
+                    or (8 if paged_kv_seed_uses_gqa(paged_seed_key) else 16)
+                )
+                bucket = 0
+                use_no_repeat_graphs = False
+                prefill_graph = self.ir_dir / paged_seed_graph
+                decode_graph = prefill_graph
+            else:
+                no_repeat_prefill_graphs = self.fused_cache_unroll_norepeat_bucket_graphs_by_step.get(initial_unroll, {})
+                no_repeat_decode_graphs = self.fused_cache_decode_unroll_norepeat_bucket_graphs_by_step.get(initial_unroll, {})
+                use_no_repeat_graphs = bool(no_repeat_codegen and no_repeat_prefill_graphs and no_repeat_decode_graphs)
+                if is_fastest_or_norepeat_mode(self.requested_mode) and not use_no_repeat_graphs:
+                    raise RuntimeError(
+                        f"{self.requested_mode} requires unroll{initial_unroll} no-repeat prefill and decode-unroll graphs"
+                    )
+                prefill_graphs = (
+                    no_repeat_prefill_graphs
+                    if use_no_repeat_graphs
+                    else self.fused_cache_unroll_bucket_graphs_by_step.get(initial_unroll, {})
+                )
+                decode_graphs = (
+                    no_repeat_decode_graphs
+                    if use_no_repeat_graphs
+                    else self.fused_cache_decode_unroll_stateful_mask_bucket_graphs_by_step.get(initial_unroll, {})
+                )
+                if not prefill_graphs or not decode_graphs:
+                    raise RuntimeError(
+                        f"native audio pipeline requires unroll{initial_unroll} prefill and decode-unroll graphs"
+                    )
+                bucket = self.select_runtime_bucket(
+                    prefill_graphs,
+                    unroll_required_len,
+                    (),
+                    preferred_min_bucket=self.preferred_cache_bucket,
+                )
+                if bucket is None or bucket not in decode_graphs:
+                    raise RuntimeError("no native audio pipeline bucket can satisfy requested generation length")
+                prefill_graph = self.ir_dir / prefill_graphs[bucket]
+                decode_graph = self.ir_dir / decode_graphs[bucket]
+                effective_native_async_decode = env_flag_enabled(os.environ.get("QWEN3_TTS_OV_NATIVE_ASYNC_DECODE"))
 
             cache_mode = str(self.compile_config.get("CACHE_MODE", "OPTIMIZE_SPEED"))
-            cache_dir = None if self.disable_ov_cache else self.cache_dir
-            prefill_graph = self.ir_dir / prefill_graphs[bucket]
-            decode_graph = self.ir_dir / decode_graphs[bucket]
+            cache_dir = None if self.disable_ov_cache else usable_ov_cache_dir(self.cache_dir)
             first_decoder = self.ir_dir / first_decoder_graph
             steady_decoder = self.ir_dir / steady_decoder_graph
+            codegen_device = str(os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE") or self.device)
+            effective_paged_kv_precision = str(os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION") or "f16")
+            effective_paged_kv_cache_input_precision = str(
+                os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_INPUT_PRECISION") or "f32"
+            )
+            effective_paged_kv_score_aggregation = str(
+                os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION") or "1"
+            ).strip().lower() not in {"0", "false", "off", "no"}
+            effective_paged_kv_heads = int(
+                os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_HEADS")
+                or (paged_kv_heads if paged_kv_requested else 0)
+            )
+            effective_paged_kv_block_size = int(os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE") or 8)
+            effective_paged_kv_head_dim = int(os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_HEAD_DIM") or 128)
+            effective_paged_kv_static_decode = env_flag_enabled(
+                os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE")
+            )
+            effective_paged_kv_static_blocks = int(os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_BLOCKS") or 128)
+            effective_paged_kv_static_mode = str(
+                os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE_MODE") or "minimal"
+            ).strip().lower()
+            effective_paged_split_subcode = bool(paged_kv_requested and self._native_paged_kv_split_subcode_enabled())
             key = (
+                "paged_kv" if paged_kv_requested else "stateful_bucket",
                 str(prefill_graph),
                 str(decode_graph),
+                str(paged_split_subcode_graph or "") if paged_kv_requested else "",
                 str(first_decoder),
                 str(steady_decoder),
-                self.device,
+                codegen_device,
                 self.decoder_device,
                 str(cache_dir or ""),
                 cache_mode,
@@ -1406,6 +1730,16 @@ class OpenVINOQwen3TTS:
                 first_chunk,
                 steady_context,
                 steady_chunk,
+                effective_paged_kv_precision if paged_kv_requested else "",
+                effective_paged_kv_cache_input_precision if paged_kv_requested else "",
+                effective_paged_kv_score_aggregation if paged_kv_requested else False,
+                effective_paged_kv_heads if paged_kv_requested else 0,
+                effective_paged_kv_block_size if paged_kv_requested else 0,
+                effective_paged_kv_head_dim if paged_kv_requested else 0,
+                effective_paged_kv_static_decode if paged_kv_requested else False,
+                effective_paged_kv_static_blocks if paged_kv_requested else 0,
+                effective_paged_kv_static_mode if paged_kv_requested else "",
+                effective_paged_split_subcode,
             )
             if key not in self.native_audio_runners:
                 from .native_codegen import NativeCodegenRunner
@@ -1414,9 +1748,15 @@ class OpenVINOQwen3TTS:
                 runner = NativeCodegenRunner(
                     prefill_graph=prefill_graph,
                     decode_graph=decode_graph,
-                    device=self.device,
+                    device=codegen_device,
                     cache_dir=cache_dir,
                     cache_mode=cache_mode,
+                    paged_kv=paged_kv_requested,
+                    kv_cache_precision=effective_paged_kv_precision,
+                    kv_cache_heads=effective_paged_kv_heads,
+                    kv_cache_block_size=effective_paged_kv_block_size,
+                    kv_cache_head_dim=effective_paged_kv_head_dim,
+                    paged_kv_subcode_graph=paged_split_subcode_graph if effective_paged_split_subcode else None,
                 )
                 runner.set_stream_decoders(
                     first_decoder_graph=first_decoder,
@@ -1433,9 +1773,11 @@ class OpenVINOQwen3TTS:
                 )
                 self.native_audio_runners[key] = runner
                 print(
-                    f"compiled native GenAI C++ audio pipeline bucket {bucket} "
+                    f"compiled native GenAI C++ audio pipeline "
+                    f"{'paged-kv' if paged_kv_requested else f'bucket {bucket}'} "
                     f"stream c{first_context}_t{first_chunk}/c{steady_context}_t{steady_chunk} "
-                    f"on {self.device}/{self.decoder_device} in {time.time() - started:.1f}s",
+                    f"on {codegen_device}/{self.decoder_device} "
+                    f"in {time.time() - started:.1f}s",
                     flush=True,
                 )
             runner = self.native_audio_runners[key]
@@ -1463,14 +1805,49 @@ class OpenVINOQwen3TTS:
                 "preferred_cache_bucket": self.preferred_cache_bucket,
                 "selected_codegen_graph": str(decode_graph.name),
                 "selected_prefill_graph": str(prefill_graph.name),
+                "selected_paged_split_subcode_graph": (
+                    str(paged_split_subcode_graph.name) if paged_kv_requested and paged_split_subcode_graph else None
+                ),
+                "paged_kv_split_subcode_mode": (
+                    split_subcode_mode if paged_kv_requested and paged_split_subcode else None
+                ),
+                "paged_kv_seed_key": paged_seed_key if paged_kv_requested else None,
+                "paged_kv_gqa": bool(paged_kv_requested and paged_kv_seed_uses_gqa(paged_seed_key)),
+                "paged_kv_split_subcode": bool(effective_paged_split_subcode) if paged_kv_requested else None,
+                "paged_kv_subcode_attention": (
+                    selected_subcode_attention
+                    if paged_kv_requested and not paged_split_subcode
+                    else ("split" if paged_kv_requested and paged_split_subcode else None)
+                ),
+                "paged_kv_subcode_attention_requested": subcode_attention if paged_kv_requested else None,
+                "paged_kv_subcode_attention_fallback": bool(
+                    paged_kv_requested and paged_subcode_attention_fallback
+                ),
+                "paged_kv_unroll": int(requested_paged_unroll) if paged_kv_requested else None,
+                "paged_kv_unroll_experimental": bool(paged_kv_requested and requested_paged_unroll > 1),
+                "paged_kv_heads": int(effective_paged_kv_heads) if paged_kv_requested else None,
+                "paged_kv_block_size": int(effective_paged_kv_block_size) if paged_kv_requested else None,
+                "paged_kv_precision": effective_paged_kv_precision if paged_kv_requested else None,
+                "paged_kv_cache_input_precision": (
+                    effective_paged_kv_cache_input_precision if paged_kv_requested else None
+                ),
+                "paged_kv_score_aggregation": effective_paged_kv_score_aggregation if paged_kv_requested else None,
+                "paged_kv_static_decode_requested": bool(effective_paged_kv_static_decode) if paged_kv_requested else None,
+                "paged_kv_static_decode": bool(effective_paged_kv_static_decode) if paged_kv_requested else None,
+                "paged_kv_static_blocks": int(effective_paged_kv_static_blocks) if paged_kv_requested else None,
+                "paged_kv_static_decode_mode": effective_paged_kv_static_mode if paged_kv_requested else None,
                 "codegen_graph_kind": (
-                    "native_audio_pipeline_decode_unroll_norepeat"
-                    if use_no_repeat_graphs
-                    else "native_audio_pipeline_decode_unroll_statefulmask"
+                    "native_audio_pipeline_paged_kv"
+                    if paged_kv_requested
+                    else (
+                        "native_audio_pipeline_decode_unroll_norepeat"
+                        if use_no_repeat_graphs
+                        else "native_audio_pipeline_decode_unroll_statefulmask"
+                    )
                 ),
                 "codegen_schedule": self.codegen_schedule,
                 "scheduled_unrolls": list(self.codegen_schedule_unrolls),
-                "active_codegen_unroll": int(initial_unroll),
+                "active_codegen_unroll": int(requested_paged_unroll if paged_kv_requested else initial_unroll),
                 "codegen_decode_unroll": self.codegen_decode_unroll,
                 "decode_unroll_graph_available": True,
                 "decode_unroll_available": True,
@@ -1478,9 +1855,15 @@ class OpenVINOQwen3TTS:
                 "codegen_no_repeat": bool(use_no_repeat_graphs),
                 "native_codegen": True,
                 "native_audio_pipeline": True,
+                "paged_kv": bool(paged_kv_requested),
+                "paged_kv_backend": "native_paged_attention" if paged_kv_requested else "stateful_bucket",
                 "native_prompt_pipeline": bool(native_prompt_pipeline),
+                "native_async_decode": bool(effective_native_async_decode),
                 "native_streaming_callbacks": True,
             }
+            self.paged_kv_enabled = bool(paged_kv_requested)
+            self.paged_kv_backend = "native_paged_attention" if paged_kv_requested else "stateful_bucket"
+            self.paged_kv_unavailable_reason = "" if paged_kv_requested else self.paged_kv_unavailable_reason
 
             def _iter_audio_chunks():
                 chunk_index = 0
@@ -1501,6 +1884,10 @@ class OpenVINOQwen3TTS:
                         vocab_size=int(self.ids["vocab_size"]),
                         num_code_groups=self.num_code_groups,
                         eos_token_id=int(self.ids["codec_eos_token_id"]),
+                        do_sample=do_sample,
+                        top_k=top_k,
+                        top_p=top_p,
+                        temperature=temperature,
                     )
                 else:
                     source_iter = runner.iter_audio_chunks(
@@ -1513,6 +1900,10 @@ class OpenVINOQwen3TTS:
                         num_code_groups=self.num_code_groups,
                         eos_token_id=int(self.ids["codec_eos_token_id"]),
                         prefix_codes=prefix_codes,
+                        do_sample=do_sample,
+                        top_k=top_k,
+                        top_p=top_p,
+                        temperature=temperature,
                     )
                 for item in source_iter:
                     audio = np.asarray(item["audio"], dtype=np.float32)
@@ -1529,6 +1920,12 @@ class OpenVINOQwen3TTS:
                     stream_rtf = (stream_elapsed_ms / stream_audio_ms) if stream_audio_ms > 0 else 0.0
                     stream_compute_rtf = (stream_compute_ms / stream_audio_ms) if stream_audio_ms > 0 else 0.0
                     is_final = bool(item.get("is_final", False))
+                    native_timing = item.get("native_timing")
+                    if paged_kv_requested and isinstance(native_timing, dict):
+                        static_mode = str(native_timing.get("paged_static_decode_mode") or "dynamic")
+                        actual_static_decode = bool(native_timing.get("paged_static_decode_enabled")) and static_mode != "dynamic"
+                    else:
+                        actual_static_decode = None
                     timings = {
                         **self.timings.snapshot(emitted_frames),
                         **dict(getattr(self, "last_codegen_info", {}) or {}),
@@ -1550,15 +1947,22 @@ class OpenVINOQwen3TTS:
                         "queue_wait_ms": 0.0,
                         "producer_lag_ms": max(0.0, codegen_ms - audio_ms),
                         "strategy": stream_config["strategy"],
-                        "codegen_unroll": int(getattr(self, "codegen_unroll", 1)),
+                        "codegen_unroll": int((getattr(self, "last_codegen_info", {}) or {}).get("active_codegen_unroll", getattr(self, "codegen_unroll", 1))),
                         "unroll_fallback": False,
                         "initial_chunk_frames": int(first_chunk),
                         "configured_chunk_frames": int(steady_chunk),
                         "native_audio_pipeline": True,
                         "native_prompt_pipeline": bool(native_prompt_pipeline),
+                        "native_sampling": bool(do_sample and paged_kv_requested and effective_paged_split_subcode),
+                        "do_sample": bool(do_sample),
+                        "top_k": int(top_k),
+                        "top_p": float(top_p),
+                        "temperature": float(temperature),
                         "native_remote_embed": bool(item.get("remote_embed", getattr(runner, "last_remote_embed", False))),
                         "native_ov_profile": item.get("native_ov_profile"),
-                        "native_timing": item.get("native_timing"),
+                        "native_timing": native_timing,
+                        "paged_kv_static_decode_actual": actual_static_decode,
+                        "paged_kv_static_decode": actual_static_decode if paged_kv_requested else None,
                         "pipeline_decode": True,
                         "chunk_frames": int(codes.shape[0]),
                         "emitted_frames": int(emitted_frames),
@@ -1594,6 +1998,224 @@ class OpenVINOQwen3TTS:
                 raise
             print(f"warning: native GenAI C++ audio pipeline unavailable; falling back to Python runtime: {exc}", flush=True)
             return None
+
+    def close_native_audio_runners(self, runner_kind: str | None = None) -> int:
+        closed = 0
+        for key, runner in list(self.native_audio_runners.items()):
+            kind = key[0] if isinstance(key, tuple) and key else None
+            if runner_kind is not None and kind != runner_kind:
+                continue
+            self.native_audio_runners.pop(key, None)
+            try:
+                runner.close()
+            finally:
+                closed += 1
+        if closed:
+            gc.collect()
+        return closed
+
+    def release_native_audio_runner_buffers(self, runner_kind: str | None = None) -> int:
+        released = 0
+        for key, runner in list(self.native_audio_runners.items()):
+            kind = key[0] if isinstance(key, tuple) and key else None
+            if runner_kind is not None and kind != runner_kind:
+                continue
+            release = getattr(runner, "release_run_buffers", None)
+            if release is None:
+                continue
+            release()
+            released += 1
+        if released:
+            gc.collect()
+        return released
+
+    def _try_stream_native_hybrid_paged_audio_pipeline(
+        self,
+        *,
+        text: str,
+        instruct: str,
+        language: str,
+        max_new_tokens: int,
+        min_new_tokens: int,
+        repetition_penalty: float,
+        max_prompt_tokens: int,
+        chunk_frames: int | None = None,
+        left_context_frames: int | None = None,
+        initial_chunk_frames: int | None = None,
+        chunk_strategy: str | None = None,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+    ):
+        if not env_flag_enabled(os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID")):
+            return None
+        if (
+            str(os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV", "")).strip().lower()
+            in {"1", "true", "on", "yes", "require"}
+        ):
+            return None
+        if do_sample or abs(float(repetition_penalty) - 1.0) > 1e-6:
+            return None
+        if self.mode != "cache" or self.cache_step != "fused":
+            return None
+        try:
+            prefix_frames = int(os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID_PREFIX_FRAMES") or 48)
+        except ValueError:
+            prefix_frames = 48
+        prefix_frames = max(1, prefix_frames)
+        if max_new_tokens <= prefix_frames:
+            return None
+
+        with temporary_env({"QWEN3_TTS_OV_NATIVE_PAGED_KV": "0"}):
+            prefix_iter = self._try_stream_native_audio_pipeline(
+                text=text,
+                instruct=instruct,
+                language=language,
+                max_new_tokens=prefix_frames,
+                min_new_tokens=min(min_new_tokens, prefix_frames),
+                repetition_penalty=repetition_penalty,
+                max_prompt_tokens=max_prompt_tokens,
+                chunk_frames=chunk_frames,
+                left_context_frames=left_context_frames,
+                initial_chunk_frames=initial_chunk_frames,
+                chunk_strategy=chunk_strategy,
+                do_sample=do_sample,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+            )
+        if prefix_iter is None:
+            return None
+
+        def _iter_hybrid_chunks():
+            started = time.time()
+            total_audio_ms = 0.0
+            total_compute_ms = 0.0
+            emitted_frames = 0
+            chunk_index = 0
+            prefix_parts: list[np.ndarray] = []
+            eos_id = int(self.ids["codec_eos_token_id"])
+
+            def rewrite_chunk(chunk: StreamChunk, phase: str, is_final: bool | None = None) -> StreamChunk:
+                nonlocal chunk_index, total_audio_ms, total_compute_ms, emitted_frames
+                audio = np.asarray(chunk.audio, dtype=np.float32)
+                codes = np.asarray(chunk.codes, dtype=np.int64).reshape(-1, self.num_code_groups)
+                timings = dict(chunk.timings or {})
+                audio_ms = (
+                    float(timings.get("chunk_audio_ms", 0.0) or 0.0)
+                    or ((float(audio.shape[0]) / float(self.sample_rate) * 1000.0) if audio.size else 0.0)
+                )
+                codegen_ms = float(timings.get("codegen_ms", 0.0) or 0.0)
+                decode_ms = float(timings.get("decode_ms", 0.0) or 0.0)
+                compute_ms = (
+                    float(timings.get("chunk_compute_ms", 0.0) or 0.0)
+                    or codegen_ms + decode_ms
+                )
+                if audio_ms > 0:
+                    total_audio_ms += audio_ms
+                    total_compute_ms += compute_ms
+                emitted_frames += int(codes.shape[0])
+                stream_elapsed_ms = max(0.0, (time.time() - started) * 1000.0)
+                final_value = bool(chunk.is_final if is_final is None else is_final)
+                timings.update(
+                    {
+                        "hybrid_paged_kv": True,
+                        "hybrid_phase": phase,
+                        "hybrid_prefix_frames": int(prefix_frames),
+                        "hybrid_prefix_actual_frames": int(sum(part.shape[0] for part in prefix_parts)),
+                        "stream_audio_ms": total_audio_ms,
+                        "stream_compute_ms": total_compute_ms,
+                        "stream_elapsed_ms": stream_elapsed_ms,
+                        "stream_rtf": (stream_elapsed_ms / total_audio_ms) if total_audio_ms > 0 else 0.0,
+                        "stream_compute_rtf": (total_compute_ms / total_audio_ms) if total_audio_ms > 0 else 0.0,
+                        "chunk_compute_ms": compute_ms,
+                        "chunk_audio_ms": audio_ms,
+                        "rtf": (compute_ms / audio_ms) if audio_ms > 0 else 0.0,
+                        "chunk_frames": int(codes.shape[0]),
+                        "emitted_frames": int(emitted_frames),
+                        "is_final": final_value,
+                    }
+                )
+                out = StreamChunk(
+                    index=chunk_index,
+                    audio=audio,
+                    sample_rate=chunk.sample_rate,
+                    codes=codes,
+                    is_final=final_value,
+                    timings=timings,
+                )
+                chunk_index += 1
+                return out
+
+            saw_eos = False
+            last_prefix_chunk: StreamChunk | None = None
+            for chunk in prefix_iter:
+                codes = np.asarray(chunk.codes, dtype=np.int64).reshape(-1, self.num_code_groups)
+                if codes.size:
+                    prefix_parts.append(codes.copy())
+                    saw_eos = bool(saw_eos or np.any(codes[:, 0] == eos_id))
+                last_prefix_chunk = chunk
+                continue_after_prefix = (not saw_eos) and (sum(part.shape[0] for part in prefix_parts) < max_new_tokens)
+                yield rewrite_chunk(chunk, "fixed_prefix", is_final=(False if chunk.is_final and continue_after_prefix else chunk.is_final))
+                if chunk.is_final:
+                    break
+
+            if not prefix_parts:
+                if last_prefix_chunk is None:
+                    return
+                return
+            prefix = np.concatenate(prefix_parts, axis=0).astype(np.int64, copy=False)
+            if saw_eos or prefix.shape[0] >= max_new_tokens:
+                return
+
+            release_prefix_runner = (
+                str(os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID_RELEASE_PREFIX_RUNNER") or "1")
+                .strip()
+                .lower()
+                not in {"0", "false", "off", "no"}
+            )
+            released_prefix_runners = self.close_native_audio_runners("stateful_bucket") if release_prefix_runner else 0
+            remaining_tokens = int(max_new_tokens - prefix.shape[0])
+            remaining_min_tokens = max(0, int(min_new_tokens - prefix.shape[0]))
+            with temporary_env(
+                {
+                    "QWEN3_TTS_OV_NATIVE_PAGED_KV": "1",
+                    "QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA": os.environ.get(
+                        "QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA",
+                        "1",
+                    ),
+                }
+            ):
+                continuation_iter = self._try_stream_native_audio_pipeline(
+                    text=text,
+                    instruct=instruct,
+                    language=language,
+                    max_new_tokens=remaining_tokens,
+                    min_new_tokens=remaining_min_tokens,
+                    repetition_penalty=repetition_penalty,
+                    max_prompt_tokens=max_prompt_tokens,
+                    chunk_frames=chunk_frames,
+                    left_context_frames=left_context_frames,
+                    initial_chunk_frames=initial_chunk_frames,
+                    chunk_strategy=chunk_strategy,
+                    prefix_codes=prefix,
+                    append_prefix_codes_to_prompt=True,
+                    do_sample=do_sample,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                )
+            if continuation_iter is None:
+                raise RuntimeError("hybrid paged-KV continuation is unavailable after fixed-bucket prefix generation")
+            for chunk in continuation_iter:
+                rewritten = rewrite_chunk(chunk, "paged_continuation")
+                rewritten.timings["hybrid_released_prefix_runners"] = int(released_prefix_runners)
+                yield rewritten
+                if chunk.is_final:
+                    break
+
+        return _iter_hybrid_chunks()
 
     def ensure_subcode_greedy(self):
         if self.subcode_greedy is not None:
@@ -1799,6 +2421,29 @@ class OpenVINOQwen3TTS:
         prompt_parts.append(talker_input_embed)
         return np.concatenate(prompt_parts, axis=1), tts_pad_embed
 
+    def append_prefix_code_frames_to_prompt(
+        self,
+        sequence: np.ndarray,
+        tts_pad_embed: np.ndarray,
+        prefix_codes: np.ndarray | None,
+    ) -> np.ndarray:
+        if prefix_codes is None:
+            return sequence
+        prefix = np.asarray(prefix_codes, dtype=np.int64)
+        if prefix.size == 0:
+            return sequence
+        prefix = prefix.reshape(-1, self.num_code_groups)
+        if prefix.shape[1] != self.num_code_groups:
+            raise ValueError(f"prefix_codes must have {self.num_code_groups} code groups")
+        prefix_embeds = self.embed_code_frames(prefix) + tts_pad_embed
+        return np.concatenate(
+            [
+                np.asarray(sequence, dtype=np.float32),
+                np.asarray(prefix_embeds, dtype=np.float32),
+            ],
+            axis=1,
+        )
+
     def make_attention_mask(self, query_positions: np.ndarray, query_len: int, key_len: int | None = None):
         key_len = int(key_len or (int(query_positions.reshape(-1)[-1]) + 1))
         if key_len <= 0:
@@ -1887,6 +2532,8 @@ class OpenVINOQwen3TTS:
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        prefix_codes: np.ndarray | None = None,
+        append_prefix_codes_to_prompt: bool = False,
     ):
         frames = list(
             self.generate_codes_iter(
@@ -1905,6 +2552,8 @@ class OpenVINOQwen3TTS:
                 top_k=top_k,
                 top_p=top_p,
                 temperature=temperature,
+                prefix_codes=prefix_codes,
+                append_prefix_codes_to_prompt=append_prefix_codes_to_prompt,
             )
         )
         if not frames:
@@ -1928,6 +2577,8 @@ class OpenVINOQwen3TTS:
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        prefix_codes: np.ndarray | None = None,
+        append_prefix_codes_to_prompt: bool = False,
     ):
         if self.mode == "cache":
             cache_generator = (
@@ -1951,6 +2602,8 @@ class OpenVINOQwen3TTS:
                 top_k=top_k,
                 top_p=top_p,
                 temperature=temperature,
+                prefix_codes=prefix_codes,
+                append_prefix_codes_to_prompt=append_prefix_codes_to_prompt,
             )
             return
         if self.mode == "fused-no-cache":
@@ -1970,6 +2623,8 @@ class OpenVINOQwen3TTS:
                 top_k=top_k,
                 top_p=top_p,
                 temperature=temperature,
+                prefix_codes=prefix_codes,
+                append_prefix_codes_to_prompt=append_prefix_codes_to_prompt,
             )
             return
         yield from self.generate_codes_no_cache_iter(
@@ -1988,6 +2643,8 @@ class OpenVINOQwen3TTS:
             top_k=top_k,
             top_p=top_p,
             temperature=temperature,
+            prefix_codes=prefix_codes,
+            append_prefix_codes_to_prompt=append_prefix_codes_to_prompt,
         )
 
     def generate_codes_no_cache_iter(
@@ -2007,6 +2664,8 @@ class OpenVINOQwen3TTS:
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        prefix_codes: np.ndarray | None = None,
+        append_prefix_codes_to_prompt: bool = False,
     ):
         sequence, tts_pad_embed = self.build_prompt(
             text,
@@ -2017,6 +2676,8 @@ class OpenVINOQwen3TTS:
             voice_clone_prompt=voice_clone_prompt,
             ref_text=ref_text,
         )
+        if append_prefix_codes_to_prompt:
+            sequence = self.append_prefix_code_frames_to_prompt(sequence, tts_pad_embed, prefix_codes)
         generated_count = 0
         generated_first_codes = []
         started = time.time()
@@ -2089,6 +2750,8 @@ class OpenVINOQwen3TTS:
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        prefix_codes: np.ndarray | None = None,
+        append_prefix_codes_to_prompt: bool = False,
     ):
         if do_sample:
             raise ValueError("do_sample=True is not supported by fused-no-cache OpenVINO graphs; use --mode no-cache")
@@ -2101,6 +2764,8 @@ class OpenVINOQwen3TTS:
             voice_clone_prompt=voice_clone_prompt,
             ref_text=ref_text,
         )
+        if append_prefix_codes_to_prompt:
+            sequence = self.append_prefix_code_frames_to_prompt(sequence, tts_pad_embed, prefix_codes)
         generated_count = 0
         generated_first_codes = []
         started = time.time()
@@ -2159,6 +2824,8 @@ class OpenVINOQwen3TTS:
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        prefix_codes: np.ndarray | None = None,
+        append_prefix_codes_to_prompt: bool = False,
     ):
         sequence, tts_pad_embed = self.build_prompt(
             text,
@@ -2169,6 +2836,8 @@ class OpenVINOQwen3TTS:
             voice_clone_prompt=voice_clone_prompt,
             ref_text=ref_text,
         )
+        if append_prefix_codes_to_prompt:
+            sequence = self.append_prefix_code_frames_to_prompt(sequence, tts_pad_embed, prefix_codes)
         self.ensure_subcode_greedy()
         prompt_len = int(sequence.shape[1])
         required_len = prompt_len + max_new_tokens
@@ -2269,6 +2938,8 @@ class OpenVINOQwen3TTS:
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        prefix_codes: np.ndarray | None = None,
+        append_prefix_codes_to_prompt: bool = False,
     ):
         if do_sample:
             raise ValueError("do_sample=True is not supported by fused cache OpenVINO graphs; use --cache-step split")
@@ -2281,6 +2952,8 @@ class OpenVINOQwen3TTS:
             voice_clone_prompt=voice_clone_prompt,
             ref_text=ref_text,
         )
+        if append_prefix_codes_to_prompt:
+            sequence = self.append_prefix_code_frames_to_prompt(sequence, tts_pad_embed, prefix_codes)
         prompt_len = int(sequence.shape[1])
         required_len = prompt_len + max_new_tokens
         initial_unroll = self.select_codegen_unroll_for_step(0)
@@ -2947,14 +3620,7 @@ class OpenVINOQwen3TTS:
     def from_ir(cls, ir_dir: str | Path, **kwargs):
         realtime_profile = kwargs.pop("realtime_profile", None)
         if realtime_profile in {None, "fastest"} and "mode" not in kwargs:
-            kwargs.update(
-                {
-                    "mode": "fastest",
-                    "codegen_unroll": "4",
-                    "codegen_decode_unroll": "auto",
-                    "preferred_cache_bucket": "96",
-                }
-            )
+            kwargs.update({"mode": "fastest"})
         elif realtime_profile not in {None, "fastest"}:
             raise ValueError("Python API supports realtime_profile='fastest'; use low-level mode kwargs for dev experiments")
         return cls(str(ir_dir), **kwargs)
@@ -3678,11 +4344,37 @@ class OpenVINOQwen3TTS:
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        prefix_codes: np.ndarray | None = None,
+        append_prefix_codes_to_prompt: bool = False,
     ):
+        scalar_text = self._ensure_scalar(text, "text")
+        scalar_instruct = self._ensure_scalar(instruct, "instruct") or ""
+        scalar_language = self._ensure_scalar(language if language is not None else "Auto", "language")
+        if prefix_codes is None:
+            hybrid_chunks = self._try_stream_native_hybrid_paged_audio_pipeline(
+                text=scalar_text,
+                instruct=scalar_instruct,
+                language=scalar_language,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                repetition_penalty=repetition_penalty,
+                max_prompt_tokens=max_prompt_tokens,
+                chunk_frames=chunk_frames,
+                left_context_frames=left_context_frames,
+                initial_chunk_frames=initial_chunk_frames,
+                chunk_strategy=chunk_strategy,
+                do_sample=do_sample,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+            )
+            if hybrid_chunks is not None:
+                yield from hybrid_chunks
+                return
         native_chunks = self._try_stream_native_audio_pipeline(
-            text=self._ensure_scalar(text, "text"),
-            instruct=self._ensure_scalar(instruct, "instruct") or "",
-            language=self._ensure_scalar(language if language is not None else "Auto", "language"),
+            text=scalar_text,
+            instruct=scalar_instruct,
+            language=scalar_language,
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,
             repetition_penalty=repetition_penalty,
@@ -3691,15 +4383,20 @@ class OpenVINOQwen3TTS:
             left_context_frames=left_context_frames,
             initial_chunk_frames=initial_chunk_frames,
             chunk_strategy=chunk_strategy,
+            prefix_codes=prefix_codes,
+            append_prefix_codes_to_prompt=append_prefix_codes_to_prompt,
             do_sample=do_sample,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
         )
         if native_chunks is not None:
             yield from native_chunks
             return
         codes = self.generate_codes_iter(
-            text=self._ensure_scalar(text, "text"),
-            instruct=self._ensure_scalar(instruct, "instruct") or "",
-            language=self._ensure_scalar(language if language is not None else "Auto", "language"),
+            text=scalar_text,
+            instruct=scalar_instruct,
+            language=scalar_language,
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,
             repetition_penalty=repetition_penalty,
@@ -3709,9 +4406,12 @@ class OpenVINOQwen3TTS:
             top_k=top_k,
             top_p=top_p,
             temperature=temperature,
+            prefix_codes=prefix_codes,
+            append_prefix_codes_to_prompt=append_prefix_codes_to_prompt,
         )
         yield from self.stream_decode_codes(
             codes,
+            prefix_codes=prefix_codes,
             chunk_frames=chunk_frames,
             left_context_frames=left_context_frames,
             initial_chunk_frames=initial_chunk_frames,
@@ -4045,6 +4745,25 @@ class OpenVINOQwen3TTS:
     def decode(self, codes: np.ndarray):
         token_count = int(codes.shape[0])
         available = sorted(self.decoder_graphs)
+        if not available:
+            if self.streaming_decoder_graphs_by_context and not getattr(self, "_decode_stream_fallback_active", False):
+                self._decode_stream_fallback_active = True
+                try:
+                    audio_parts = [
+                        chunk.audio
+                        for chunk in self.stream_decode_codes(
+                            (np.asarray(frame, dtype=np.int64) for frame in np.asarray(codes, dtype=np.int64)),
+                            chunk_strategy="stable",
+                        )
+                        if chunk.audio.size
+                    ]
+                finally:
+                    self._decode_stream_fallback_active = False
+                if audio_parts:
+                    return np.concatenate(audio_parts).astype(np.float32, copy=False)
+            raise RuntimeError(
+                "manifest has no full speech_decoder graph and streaming decoder fallback did not produce audio"
+            )
         bucket = next((item for item in available if item >= token_count), None)
         if bucket is None:
             bucket = available[-1]

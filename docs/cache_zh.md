@@ -1,6 +1,19 @@
 # OpenVINO 编译缓存
 
-生产路径使用 `fastest` profile。它会编译 native C++ pipeline 所需的 unroll4、decode-unroll、streaming decoder 和基础 embedding 图。
+`fastest` profile 依赖 native C++ pipeline、paged-KV seed graph、cached subcode graph 和 streaming decoder。预热的目标是提前触发 OpenVINO compile，避免用户首个请求承担编译开销。
+
+首次部署请先完成 [Quick Start](quick_start_zh.md) 中的一键构建；已有 IR 时再单独运行本页的 cache warmup。
+
+如果还没有导出/压缩 IR，优先使用一键构建：
+
+```bash
+uv run python -m qwen3_tts_ov build-fastest \
+  --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --out-dir openvino/voice_design \
+  --device GPU
+```
+
+该命令默认使用低内存 production 图集合；旧 fixed-bucket/unroll 诊断图不会被导出或预热。
 
 ## 预热
 
@@ -13,27 +26,47 @@ uv run python -m qwen3_tts_ov cache-warmup \
   --preload-buckets warmup
 ```
 
-默认缓存写入用户缓存目录，不写入 IR 目录。`--preload-buckets warmup` 只预热当前最快路径需要的 bucket，避免 iGPU USM 压力过大。
+`fastest` 当前是 paged-KV no-cache profile，因此 `buckets` 不会强制编译旧 fixed-bucket 图；保留该参数是为了和其它诊断 profile 兼容。
 
-## 查看任务
+## 查看将编译哪些图
 
 ```bash
 uv run python -m qwen3_tts_ov cache-warmup \
   --ir-dir openvino/voice_design \
   --device GPU \
   --realtime-profile fastest \
+  --graphs core,stream,buckets \
+  --preload-buckets warmup \
   --dry-run
 ```
 
-期望任务包含：
+典型任务包括：
 
-- core embedding graph
-- `fused_cache_step_unroll4_*_norepeat_cache96_*`
-- `fused_cache_decode_unroll4_*_norepeat_cache96_*`
-- `speech_decoder_stream_c0_t8.xml`
-- `speech_decoder_stream_c25_t24.xml`
+- `core:text_embedding`
+- `core:codec_embedding`
+- `core:code_frame_embedding`
+- `core:paged_kv_seed:talker_stateful_gqa`
+- `core:subcode_greedy_cached`
+- `stream:c0_t8` 或旧 IR 中可用的 `stream:c0_t12`
+- `stream:c25_t24`
 
-## Sidecar
+如果缺少 paged-KV seed、cached subcode 或 streaming decoder 图，`fastest` 应直接报错。不要通过切到旧 profile 绕过错误；应重新导出或重新压缩 IR。
+
+## 缓存位置
+
+默认缓存写入用户缓存目录，不写入 IR 目录。可以显式指定：
+
+```bash
+uv run python -m qwen3_tts_ov cache-warmup \
+  --ir-dir openvino/voice_design \
+  --device GPU \
+  --realtime-profile fastest \
+  --ov-cache-dir ~/.cache/qwen3_tts_ov
+```
+
+如果磁盘空间不足，runtime 会关闭本次 compile 的 `CACHE_DIR`，避免写出不完整缓存。不要把 OpenVINO cache、`outputs/` 或用户缓存目录提交到 git。
+
+## Sidecar 预热
 
 ```bash
 uv run python -m qwen3_tts_ov serve \
@@ -44,10 +77,4 @@ uv run python -m qwen3_tts_ov serve \
   --preload-buckets warmup
 ```
 
-`serve --realtime-profile auto` 会读取 `outputs/realtime_bench/streaming_profiles.json` 中已通过的 p90 summary；没有 benchmark 结果时回到 `fastest`。
-
-## 注意事项
-
-- 不要把 `openvino/**/ov_cache/`、`outputs/` 或用户缓存目录提交到 git。
-- `--preload-buckets all` 只适合离线预编译，不建议在 sidecar 常驻启动时使用。
-- 如果缺少 no-repeat 或 decode-unroll graph，`fastest` 会直接报错；这是预期行为，避免静默降级到慢路径。
+`--preload-buckets all` 适合离线预编译，不建议在 iGPU sidecar 常驻启动时使用。长文本会优先使用 manifest 中可用的 sampled paged-KV full-AR 加速图；质量评测生成的 `outputs/long_text_quality/quality_summary.json` 可用于覆盖内置选择。

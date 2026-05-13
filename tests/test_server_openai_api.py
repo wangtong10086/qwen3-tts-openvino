@@ -219,7 +219,7 @@ def test_websocket_can_send_optional_chunk_metadata(monkeypatch, tmp_path):
         metadata = websocket.receive_json()
         assert metadata["type"] == "metadata"
         assert metadata["realtime_profile"] == "fastest"
-        assert metadata["graph_variant"] == "int8_sym_fused_cachedsub"
+        assert metadata["graph_variant"] == "int8_sym_paged_talker_split"
         audio_meta = websocket.receive_json()
         assert audio_meta["type"] == "audio"
         assert audio_meta["timings"]["stream_rtf"] == 0.8
@@ -271,7 +271,7 @@ def test_fastest_websocket_uses_single_prompt_continuous_long_output(monkeypatch
         metadata = websocket.receive_json()
         assert metadata["forced_chunk_strategy"] is True
         assert metadata["continuous_long_output"] is True
-        assert metadata["continuous_backend"] == "single_prompt_stateful_bucket"
+        assert metadata["continuous_backend"] == "single_prompt_full_ar_reference"
         assert metadata["continuous_bucket"] == 384
         assert metadata["paged_kv"] is False
 
@@ -282,7 +282,7 @@ def test_fastest_websocket_uses_single_prompt_continuous_long_output(monkeypatch
                 break
             assert message["type"] == "audio"
             assert message["timings"]["continuous_long_output"] is True
-            assert message["timings"]["continuous_backend"] == "single_prompt_stateful_bucket"
+            assert message["timings"]["continuous_backend"] == "single_prompt_full_ar_reference"
             assert message["timings"]["paged_kv"] is False
             websocket.receive_bytes()
             audio_messages += 1
@@ -291,9 +291,9 @@ def test_fastest_websocket_uses_single_prompt_continuous_long_output(monkeypatch
     assert len(calls) == 1
     assert calls[0]["text"] == text
     assert calls[0]["max_new_tokens"] == 160
-    assert runtime_kwargs[0]["graph_variant"] == "int8_sym_fused"
+    assert runtime_kwargs[0]["graph_variant"] == "fp16"
     assert runtime_kwargs[0]["codegen_unroll"] == 1
-    assert runtime_kwargs[0]["preferred_cache_bucket"] == 384
+    assert runtime_kwargs[0]["preferred_cache_bucket"] == 0
     assert runtime_kwargs[0]["native_pipeline"] == "off"
 
 
@@ -341,7 +341,10 @@ def test_server_realtime_profile_int8_reaches_runtime_and_health(monkeypatch, tm
     app = server.create_app(model_root=tmp_path / "openvino", warmup=False, realtime_profile="int8")
     client = fastapi_testclient.TestClient(app)
 
-    assert client.post("/v1/tts", json={"mode": "voice_design", "text": "hello"}).status_code == 200
+    assert client.post(
+        "/v1/tts",
+        json={"mode": "voice_design", "text": "hello", "generation": {"max_new_tokens": 48}},
+    ).status_code == 200
     health = client.get("/health").json()
     runtime_status = next(iter(health["runtimes"].values()))
 
@@ -403,7 +406,10 @@ def test_server_realtime_profile_int8_sym_sets_unroll4(monkeypatch, tmp_path):
     app = server.create_app(model_root=tmp_path / "openvino", warmup=False, realtime_profile="int8-sym")
     client = fastapi_testclient.TestClient(app)
 
-    assert client.post("/v1/tts", json={"mode": "voice_design", "text": "hello"}).status_code == 200
+    assert client.post(
+        "/v1/tts",
+        json={"mode": "voice_design", "text": "hello", "generation": {"max_new_tokens": 48}},
+    ).status_code == 200
     health = client.get("/health").json()
     runtime_status = next(iter(health["runtimes"].values()))
 
@@ -472,7 +478,10 @@ def test_server_realtime_profile_int8_sym_norepeat_defaults_penalty(monkeypatch,
     app = server.create_app(model_root=tmp_path / "openvino", warmup=False, realtime_profile="int8-sym-norepeat")
     client = fastapi_testclient.TestClient(app)
 
-    assert client.post("/v1/tts", json={"mode": "voice_design", "text": "hello"}).status_code == 200
+    assert client.post(
+        "/v1/tts",
+        json={"mode": "voice_design", "text": "hello", "generation": {"max_new_tokens": 48}},
+    ).status_code == 200
     health = client.get("/health").json()
     runtime_status = next(iter(health["runtimes"].values()))
 

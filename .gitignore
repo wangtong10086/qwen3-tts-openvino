@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.cache/
 *.egg-info/
 .agents/
 .codex/
@@ -15,6 +16,8 @@ models/
 openvino_full/
 openvino/
 outputs/
+build/release/
+dist/release/
 *.wav
 *.flac
 *.mp3

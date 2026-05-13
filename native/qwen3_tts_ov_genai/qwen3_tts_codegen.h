@@ -28,6 +28,31 @@ int qwen3_tts_codegen_create(
     void** out_handle,
     char** error);
 
+int qwen3_tts_codegen_create_paged_kv(
+    const char* paged_seed_xml,
+    const char* device,
+    const char* cache_dir,
+    const char* cache_mode,
+    const char* kv_cache_precision,
+    int64_t kv_heads,
+    int64_t kv_block_size,
+    int64_t kv_head_dim,
+    void** out_handle,
+    char** error);
+
+int qwen3_tts_codegen_create_paged_kv_split(
+    const char* paged_talker_seed_xml,
+    const char* subcode_xml,
+    const char* device,
+    const char* cache_dir,
+    const char* cache_mode,
+    const char* kv_cache_precision,
+    int64_t kv_heads,
+    int64_t kv_block_size,
+    int64_t kv_head_dim,
+    void** out_handle,
+    char** error);
+
 int qwen3_tts_codegen_destroy(void* handle, char** error);
 
 int qwen3_tts_codegen_set_stream_decoders(
@@ -73,6 +98,11 @@ int qwen3_tts_codegen_run_voice_design_audio_stream(
     int64_t vocab_size,
     int64_t num_code_groups,
     int64_t eos_token_id,
+    int64_t do_sample,
+    int64_t top_k,
+    float top_p,
+    float temperature,
+    uint64_t seed,
     Qwen3TTSAudioCallback callback,
     void* user_data,
     int64_t* out_count,
@@ -86,6 +116,8 @@ int qwen3_tts_codegen_reset_profile(void* handle, char** error);
 int qwen3_tts_codegen_get_profile_json(void* handle, char** out_json, char** error);
 
 int qwen3_tts_codegen_get_last_timing_json(void* handle, char** out_json, char** error);
+
+int qwen3_tts_codegen_release_run_buffers(void* handle, char** error);
 
 void qwen3_tts_codegen_free_error(char* error);
 

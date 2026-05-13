@@ -4,7 +4,7 @@
   "language": "Chinese",
   "instruct": "A calm young female voice, natural Mandarin pronunciation.",
   "generation": {
-    "max_new_tokens": 128,
+    "max_new_tokens": 48,
     "min_new_tokens": 2,
     "repetition_penalty": 1.0
   },

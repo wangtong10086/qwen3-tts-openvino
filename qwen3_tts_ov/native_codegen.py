@@ -4,6 +4,7 @@ import ctypes
 import json
 import os
 import queue
+import sys
 import threading
 from pathlib import Path
 
@@ -14,8 +15,41 @@ class NativeCodegenUnavailable(RuntimeError):
     pass
 
 
+def native_library_name() -> str:
+    if os.name == "nt":
+        return "qwen3_tts_ov_genai.dll"
+    if sys.platform == "darwin":
+        return "libqwen3_tts_ov_genai.dylib"
+    return "libqwen3_tts_ov_genai.so"
+
+
+def native_library_candidates() -> list[Path]:
+    name = native_library_name()
+    roots: list[Path] = []
+    frozen_root = getattr(sys, "_MEIPASS", None)
+    if frozen_root:
+        roots.append(Path(frozen_root))
+    if getattr(sys, "frozen", False):
+        roots.append(Path(sys.executable).resolve().parent)
+    roots.append(Path(__file__).resolve().parents[1])
+
+    candidates: list[Path] = []
+    for root in roots:
+        candidates.extend(
+            [
+                root / "native" / "build" / name,
+                root / "native" / name,
+                root / name,
+            ]
+        )
+    return candidates
+
+
 def default_library_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "native" / "build" / "libqwen3_tts_ov_genai.so"
+    for candidate in native_library_candidates():
+        if candidate.exists():
+            return candidate
+    return Path(__file__).resolve().parents[1] / "native" / "build" / native_library_name()
 
 
 def ensure_openvino_tokenizers_extension_env() -> None:
@@ -39,6 +73,12 @@ class NativeCodegenRunner:
         cache_dir: Path | None = None,
         cache_mode: str = "OPTIMIZE_SPEED",
         library_path: Path | None = None,
+        paged_kv: bool = False,
+        kv_cache_precision: str = "f16",
+        kv_cache_heads: int = 16,
+        kv_cache_block_size: int = 8,
+        kv_cache_head_dim: int = 128,
+        paged_kv_subcode_graph: Path | None = None,
     ):
         library_path = Path(library_path or os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN_LIB") or default_library_path())
         if not library_path.exists():
@@ -51,18 +91,48 @@ class NativeCodegenRunner:
         self._configure_api()
         self.handle = ctypes.c_void_p()
         err = ctypes.c_char_p()
-        rc = self.lib.qwen3_tts_codegen_create(
-            str(prefill_graph).encode("utf-8"),
-            str(decode_graph).encode("utf-8"),
-            str(device).encode("utf-8"),
-            str(cache_dir or "").encode("utf-8"),
-            str(cache_mode or "OPTIMIZE_SPEED").encode("utf-8"),
-            ctypes.byref(self.handle),
-            ctypes.byref(err),
-        )
+        if paged_kv and paged_kv_subcode_graph is not None:
+            rc = self.lib.qwen3_tts_codegen_create_paged_kv_split(
+                str(prefill_graph).encode("utf-8"),
+                str(paged_kv_subcode_graph).encode("utf-8"),
+                str(device).encode("utf-8"),
+                str(cache_dir or "").encode("utf-8"),
+                str(cache_mode or "OPTIMIZE_SPEED").encode("utf-8"),
+                str(kv_cache_precision or "f16").encode("utf-8"),
+                int(kv_cache_heads),
+                int(kv_cache_block_size),
+                int(kv_cache_head_dim),
+                ctypes.byref(self.handle),
+                ctypes.byref(err),
+            )
+        elif paged_kv:
+            rc = self.lib.qwen3_tts_codegen_create_paged_kv(
+                str(prefill_graph).encode("utf-8"),
+                str(device).encode("utf-8"),
+                str(cache_dir or "").encode("utf-8"),
+                str(cache_mode or "OPTIMIZE_SPEED").encode("utf-8"),
+                str(kv_cache_precision or "f16").encode("utf-8"),
+                int(kv_cache_heads),
+                int(kv_cache_block_size),
+                int(kv_cache_head_dim),
+                ctypes.byref(self.handle),
+                ctypes.byref(err),
+            )
+        else:
+            rc = self.lib.qwen3_tts_codegen_create(
+                str(prefill_graph).encode("utf-8"),
+                str(decode_graph).encode("utf-8"),
+                str(device).encode("utf-8"),
+                str(cache_dir or "").encode("utf-8"),
+                str(cache_mode or "OPTIMIZE_SPEED").encode("utf-8"),
+                ctypes.byref(self.handle),
+                ctypes.byref(err),
+            )
         self._check(rc, err)
         self.closed = False
         self.last_remote_embed = False
+        self.paged_kv = bool(paged_kv)
+        self.paged_kv_split_subcode = bool(paged_kv and paged_kv_subcode_graph is not None)
 
     def _configure_api(self) -> None:
         self.lib.qwen3_tts_codegen_create.argtypes = [
@@ -75,6 +145,33 @@ class NativeCodegenRunner:
             ctypes.POINTER(ctypes.c_char_p),
         ]
         self.lib.qwen3_tts_codegen_create.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_create_paged_kv.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_create_paged_kv.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_create_paged_kv_split.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_create_paged_kv_split.restype = ctypes.c_int
         self.lib.qwen3_tts_codegen_destroy.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p)]
         self.lib.qwen3_tts_codegen_destroy.restype = ctypes.c_int
         self.lib.qwen3_tts_codegen_run_unroll4_statefulmask.argtypes = [
@@ -89,6 +186,11 @@ class NativeCodegenRunner:
             ctypes.c_int64,
             ctypes.c_int64,
             ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_uint64,
             ctypes.POINTER(ctypes.c_int64),
             ctypes.POINTER(ctypes.c_int64),
             ctypes.POINTER(ctypes.c_double),
@@ -114,6 +216,11 @@ class NativeCodegenRunner:
             ctypes.c_int64,
             ctypes.c_int64,
             ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_uint64,
             self._frame_callback_type,
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_int64),
@@ -177,6 +284,11 @@ class NativeCodegenRunner:
             ctypes.c_int64,
             ctypes.c_int64,
             ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_uint64,
             ctypes.POINTER(ctypes.c_int64),
             ctypes.c_int64,
             self._audio_callback_type,
@@ -199,6 +311,11 @@ class NativeCodegenRunner:
             ctypes.c_int64,
             ctypes.c_int64,
             ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_uint64,
             self._audio_callback_type,
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_int64),
@@ -229,6 +346,11 @@ class NativeCodegenRunner:
             ctypes.POINTER(ctypes.c_char_p),
         ]
         self.lib.qwen3_tts_codegen_get_last_timing_json.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_release_run_buffers.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_release_run_buffers.restype = ctypes.c_int
         self.lib.qwen3_tts_codegen_free_error.argtypes = [ctypes.c_char_p]
         self.lib.qwen3_tts_codegen_free_error.restype = None
 
@@ -290,6 +412,13 @@ class NativeCodegenRunner:
             if out.value:
                 self.lib.qwen3_tts_codegen_free_error(out)
 
+    def release_run_buffers(self) -> None:
+        if getattr(self, "closed", True):
+            return
+        err = ctypes.c_char_p()
+        rc = self.lib.qwen3_tts_codegen_release_run_buffers(self.handle, ctypes.byref(err))
+        self._check(rc, err)
+
     def run(
         self,
         sequence: np.ndarray,
@@ -300,6 +429,11 @@ class NativeCodegenRunner:
         vocab_size: int,
         num_code_groups: int,
         eos_token_id: int,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+        seed: int = 0,
     ) -> tuple[np.ndarray, float]:
         sequence = np.ascontiguousarray(sequence, dtype=np.float32)
         tts_pad_embed = np.ascontiguousarray(tts_pad_embed, dtype=np.float32)
@@ -324,6 +458,11 @@ class NativeCodegenRunner:
             ctypes.c_int64(vocab_size),
             ctypes.c_int64(num_code_groups),
             ctypes.c_int64(eos_token_id),
+            ctypes.c_int64(1 if do_sample else 0),
+            ctypes.c_int64(top_k),
+            ctypes.c_float(top_p),
+            ctypes.c_float(temperature),
+            ctypes.c_uint64(seed),
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
             ctypes.byref(out_count),
             ctypes.byref(elapsed_ms),
@@ -404,6 +543,11 @@ class NativeCodegenRunner:
         vocab_size: int,
         num_code_groups: int,
         eos_token_id: int,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+        seed: int = 0,
     ):
         sequence = np.ascontiguousarray(sequence, dtype=np.float32)
         tts_pad_embed = np.ascontiguousarray(tts_pad_embed, dtype=np.float32)
@@ -440,6 +584,11 @@ class NativeCodegenRunner:
                     ctypes.c_int64(vocab_size),
                     ctypes.c_int64(num_code_groups),
                     ctypes.c_int64(eos_token_id),
+                    ctypes.c_int64(1 if do_sample else 0),
+                    ctypes.c_int64(top_k),
+                    ctypes.c_float(top_p),
+                    ctypes.c_float(temperature),
+                    ctypes.c_uint64(seed),
                     c_callback,
                     None,
                     ctypes.byref(out_count),
@@ -482,6 +631,11 @@ class NativeCodegenRunner:
         num_code_groups: int,
         eos_token_id: int,
         prefix_codes: np.ndarray | None = None,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+        seed: int = 0,
     ):
         sequence = np.ascontiguousarray(sequence, dtype=np.float32)
         tts_pad_embed = np.ascontiguousarray(tts_pad_embed, dtype=np.float32)
@@ -540,6 +694,11 @@ class NativeCodegenRunner:
                     ctypes.c_int64(vocab_size),
                     ctypes.c_int64(num_code_groups),
                     ctypes.c_int64(eos_token_id),
+                    ctypes.c_int64(1 if do_sample else 0),
+                    ctypes.c_int64(top_k),
+                    ctypes.c_float(top_p),
+                    ctypes.c_float(temperature),
+                    ctypes.c_uint64(seed),
                     prefix.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
                     ctypes.c_int64(prefix.shape[0]),
                     c_callback,
@@ -555,6 +714,17 @@ class NativeCodegenRunner:
                 out_queue.put(("done", int(out_count.value), float(elapsed_ms.value), remote_embed, profile, timing))
             except BaseException as exc:
                 out_queue.put(exc)
+            finally:
+                if os.environ.get("QWEN3_TTS_OV_NATIVE_RELEASE_RUN_BUFFERS_AFTER_RUN", "0").strip().lower() in {
+                    "1",
+                    "true",
+                    "on",
+                    "yes",
+                }:
+                    try:
+                        self.release_run_buffers()
+                    except BaseException as exc:
+                        out_queue.put(exc)
 
         thread = threading.Thread(target=worker, name="qwen3-tts-native-audio-pipeline", daemon=True)
         thread.start()
@@ -595,6 +765,11 @@ class NativeCodegenRunner:
         vocab_size: int,
         num_code_groups: int,
         eos_token_id: int,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+        seed: int = 0,
     ):
         codec_prefill_array = np.ascontiguousarray(codec_prefill, dtype=np.int64).reshape(-1)
         if codec_prefill_array.size == 0:
@@ -647,6 +822,11 @@ class NativeCodegenRunner:
                     ctypes.c_int64(vocab_size),
                     ctypes.c_int64(num_code_groups),
                     ctypes.c_int64(eos_token_id),
+                    ctypes.c_int64(1 if do_sample else 0),
+                    ctypes.c_int64(top_k),
+                    ctypes.c_float(top_p),
+                    ctypes.c_float(temperature),
+                    ctypes.c_uint64(seed),
                     c_callback,
                     None,
                     ctypes.byref(out_count),
@@ -660,6 +840,17 @@ class NativeCodegenRunner:
                 out_queue.put(("done", int(out_count.value), float(elapsed_ms.value), remote_embed, profile, timing))
             except BaseException as exc:
                 out_queue.put(exc)
+            finally:
+                if os.environ.get("QWEN3_TTS_OV_NATIVE_RELEASE_RUN_BUFFERS_AFTER_RUN", "0").strip().lower() in {
+                    "1",
+                    "true",
+                    "on",
+                    "yes",
+                }:
+                    try:
+                        self.release_run_buffers()
+                    except BaseException as exc:
+                        out_queue.put(exc)
 
         thread = threading.Thread(target=worker, name="qwen3-tts-native-voice-design-pipeline", daemon=True)
         thread.start()

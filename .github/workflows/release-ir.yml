@@ -1,0 +1,42 @@
+name: release-ir
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version
+        required: true
+        default: 0.1.0
+      ir_dir:
+        description: Existing IR directory on the runner
+        required: true
+        default: openvino/voice_design
+      model_type:
+        description: IR model type
+        required: true
+        default: voice_design
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install release dependencies
+        run: uv sync --extra release
+      - name: Package IR
+        run: |
+          test -f "${{ inputs.ir_dir }}/manifest.json"
+          uv run python scripts/package_ir.py \
+            --ir-dir "${{ inputs.ir_dir }}" \
+            --model-type "${{ inputs.model_type }}" \
+            --version "${{ inputs.version }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qwen3-tts-openvino-ir-${{ inputs.model_type }}-${{ inputs.version }}
+          path: dist/release/qwen3-tts-openvino-ir-${{ inputs.model_type }}-${{ inputs.version }}.*

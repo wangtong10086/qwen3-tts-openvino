@@ -15,8 +15,18 @@ from .profiles import (
     FASTEST_CODEGEN_DECODE_UNROLL,
     FASTEST_CODEGEN_SCHEDULE,
     FASTEST_CODEGEN_UNROLL,
+    FASTEST_CACHE_KERNEL,
+    FASTEST_CACHE_STEP,
+    FASTEST_GRAPH_VARIANT,
+    FASTEST_NATIVE_CODEGEN_DEVICE,
     FASTEST_MODE,
     FASTEST_NATIVE_BUFFER_REUSE,
+    FASTEST_NATIVE_PAGED_KV,
+    FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE,
+    FASTEST_NATIVE_PAGED_KV_GQA,
+    FASTEST_NATIVE_PAGED_KV_PRECISION,
+    FASTEST_NATIVE_PAGED_KV_SCORE_AGGREGATION,
+    FASTEST_NATIVE_PAGED_KV_SPLIT_SUBCODE,
     FASTEST_NATIVE_PIPELINE,
     FASTEST_PREFERRED_CACHE_BUCKET,
     FASTEST_PROFILE_NAME,
@@ -68,6 +78,28 @@ def add_runtime_args(
     parser.add_argument("--native-buffer-reuse", default=None, choices=["auto", "off", "on"], help=advanced)
     parser.add_argument("--native-prompt", default=None, choices=["off", "on"], help=advanced)
     parser.add_argument("--native-prompt-device", default=None, help=advanced)
+    parser.add_argument("--native-paged-kv", default=None, choices=["auto", "off", "on", "require"], help=advanced)
+    parser.add_argument("--native-paged-kv-gqa", default=None, choices=["auto", "off", "on"], help=advanced)
+    parser.add_argument("--native-paged-kv-precision", default=None, choices=["f16", "bf16", "u8"], help=advanced)
+    parser.add_argument("--native-paged-kv-cache-input-precision", default=None, choices=["f32", "f16", "bf16", "u8"], help=advanced)
+    parser.add_argument("--native-paged-kv-block-size", default=None, type=int, help=advanced)
+    parser.add_argument("--native-paged-kv-static-decode", default=None, choices=["off", "on"], help=advanced)
+    parser.add_argument("--native-paged-kv-static-blocks", default=None, type=int, help=advanced)
+    parser.add_argument("--native-paged-kv-static-decode-mode", default=None, choices=["minimal", "full"], help=advanced)
+    parser.add_argument("--native-paged-kv-unroll", default=None, type=int, help=advanced)
+    parser.add_argument("--native-paged-kv-experimental-unroll", default=None, choices=["off", "on"], help=advanced)
+    parser.add_argument("--native-paged-kv-subcode-attention", default=None, choices=["auto", "sdpa", "exact"], help=advanced)
+    parser.add_argument("--native-paged-kv-split-subcode", default=None, choices=["off", "on"], help=advanced)
+    parser.add_argument(
+        "--native-paged-kv-split-subcode-mode",
+        default=None,
+        choices=["cached", "recompute", "cached_exact", "recompute_exact"],
+        help=advanced,
+    )
+    parser.add_argument("--native-paged-kv-score-aggregation", default=None, choices=["off", "on"], help=advanced)
+    parser.add_argument("--native-paged-kv-hybrid", default=None, choices=["off", "on"], help=advanced)
+    parser.add_argument("--native-paged-kv-hybrid-prefix-frames", default=None, type=int, help=advanced)
+    parser.add_argument("--native-codegen-device", default=None, help=advanced)
     parser.add_argument("--native-ov-profile", action="store_true", help=advanced)
     if not include_generation:
         return
@@ -113,15 +145,28 @@ def build_runtime(args):
 
 
 def apply_profile_defaults(args):
+    if getattr(args, "native_paged_kv", None) in {"on", "require"}:
+        args.realtime_profile = "fp16"
+        args.mode = "no-cache"
+        args.cache_kernel = "exact"
+        args.cache_step = "fused"
+        args.graph_variant = "fp16"
+        args.codegen_unroll = "1"
+        args.codegen_schedule = "current"
+        args.codegen_decode_unroll = "off"
+        args.preferred_cache_bucket = "0"
+        if getattr(args, "native_pipeline", None) is None:
+            args.native_pipeline = "require" if args.native_paged_kv == "require" else "on"
+        return
     realtime_profile = getattr(args, "realtime_profile", None)
     if realtime_profile not in (None, "") and realtime_profile not in REALTIME_PROFILE_CHOICES:
         raise ValueError(f"realtime_profile must be one of {', '.join(REALTIME_PROFILE_CHOICES)}")
     if realtime_profile in {FASTEST_PROFILE_NAME, "auto"}:
         args.mode = FASTEST_MODE
         args.cache_kernel, args.cache_step, args.graph_variant = (
-            "exact",
-            "fused",
-            "int8_sym_fused_cachedsub",
+            FASTEST_CACHE_KERNEL,
+            FASTEST_CACHE_STEP,
+            FASTEST_GRAPH_VARIANT,
         )
         args.codegen_unroll = str(FASTEST_CODEGEN_UNROLL)
         args.codegen_schedule = FASTEST_CODEGEN_SCHEDULE
@@ -129,6 +174,13 @@ def apply_profile_defaults(args):
         args.preferred_cache_bucket = str(FASTEST_PREFERRED_CACHE_BUCKET)
         args.native_pipeline = FASTEST_NATIVE_PIPELINE
         args.native_buffer_reuse = FASTEST_NATIVE_BUFFER_REUSE
+        args.native_paged_kv = FASTEST_NATIVE_PAGED_KV
+        args.native_paged_kv_gqa = FASTEST_NATIVE_PAGED_KV_GQA
+        args.native_paged_kv_precision = FASTEST_NATIVE_PAGED_KV_PRECISION
+        args.native_paged_kv_block_size = FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE
+        args.native_paged_kv_split_subcode = FASTEST_NATIVE_PAGED_KV_SPLIT_SUBCODE
+        args.native_paged_kv_score_aggregation = FASTEST_NATIVE_PAGED_KV_SCORE_AGGREGATION
+        args.native_codegen_device = FASTEST_NATIVE_CODEGEN_DEVICE
         return
 
 
@@ -173,6 +225,78 @@ def apply_native_env(args):
     prompt_device = getattr(args, "native_prompt_device", None)
     if prompt_device:
         os.environ["QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE"] = str(prompt_device)
+    paged_kv = getattr(args, "native_paged_kv", None)
+    if paged_kv in (None, "auto"):
+        os.environ.pop("QWEN3_TTS_OV_NATIVE_PAGED_KV", None)
+    elif paged_kv == "off":
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV"] = "0"
+    elif paged_kv == "on":
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV"] = "1"
+    elif paged_kv == "require":
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV"] = "require"
+        os.environ["QWEN3_TTS_OV_NATIVE_PIPELINE"] = "require"
+    paged_kv_gqa = getattr(args, "native_paged_kv_gqa", None)
+    if paged_kv_gqa in (None, "auto"):
+        os.environ.pop("QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA", None)
+    elif paged_kv_gqa == "off":
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA"] = "0"
+    elif paged_kv_gqa == "on":
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA"] = "1"
+    paged_kv_precision = getattr(args, "native_paged_kv_precision", None)
+    if paged_kv_precision:
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION"] = str(paged_kv_precision)
+    paged_kv_cache_input_precision = getattr(args, "native_paged_kv_cache_input_precision", None)
+    if paged_kv_cache_input_precision:
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_INPUT_PRECISION"] = str(paged_kv_cache_input_precision)
+    paged_kv_block_size = getattr(args, "native_paged_kv_block_size", None)
+    if paged_kv_block_size:
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE"] = str(int(paged_kv_block_size))
+    paged_kv_static_decode = getattr(args, "native_paged_kv_static_decode", None)
+    if paged_kv_static_decode == "off":
+        os.environ.pop("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE", None)
+    elif paged_kv_static_decode == "on":
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE"] = "1"
+    paged_kv_static_blocks = getattr(args, "native_paged_kv_static_blocks", None)
+    if paged_kv_static_blocks:
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_BLOCKS"] = str(int(paged_kv_static_blocks))
+    paged_kv_static_decode_mode = getattr(args, "native_paged_kv_static_decode_mode", None)
+    if paged_kv_static_decode_mode:
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE_MODE"] = str(paged_kv_static_decode_mode)
+    paged_kv_unroll = getattr(args, "native_paged_kv_unroll", None)
+    if paged_kv_unroll:
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_UNROLL"] = str(int(paged_kv_unroll))
+    paged_kv_experimental_unroll = getattr(args, "native_paged_kv_experimental_unroll", None)
+    if paged_kv_experimental_unroll == "off":
+        os.environ.pop("QWEN3_TTS_OV_NATIVE_PAGED_KV_EXPERIMENTAL_UNROLL", None)
+    elif paged_kv_experimental_unroll == "on":
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_EXPERIMENTAL_UNROLL"] = "1"
+    paged_kv_subcode_attention = getattr(args, "native_paged_kv_subcode_attention", None)
+    if paged_kv_subcode_attention:
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_SUBCODE_ATTENTION"] = str(paged_kv_subcode_attention)
+    paged_kv_split_subcode = getattr(args, "native_paged_kv_split_subcode", None)
+    if paged_kv_split_subcode == "off":
+        os.environ.pop("QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE", None)
+    elif paged_kv_split_subcode == "on":
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE"] = "1"
+    paged_kv_split_subcode_mode = getattr(args, "native_paged_kv_split_subcode_mode", None)
+    if paged_kv_split_subcode_mode:
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE_MODE"] = str(paged_kv_split_subcode_mode)
+    paged_kv_score_aggregation = getattr(args, "native_paged_kv_score_aggregation", None)
+    if paged_kv_score_aggregation == "off":
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION"] = "0"
+    elif paged_kv_score_aggregation == "on":
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION"] = "1"
+    paged_kv_hybrid = getattr(args, "native_paged_kv_hybrid", None)
+    if paged_kv_hybrid == "off":
+        os.environ.pop("QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID", None)
+    elif paged_kv_hybrid == "on":
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID"] = "1"
+    paged_kv_hybrid_prefix = getattr(args, "native_paged_kv_hybrid_prefix_frames", None)
+    if paged_kv_hybrid_prefix:
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID_PREFIX_FRAMES"] = str(int(paged_kv_hybrid_prefix))
+    native_codegen_device = getattr(args, "native_codegen_device", None)
+    if native_codegen_device:
+        os.environ["QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE"] = str(native_codegen_device)
     if getattr(args, "native_ov_profile", False):
         os.environ["QWEN3_TTS_OV_NATIVE_PERF_COUNT"] = "1"
 
@@ -458,6 +582,10 @@ def run_serve(args):
         preload_buckets=args.preload_buckets,
         warmup_text=args.warmup_text,
         warmup_strategy=args.warmup_strategy,
+        max_concurrent_tts=args.max_concurrent_tts,
+        long_output_memory_policy=args.long_output_memory_policy,
+        max_continuous_prompt_tokens=args.max_continuous_prompt_tokens,
+        usm_retry_count=args.usm_retry_count,
     )
 
 
@@ -531,6 +659,56 @@ def add_cache_warmup_args(parser):
     parser.add_argument("--single-task-json", default=None, help=argparse.SUPPRESS)
 
 
+def add_build_fastest_args(parser):
+    parser.add_argument(
+        "--model-type",
+        default="voice_design",
+        choices=["voice_design", "custom_voice", "base"],
+        help="Model family to prepare. Defaults to the validated VoiceDesign fastest path.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Local PyTorch model directory. Defaults to models/Qwen3-TTS-12Hz-1.7B-<model type>.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        help="OpenVINO IR output directory. Defaults to openvino/<model type>.",
+    )
+    parser.add_argument("--device", default="GPU")
+    parser.add_argument("--decoder-device", default=None)
+    parser.add_argument("--ov-cache-dir", default=None)
+    parser.add_argument("--disable-ov-cache", action="store_true")
+    parser.add_argument("--preload-buckets", default="warmup")
+    parser.add_argument("--warmup-graphs", default="core,stream,buckets")
+    parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["realtime", "low_latency", "smooth", "balanced", "stable"])
+    parser.add_argument(
+        "--graph-set",
+        default="production",
+        choices=["production", "compat"],
+        help="production exports only the fastest runtime graphs; compat also exports legacy fixed-bucket/unroll diagnostic graphs.",
+    )
+    parser.add_argument("--clean", action="store_true", help="Remove the output IR directory before building.")
+    parser.add_argument("--clean-native", action="store_true", help="Remove native/build before compiling the native pipeline.")
+    parser.add_argument("--skip-submodule", action="store_true")
+    parser.add_argument("--skip-native", action="store_true")
+    parser.add_argument("--skip-export", action="store_true")
+    parser.add_argument("--skip-compress", action="store_true")
+    parser.add_argument("--skip-warmup", action="store_true")
+    parser.add_argument("--force-native", action="store_true")
+    parser.add_argument("--force-export", action="store_true")
+    parser.add_argument("--force-compress", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--output-json", default=None)
+
+
+def run_build_fastest_command(args):
+    from .build_fastest import run_build_fastest
+
+    run_build_fastest(args)
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "export":
@@ -547,6 +725,10 @@ def main(argv=None):
     cache_warmup = sub.add_parser("cache-warmup")
     add_cache_warmup_args(cache_warmup)
     cache_warmup.set_defaults(func=run_cache_warmup_command)
+
+    build_fastest = sub.add_parser("build-fastest", help="build native code, export/compress fastest IR, and warm OpenVINO cache")
+    add_build_fastest_args(build_fastest)
+    build_fastest.set_defaults(func=run_build_fastest_command)
 
     vd = sub.add_parser("voice-design")
     add_runtime_args(vd, default_ir_dir="auto")
@@ -618,6 +800,10 @@ def main(argv=None):
     serve_parser.add_argument("--preload-buckets", default="warmup")
     serve_parser.add_argument("--warmup-text", default="你好，这是一次流式预热。")
     serve_parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["realtime", "low_latency", "smooth", "balanced", "stable"])
+    serve_parser.add_argument("--max-concurrent-tts", type=int, default=1)
+    serve_parser.add_argument("--long-output-memory-policy", default="stable", choices=["stable", "fast"])
+    serve_parser.add_argument("--max-continuous-prompt-tokens", type=int, default=1024)
+    serve_parser.add_argument("--usm-retry-count", type=int, default=1)
     serve_parser.set_defaults(func=run_serve)
 
     args = parser.parse_args(argv)

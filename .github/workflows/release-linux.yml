@@ -1,0 +1,47 @@
+name: release-linux
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version
+        required: true
+        default: 0.1.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra native --extra server --extra release
+      - name: Build native library
+        run: uv run python scripts/build_native_codegen.py
+      - name: Package release
+        run: |
+          uv run python scripts/package_release.py \
+            --target linux-x64 \
+            --version "${{ inputs.version }}"
+      - name: Smoke release package
+        run: |
+          uv run python scripts/smoke_release_package.py \
+            --archive "dist/release/qwen3-tts-ov-server-linux-x64-${{ inputs.version }}.tar.zst" \
+            --work-dir build/release-smoke-linux \
+            --port 17960
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qwen3-tts-ov-server-linux-x64-${{ inputs.version }}-smoke-logs
+          path: build/release-smoke-linux/server.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qwen3-tts-ov-server-linux-x64-${{ inputs.version }}
+          path: dist/release/qwen3-tts-ov-server-linux-x64-${{ inputs.version }}.*

@@ -1,111 +1,95 @@
-# Native OpenVINO GenAI C++ codegen pipeline
+# Native OpenVINO Pipeline
 
-This directory contains the native C++ migration path for the Qwen3-TTS
-streaming inference pipeline. The shared library links both OpenVINO Runtime and
-`libopenvino_genai`, and wraps the Qwen3-specific graphs in a
-`Qwen3TTSGenAIPipeline` object modeled after OpenVINO GenAI speech pipelines.
-The native pipeline uses GenAI `SpeechGenerationConfig` validation and
-`SpeechGenerationPerfMetrics`/`PerfMetrics` timing helpers, while keeping the
-Qwen3 codec generation loop specialized to the exported TTS graphs.
-It can optionally chain `frame_embed` between autoregressive steps with OpenVINO
-remote tensors, avoiding a GPU-to-CPU-to-GPU copy on devices that support remote
-tensors. This path is disabled by default because it has not shown stable speedup
-on the current iGPU setup.
-It can also optionally build VoiceDesign prompts in C++ with OpenVINO GenAI
-Tokenizer plus the exported text/codec embedding graphs. That path is useful for
-validating a fuller C++ pipeline but is disabled by default because it is slower
-than Python prompt construction on the current machine.
+This directory contains the C++ runtime used by the production `fastest`
+profile. It links OpenVINO Runtime and OpenVINO GenAI utilities, but the codec
+generation loop is Qwen3-TTS-specific.
 
-The production `fastest` profile requires this native pipeline. Set
-`QWEN3_TTS_OV_NATIVE_PIPELINE=require` in verification runs to fail fast when
-the shared library or required graphs are missing:
+The stock GenAI `LLMPipeline` / `Text2SpeechPipeline` is not used directly
+because Qwen3-TTS generation differs from normal text generation:
 
-- `fused_cache_step_unrollN_*`
-- `fused_cache_decode_unrollN_*_statefulmask_*`
-- `speech_decoder_stream_c0_t8.xml`
-- `speech_decoder_stream_c25_t12.xml`
+- the prompt is already represented as `inputs_embeds`
+- autoregressive output is codec frames, not token ids
+- generated codec frames are embedded and fed back as `frame_embed`
+- subcode prediction uses multiple codebooks per frame
+- audio chunks are emitted through a streaming speech decoder
 
-The C++ loop is specialized for Qwen3-TTS codec generation instead of directly
-using the stock GenAI `Text2SpeechPipeline` / `LLMPipeline`, because those
-pipelines do not model Qwen3-TTS' multi-codebook codec autoregression:
+## Production Path
 
-- prompt is already provided as `inputs_embeds`
-- output is codec frames, not text token ids
-- `frame_embed` is fed back into the next autoregressive step
-- `repeated_mask` is moved into the stateful decode-unroll graph
-- codec frames or decoded audio chunks are emitted back to Python through native
-  streaming callbacks
+`fastest` uses:
 
-The currently exported IR uses OpenVINO `ReadValue` / `Assign` stateful KV with
-fixed cache buckets. It does not expose GenAI continuous batching inputs such as
-`key_cache.*`, `value_cache.*`, and `block_indices`, so the production path is
-not a true paged-KV `LLMPipeline` backend yet. Long VoiceDesign requests are
-handled by a single-prompt `cache384` stateful bucket path, preferring the
-`int8_sym_fused_cachedsub` graph variant when available, to preserve prosody
-without text segmentation. A true paged-KV backend requires a new export/
-transformation path that produces GenAI-compatible cache inputs for the Qwen3
-codec decoder graph.
+- paged-KV talker seed graph converted in memory with OpenVINO `SDPAToPagedAttention`
+- GQA KV cache
+- `KV_CACHE_PRECISION=f16`
+- `block_size=16`
+- split-subcode mode
+- `int8_sym_paged_talker_split` for the paged talker seed
+- FP16 cached subcode graph
+- `speech_decoder_stream_c0_t8.xml` for the first chunk when available; older IR may use `c0_t12`
+- `speech_decoder_stream_c25_t24.xml` for steady chunks
 
-Build:
+The runtime requires these graphs to be present. Missing required graphs should
+fail fast instead of silently falling back to a slower or lower-quality path.
+
+## Build
 
 ```bash
 uv sync --extra native
 uv run python scripts/build_native_codegen.py
 ```
 
-The build creates both:
+Build outputs are ignored by git:
 
-- `native/build/libqwen3_tts_ov_genai.so`
-- `native/build/qwen3_tts_ov_native_cli`
-
-Run:
-
-```bash
-uv run python -m qwen3_tts_ov stream voice-design --realtime-profile fastest ...
+```text
+native/build/libqwen3_tts_ov_genai.so
+native/build/qwen3_tts_ov_native_cli
 ```
 
-`fastest` sets the required native environment automatically through the CLI and
-sidecar. Low-level environment variables remain available for devtools and
-operator profiling.
+## Runtime Usage
 
-`QWEN3_TTS_OV_NATIVE_ASYNC_DECODE=1` enables an experimental C++ decoder worker
-that overlaps codegen and audio decode. It is disabled by default because some
-iGPU/OpenVINO runtime combinations serialize or contend heavily when two GPU
-infer requests are submitted concurrently.
-
-`QWEN3_TTS_OV_NATIVE_REMOTE_EMBED=1` enables remote `frame_embed` chaining. The
-runtime reports `native_remote_embed=true` when the remote path is actually
-active.
-
-`QWEN3_TTS_OV_NATIVE_PROMPT=1` enables native VoiceDesign prompt construction.
-It requires `openvino_tokenizer.xml` and `openvino_detokenizer.xml` in the IR
-directory. Generate them with `python -m qwen3_tts_ov.exporter --tokenizer-only`.
-
-Standalone C++ smoke:
+The Python CLI and sidecar set the required native environment automatically
+when `--realtime-profile fastest` is used:
 
 ```bash
-native/build/qwen3_tts_ov_native_cli \
-  --ir-dir openvino_full \
+uv run python -m qwen3_tts_ov stream voice-design \
+  --ir-dir openvino/voice_design \
   --device GPU \
-  --decoder-device GPU \
-  --prompt-device CPU \
-  --text "你好" \
-  --instruct "自然朗读" \
-  --max-new-tokens 8 \
-  --min-new-tokens 1 \
-  --warmup-generations 1 \
-  --ov-profile \
-  --output outputs/native_cpp_smoke.wav \
-  --profile-json outputs/native_cpp_profile.json
+  --realtime-profile fastest \
+  --text "你好，这是 native pipeline 测试。" \
+  --instruct "用自然清晰的中文朗读。" \
+  --language Chinese
 ```
 
-The standalone CLI runs VoiceDesign prompt construction, codegen, streaming
-decode, and WAV writing in C++ through the native pipeline. Use `--cache-dir` to
-point it at a warmed OpenVINO cache directory when measuring startup latency.
-`--warmup-generations` runs unmeasured requests on the same compiled requests so
-that `--profile-json` can separate compile/setup cost from hot generation cost.
-The profile records compile/setup, prompt setup, warmup, first audio latency,
-generation, WAV writing, per-chunk codegen/decode timings, and native RTF
-metrics. `--ov-profile` enables OpenVINO `PERF_COUNT` in the native C++
-compiled models and adds `native_ov_profile.by_type/by_label/top` to the JSON,
-which is the preferred way to inspect codegen operator hotspots.
+Low-level flags remain available for diagnostics:
+
+- `--native-paged-kv require`
+- `--native-paged-kv-gqa on|off`
+- `--native-paged-kv-split-subcode on|off`
+- `--native-paged-kv-block-size N`
+- `--native-paged-kv-precision f16|bf16|f32`
+- `--native-paged-kv-score-aggregation on|off`
+
+Use these flags only for A/B testing. Production should use `--realtime-profile fastest`.
+
+## Long Text
+
+Long text still uses one full autoregressive sequence. The native pipeline
+supports sampled paged-KV split-subcode generation for quality-gated long text
+profiles. The default sidecar only enables that path after
+`scripts/evaluate_long_text_quality.py` writes a passing
+`outputs/long_text_quality/quality_summary.json`, when the IR manifest exposes
+the built-in `int8_sym_paged_talker_split` long-text graph set, or when
+`QWEN3_TTS_OV_LONG_AR_PROFILE=paged-sample-fp16|paged-sample-int8` is set.
+
+## Diagnostics
+
+Use these scripts before accepting a new native optimization:
+
+```bash
+uv run python scripts/verify_paged_kv_correctness.py --help
+uv run python scripts/verify_long_autoregressive_parity.py --help
+uv run python scripts/audit_paged_kv_conversion.py --help
+```
+
+`PERF_COUNT` and operator profiling are diagnostic-only. They slow down the
+small-graph autoregressive loop and should not be used for production RTF
+measurements.

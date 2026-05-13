@@ -1,16 +1,23 @@
 FASTEST_PROFILE_NAME = "fastest"
-FASTEST_MODE = "realtime-int8-sym-fused-cachedsub-norepeat"
-FASTEST_GRAPH_VARIANT = "int8_sym_fused_cachedsub"
+FASTEST_MODE = "no-cache"
+FASTEST_GRAPH_VARIANT = "int8_sym_paged_talker_split"
 FASTEST_CACHE_KERNEL = "exact"
 FASTEST_CACHE_STEP = "fused"
-FASTEST_CODEGEN_UNROLL = 4
+FASTEST_CODEGEN_UNROLL = 1
 FASTEST_CODEGEN_SCHEDULE = "current"
-FASTEST_CODEGEN_DECODE_UNROLL = "auto"
-FASTEST_PREFERRED_CACHE_BUCKET = 96
+FASTEST_CODEGEN_DECODE_UNROLL = "off"
+FASTEST_PREFERRED_CACHE_BUCKET = 0
 FASTEST_REPETITION_PENALTY = 1.0
 FASTEST_CHUNK_STRATEGY = "smooth"
 FASTEST_NATIVE_PIPELINE = "require"
-FASTEST_NATIVE_BUFFER_REUSE = "on"
+FASTEST_NATIVE_BUFFER_REUSE = "off"
+FASTEST_NATIVE_PAGED_KV = "require"
+FASTEST_NATIVE_PAGED_KV_GQA = "on"
+FASTEST_NATIVE_PAGED_KV_PRECISION = "f16"
+FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE = 16
+FASTEST_NATIVE_PAGED_KV_SPLIT_SUBCODE = "on"
+FASTEST_NATIVE_PAGED_KV_SCORE_AGGREGATION = "on"
+FASTEST_NATIVE_CODEGEN_DEVICE = "GPU"
 
 RUNTIME_MODE_CHOICES = (
     "fastest",
@@ -181,7 +188,7 @@ def effective_runtime_options(
     graph_variant: str,
 ) -> tuple[str, str, str, str]:
     if mode == FASTEST_PROFILE_NAME:
-        return effective_runtime_options(FASTEST_MODE, cache_kernel, cache_step, graph_variant)
+        return FASTEST_MODE, FASTEST_CACHE_KERNEL, FASTEST_CACHE_STEP, FASTEST_GRAPH_VARIANT
     if mode == "fast-cache":
         return "cache", "sdpa", "split", "int8_cachedsub"
     if mode == "realtime-int8":
@@ -219,7 +226,7 @@ def apply_realtime_profile(
     graph_variant: str,
 ) -> tuple[str, str, str, str]:
     if realtime_profile in {FASTEST_PROFILE_NAME, "auto"}:
-        return effective_runtime_options(FASTEST_MODE, cache_kernel, cache_step, graph_variant)
+        return FASTEST_MODE, FASTEST_CACHE_KERNEL, FASTEST_CACHE_STEP, FASTEST_GRAPH_VARIANT
     if realtime_profile == "int8":
         return effective_runtime_options("realtime-int8", cache_kernel, cache_step, graph_variant)
     if realtime_profile in {"int8-sym", "int8-sym-norepeat", "auto"}:
@@ -312,6 +319,13 @@ def fastest_runtime_defaults() -> dict:
         "chunk_strategy": FASTEST_CHUNK_STRATEGY,
         "native_pipeline": FASTEST_NATIVE_PIPELINE,
         "native_buffer_reuse": FASTEST_NATIVE_BUFFER_REUSE,
+        "native_paged_kv": FASTEST_NATIVE_PAGED_KV,
+        "native_paged_kv_gqa": FASTEST_NATIVE_PAGED_KV_GQA,
+        "native_paged_kv_precision": FASTEST_NATIVE_PAGED_KV_PRECISION,
+        "native_paged_kv_block_size": FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE,
+        "native_paged_kv_split_subcode": FASTEST_NATIVE_PAGED_KV_SPLIT_SUBCODE,
+        "native_paged_kv_score_aggregation": FASTEST_NATIVE_PAGED_KV_SCORE_AGGREGATION,
+        "native_codegen_device": FASTEST_NATIVE_CODEGEN_DEVICE,
     }
 
 
@@ -333,6 +347,11 @@ def scheduled_codegen_unrolls(codegen_schedule: str, primary_unroll: int) -> tup
 
 def missing_graph_variant_message(graph_variant: str, available: str) -> str:
     message = f"graph variant {graph_variant!r} not found in manifest; available variants: {available}"
+    if graph_variant == FASTEST_GRAPH_VARIANT:
+        message += (
+            ". Generate the production fastest variant after exporting paged-KV seed graphs with: "
+            "uv run python scripts/compress_openvino_weights.py --ir-dir auto --preset fastest"
+        )
     if graph_variant in {"int8_fused", "int8_sym_fused"}:
         mode = "int8_sym" if graph_variant == "int8_sym_fused" else "int8_asym"
         message += (

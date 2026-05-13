@@ -60,6 +60,15 @@ def update_variant(manifest: dict, variant: str, variant_graphs: dict, mode_name
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ir-dir", default="auto")
+    parser.add_argument(
+        "--preset",
+        default="custom",
+        choices=["custom", "fastest"],
+        help=(
+            "Convenience graph selection. 'fastest' creates the production "
+            "int8_sym_paged_talker_split variant for the native paged-KV path."
+        ),
+    )
     parser.add_argument("--variant", default="int8_fused")
     parser.add_argument(
         "--source-variant",
@@ -75,6 +84,12 @@ def main() -> None:
     parser.add_argument("--include-fused-cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-fused-unroll", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-fused-decode-unroll", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--include-paged-kv-seed", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--paged-kv-seed-keys",
+        default="fused_cache_step",
+        help="Comma-separated graphs.paged_kv_seed keys to compress, for example fused_cache_step,fused_cache_step_gqa.",
+    )
     parser.add_argument("--fused-cache-kernels", default="exact")
     parser.add_argument("--fused-cache-unroll-steps", default="4,6,8,12")
     parser.add_argument(
@@ -82,7 +97,27 @@ def main() -> None:
         action="store_true",
         help="Also compress Gather-backed embedding weights. Defaults to off to reduce TTS quality risk.",
     )
+    parser.add_argument(
+        "--ignore-patterns",
+        default="",
+        help="Comma-separated NNCF ignored-scope regex patterns. Useful for partial graph compression experiments.",
+    )
     args = parser.parse_args()
+
+    if args.preset == "fastest":
+        if args.variant == parser.get_default("variant"):
+            args.variant = "int8_sym_paged_talker_split"
+        if args.mode == parser.get_default("mode"):
+            args.mode = "int8_sym"
+        args.include_no_cache = False
+        args.include_subcode = False
+        args.include_cached_subcode = False
+        args.include_sdpa_cache = False
+        args.include_fused_cache = False
+        args.include_fused_unroll = False
+        args.include_fused_decode_unroll = False
+        args.include_paged_kv_seed = True
+        args.paged_kv_seed_keys = "talker_stateful_gqa"
 
     ir_dir = resolve_ir_dir(args.ir_dir, fallback_to_local_voice_design=True, warn=True)
     manifest_path = ir_dir / "manifest.json"
@@ -93,7 +128,11 @@ def main() -> None:
         "int8_asym": nncf.CompressWeightsMode.INT8_ASYM,
         "int8_sym": nncf.CompressWeightsMode.INT8_SYM,
     }[args.mode]
-    ignored_scope = None if args.compress_gather else nncf.IgnoredScope(types=["Gather"])
+    ignored_types = [] if args.compress_gather else ["Gather"]
+    ignored_patterns = parse_csv(args.ignore_patterns)
+    ignored_scope = None
+    if ignored_types or ignored_patterns:
+        ignored_scope = nncf.IgnoredScope(types=ignored_types, patterns=ignored_patterns, validate=False)
 
     graphs = copy.deepcopy(manifest["graphs"])
     if args.source_variant:
@@ -208,9 +247,28 @@ def main() -> None:
         compress_unroll_section("fused_cache_decode_unroll_stateful_mask_buckets", "fused cache decode unroll stateful mask")
         compress_unroll_section("fused_cache_decode_unroll_norepeat_buckets", "fused cache decode unroll no-repeat")
 
+    if args.include_paged_kv_seed:
+        selected_jobs += 1
+        paged_seed_section = graphs.get("paged_kv_seed", {})
+        if not paged_seed_section:
+            raise ValueError("manifest has no graphs.paged_kv_seed section")
+        compressed_seed_graphs = {}
+        for key in parse_csv(args.paged_kv_seed_keys):
+            source = paged_seed_section.get(key)
+            if not source:
+                raise ValueError(f"manifest has no graphs.paged_kv_seed.{key}")
+            target = add_suffix(source, f"_{args.variant}")
+            compress_model(ir_dir / source, ir_dir / target, mode, ignored_scope, args.force)
+            compressed_seed_graphs[key] = target
+        variant_graphs["paged_kv_seed"] = compressed_seed_graphs
+
     if selected_jobs == 0:
         raise ValueError("no graph groups selected for compression")
 
+    if args.preset == "fastest":
+        # Keep the production variant narrow and reproducible even if the same
+        # local IR was used for older compression experiments.
+        manifest.setdefault("graph_variants", {}).pop(args.variant, None)
     update_variant(manifest, args.variant, variant_graphs, args.mode)
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)

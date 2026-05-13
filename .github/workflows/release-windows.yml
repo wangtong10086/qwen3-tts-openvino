@@ -1,0 +1,54 @@
+name: release-windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version
+        required: true
+        default: 0.1.0
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra native --extra server --extra release
+      - name: Build native library
+        run: uv run python scripts/build_native_codegen.py --backend cmake
+      - name: Package release
+        run: |
+          uv run python scripts/package_release.py `
+            --target windows-x64 `
+            --version "${{ inputs.version }}"
+      - name: Smoke release package from PowerShell
+        shell: powershell
+        run: |
+          uv run python scripts/smoke_release_package.py `
+            --archive "dist/release/qwen3-tts-ov-server-windows-x64-${{ inputs.version }}.zip" `
+            --work-dir build/release-smoke-windows `
+            --port 17961 `
+            --exe-path-out build/release-smoke-windows/exe_path.txt
+      - name: Verify executable from cmd
+        shell: cmd
+        run: |
+          set /p EXE=<build\release-smoke-windows\exe_path.txt
+          "%EXE%" --help
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qwen3-tts-ov-server-windows-x64-${{ inputs.version }}-smoke-logs
+          path: build/release-smoke-windows/server.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qwen3-tts-ov-server-windows-x64-${{ inputs.version }}
+          path: dist/release/qwen3-tts-ov-server-windows-x64-${{ inputs.version }}.*

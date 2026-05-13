@@ -28,9 +28,17 @@ server = [
   "uvicorn",
   "websockets",
 ]
+quality = [
+  "openai",
+  "python-dotenv",
+]
 native = [
   "openvino-genai",
   "openvino-tokenizers",
+]
+release = [
+  "pyinstaller",
+  "zstandard",
 ]
 dev = [
   "pytest",
@@ -38,6 +46,7 @@ dev = [
 
 [project.scripts]
 qwen3-tts-ov = "qwen3_tts_ov.cli:main"
+qwen3-tts-ov-server = "qwen3_tts_ov.release_server:main"
 
 [build-system]
 requires = ["setuptools>=68"]

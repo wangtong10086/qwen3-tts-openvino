@@ -2,7 +2,20 @@ import types
 
 import numpy as np
 
-from qwen3_tts_ov.runtime import DEFAULT_STREAM_CHUNK_STRATEGIES, OpenVINOQwen3TTS
+from qwen3_tts_ov.runtime import (
+    DEFAULT_STREAM_CHUNK_STRATEGIES,
+    OpenVINOQwen3TTS,
+    effective_paged_kv_unroll,
+    env_flag_enabled,
+    paged_kv_seed_uses_gqa,
+    select_paged_kv_seed_key,
+)
+from qwen3_tts_ov.profiles import (
+    FASTEST_GRAPH_VARIANT,
+    FASTEST_PROFILE_NAME,
+    effective_runtime_options,
+    fastest_runtime_defaults,
+)
 
 
 class FakeTimings:
@@ -88,6 +101,17 @@ def test_stream_decode_codes_uses_initial_chunk_strategy_then_steady_chunk():
     assert chunks[1].timings["configured_chunk_frames"] == 2
 
 
+def test_decode_uses_streaming_decoder_when_full_decoder_missing():
+    runtime = make_runtime()
+    runtime.decoder_graphs = {}
+    runtime.streaming_decoder_graphs_by_context = {0: {12: "first.xml"}, 25: {24: "steady.xml"}}
+
+    audio = runtime.decode(np.asarray([[1, 2], [3, 4], [5, 6]], dtype=np.int64))
+
+    assert audio.shape[0] == 6
+    assert audio.dtype == np.float32
+
+
 def test_smooth_strategy_uses_low_latency_first_chunk_and_larger_steady_chunk():
     runtime = make_runtime()
     codes = [np.asarray([index, index + 10], dtype=np.int64) for index in range(32)]
@@ -125,3 +149,95 @@ def test_stream_decoder_key_prefers_first_chunk_then_left_context_graph():
     assert runtime._stream_decoder_key(0, 12, 12, 25) == (0, 12)
     assert runtime._stream_decoder_key(12, 12, 12, 25) == (25, 12)
     assert runtime._stream_decoder_key(25, 18, 12, 25) == (25, 24)
+
+
+def test_paged_kv_unroll_requires_explicit_experimental_flag():
+    assert effective_paged_kv_unroll(4, experimental_enabled=False) == 1
+    assert effective_paged_kv_unroll("4", experimental_enabled=True) == 4
+    assert effective_paged_kv_unroll(None, experimental_enabled=True) == 1
+
+
+def test_env_flag_enabled_accepts_common_truthy_values():
+    assert env_flag_enabled("1") is True
+    assert env_flag_enabled("true") is True
+    assert env_flag_enabled("yes") is True
+    assert env_flag_enabled("0") is False
+    assert env_flag_enabled(None) is False
+
+
+def test_paged_kv_seed_uses_gqa_for_subcode_variants():
+    assert paged_kv_seed_uses_gqa("fused_cache_step_gqa")
+    assert paged_kv_seed_uses_gqa("fused_cache_step_gqa_subcode_exact")
+    assert paged_kv_seed_uses_gqa("fused_cache_step_unroll4_gqa_subcode_exact")
+    assert not paged_kv_seed_uses_gqa("fused_cache_step_subcode_exact")
+
+
+def test_paged_kv_seed_auto_prefers_sdpa_for_speed():
+    graphs = {
+        "fused_cache_step_gqa": "fused_cache_step_sdpa_paged_gqa_seed.xml",
+        "fused_cache_step_gqa_subcode_exact": "fused_cache_step_sdpa_paged_gqa_subcode_exact_seed.xml",
+    }
+
+    key, subcode_attention, fallback = select_paged_kv_seed_key(graphs, prefer_gqa=True)
+
+    assert key == "fused_cache_step_gqa"
+    assert subcode_attention == "sdpa"
+    assert fallback is False
+
+
+def test_paged_kv_seed_auto_falls_back_to_sdpa_when_exact_missing():
+    graphs = {"fused_cache_step_gqa": "fused_cache_step_sdpa_paged_gqa_seed.xml"}
+
+    key, subcode_attention, fallback = select_paged_kv_seed_key(graphs, prefer_gqa=True)
+
+    assert key == "fused_cache_step_gqa"
+    assert subcode_attention == "sdpa"
+    assert fallback is False
+
+
+def test_paged_kv_seed_exact_reports_fallback_when_exact_missing():
+    graphs = {"fused_cache_step_gqa": "fused_cache_step_sdpa_paged_gqa_seed.xml"}
+
+    key, subcode_attention, fallback = select_paged_kv_seed_key(
+        graphs,
+        prefer_gqa=True,
+        subcode_attention="exact",
+    )
+
+    assert key == "fused_cache_step_gqa"
+    assert subcode_attention == "sdpa"
+    assert fallback is True
+
+
+def test_paged_kv_split_subcode_prefers_talker_stateful_gqa_seed():
+    graphs = {
+        "fused_cache_step_gqa": "fused_cache_step_sdpa_paged_gqa_seed.xml",
+        "talker_stateful_gqa": "talker_stateful_sdpa_paged_gqa_seed.xml",
+    }
+
+    key, subcode_attention, fallback = select_paged_kv_seed_key(
+        graphs,
+        prefer_gqa=True,
+        split_subcode=True,
+    )
+
+    assert key == "talker_stateful_gqa"
+    assert subcode_attention == "split"
+    assert fallback is False
+
+
+def test_fastest_profile_resolves_to_paged_kv_split_talker_variant():
+    assert effective_runtime_options(FASTEST_PROFILE_NAME, "exact", "fused", "fp16") == (
+        "no-cache",
+        "exact",
+        "fused",
+        FASTEST_GRAPH_VARIANT,
+    )
+
+    defaults = fastest_runtime_defaults()
+    assert defaults["graph_variant"] == "int8_sym_paged_talker_split"
+    assert defaults["native_pipeline"] == "require"
+    assert defaults["native_paged_kv"] == "require"
+    assert defaults["native_paged_kv_gqa"] == "on"
+    assert defaults["native_paged_kv_block_size"] == 16
+    assert defaults["native_paged_kv_split_subcode"] == "on"

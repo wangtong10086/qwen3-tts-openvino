@@ -1,52 +1,29 @@
 # Qwen3-TTS OpenVINO
 
-这是一个面向 Qwen3-TTS 12Hz 模型的 OpenVINO-only 推理仓库。仓库只保存源码、文档和小型示例，不保存模型权重、OpenVINO IR、生成音频、本地虚拟环境或 native 编译产物。
+OpenVINO-only 的 Qwen3-TTS 12Hz 推理、导出、流式 sidecar 和 native 加速仓库。
 
-生产主线只推荐 `fastest` profile：
+[English README](README.md) | [文档索引](docs/README.zh-CN.md) | [示例请求](examples/README.zh-CN.md)
 
-- 必须构建 native C++ pipeline。
-- 必须导出 cached-subcode fused graph。
-- 必须生成 `int8_sym_fused_cachedsub` 权重压缩 variant。
-- 必须包含 no-repeat `unroll4` 和 decode-unroll graph。
-- 默认 `chunk_strategy=smooth`，用于降低块间卡顿风险。
+本仓库是源码仓库，不提交模型权重、OpenVINO IR、生成音频、虚拟环境、OpenVINO 编译缓存或 native 编译产物。
 
-## 目录
+## 特性
 
-```text
-qwen3_tts_ov/    生产 runtime、exporter、sidecar、web demo 和 CLI
-native/          必需的 C++ OpenVINO GenAI-style pipeline 源码
-scripts/         生产辅助脚本：native 构建、权重压缩、realtime benchmark
-devtools/        实验 benchmark、profiling、旧入口和历史对照脚本
-docs/            中文补充文档
-examples/        JSON/JSONL 请求示例
-tests/           单元测试
-```
+- 支持 VoiceDesign、CustomVoice、VoiceClone。
+- `build-fastest` 一键构建当前验证过的最快路径，默认使用低内存 production 图集合。
+- native C++ codec 生成链路，使用 OpenVINO paged-KV attention。
+- 本地 sidecar 提供 WebSocket、HTTP NDJSON 和 OpenAI-compatible Speech API。
+- 流式输出 mono 24 kHz `pcm_s16le`。
+- 长文本默认完整上下文全自回归，不自动分段。
 
-以下目录由本地生成，默认不进入 git：
+## Quick Start
 
-```text
-models/
-openvino/
-openvino_full/
-outputs/
-.venv/
-native/build/
-```
-
-## 安装
+1. 安装依赖：
 
 ```bash
-git submodule update --init --recursive
 uv sync --extra native --extra server --extra export
-uv run python scripts/build_native_codegen.py
-uv run python -m qwen3_tts_ov --help
 ```
 
-`third_party/openvino.genai` 是 native 构建所需的 pinned submodule。Runtime 推理不导入 PyTorch；导出模型时才需要 export 依赖。
-
-## 下载模型
-
-VoiceDesign 示例：
+2. 下载 VoiceDesign 模型到本地 `models/`：
 
 ```bash
 uv run modelscope download \
@@ -54,203 +31,106 @@ uv run modelscope download \
   --local_dir ./models/Qwen3-TTS-12Hz-1.7B-VoiceDesign
 ```
 
-CustomVoice 和 Base/VoiceClone 需要分别下载对应模型目录。
-
-## 导出最快路径 IR
-
-VoiceDesign：
+3. 一键构建最快路径：
 
 ```bash
-uv run python -m qwen3_tts_ov export \
+uv run python -m qwen3_tts_ov build-fastest \
   --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
-  --model-type voice_design \
   --out-dir openvino/voice_design \
-  --cache-buckets 96,128,192,256,320,384 \
-  --cache-kernels exact \
-  --fused-cache-kernels exact \
-  --fused-subcode-mode cached \
-  --fused-cache-unroll-steps 4 \
-  --fused-cache-norepeat-steps 4 \
-  --decoder-tokens 64,128,256 \
-  --stream-decoder-chunks 8,12,24 \
-  --stream-decoder-first-chunks 8 \
-  --stream-decoder-left-context 25
+  --device GPU
 ```
 
-CustomVoice 使用相同参数，替换模型和输出目录：
+从旧导出产物完全重来时可加 `--clean --clean-native`。
 
-```bash
-uv run python -m qwen3_tts_ov export \
-  --model models/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-  --model-type custom_voice \
-  --out-dir openvino/custom_voice \
-  --cache-buckets 96,128,192,256,320,384 \
-  --cache-kernels exact \
-  --fused-cache-kernels exact \
-  --fused-subcode-mode cached \
-  --fused-cache-unroll-steps 4 \
-  --fused-cache-norepeat-steps 4 \
-  --decoder-tokens 64,128,256 \
-  --stream-decoder-chunks 8,12,24 \
-  --stream-decoder-first-chunks 8 \
-  --stream-decoder-left-context 25
-```
-
-Base/VoiceClone 额外加 `--export-clone-graphs`：
-
-```bash
-uv run python -m qwen3_tts_ov export \
-  --model models/Qwen3-TTS-12Hz-1.7B-Base \
-  --model-type base \
-  --out-dir openvino/base \
-  --cache-buckets 96,128,192,256,320,384 \
-  --cache-kernels exact \
-  --fused-cache-kernels exact \
-  --fused-subcode-mode cached \
-  --fused-cache-unroll-steps 4 \
-  --fused-cache-norepeat-steps 4 \
-  --decoder-tokens 64,128,256 \
-  --stream-decoder-chunks 8,12,24 \
-  --stream-decoder-first-chunks 8 \
-  --stream-decoder-left-context 25 \
-  --export-clone-graphs
-```
-
-压缩最快路径权重：
-
-```bash
-uv run python scripts/compress_openvino_weights.py \
-  --ir-dir openvino/voice_design \
-  --source-variant fp16_fused_cachedsub \
-  --variant int8_sym_fused_cachedsub \
-  --mode int8_sym \
-  --fused-cache-unroll-steps 4
-```
-
-对 CustomVoice/Base 重复同样压缩命令，替换 `--ir-dir`。
-
-## 预热与运行
-
-```bash
-uv run python -m qwen3_tts_ov cache-warmup \
-  --ir-dir openvino/voice_design \
-  --device GPU \
-  --realtime-profile fastest \
-  --graphs core,stream,buckets \
-  --preload-buckets warmup
-```
-
-启动 sidecar：
+4. 启动 sidecar：
 
 ```bash
 uv run python -m qwen3_tts_ov serve \
   --model-root openvino \
   --device GPU \
   --realtime-profile fastest \
-  --preload-modes voice_design \
-  --preload-buckets warmup \
   --host 127.0.0.1 \
   --port 17860
 ```
 
-浏览器测试页：
+5. 打开浏览器：
 
 ```text
 http://127.0.0.1:17860/
 ```
 
-## CLI 示例
+完整安装说明见 [docs/quick_start_zh.md](docs/quick_start_zh.md)。
 
-VoiceDesign 流式：
+## 当前生产路径
 
-```bash
-uv run python -m qwen3_tts_ov stream voice-design \
-  --ir-dir openvino/voice_design \
-  --device GPU \
-  --realtime-profile fastest \
-  --text "你好，这是一次流式 OpenVINO 合成测试。" \
-  --instruct "A calm young female voice." \
-  --language Chinese \
-  --chunk-dir outputs/stream \
-  --output outputs/stream.wav
+`fastest` profile 表示：
+
+- 必须构建 native C++ pipeline。
+- 必须导出 paged-KV seed graph。
+- 必须生成 `int8_sym_paged_talker_split` 权重压缩 variant。
+- 默认使用 `native paged-KV + GQA + split-subcode + block16`。
+- 默认 `chunk_strategy=smooth`，降低浏览器播放块间卡顿风险。
+
+长文本仍使用同一个 prompt 从头到尾全自回归生成。只要 IR manifest 包含最快路径需要的 paged seed 和 cached subcode 图，sidecar 会自动使用 sampled paged-KV full-AR 加速；缺图时才回退到 FP16 reference。自动分段只作为显式诊断 fallback。
+
+## 常用入口
+
+- 使用侧启动：`qwen3-tts-ov-server --model-root openvino --device GPU`
+- 一键构建：`uv run python -m qwen3_tts_ov build-fastest --model ...`
+- 启动服务：`uv run python -m qwen3_tts_ov serve --model-root openvino --device GPU`
+- 流式 CLI：`uv run python -m qwen3_tts_ov stream voice-design ...`
+- 批处理：`uv run python -m qwen3_tts_ov batch --batch-jsonl examples/requests.example.jsonl`
+- OpenAI-compatible API：`POST /v1/audio/speech`
+
+运行方式、Python API 和 HTTP/WebSocket 协议见 [docs/runtime_zh.md](docs/runtime_zh.md)。
+
+## 文档
+
+- [Quick Start](docs/quick_start_zh.md): 从空仓库到 Web Demo。
+- [Release 使用说明](docs/release_zh.md): 预编译 Linux/Windows 包的使用方式。
+- [开发说明](docs/development_zh.md): 源码开发、导出、压缩和 release 打包。
+- [运行接口](docs/runtime_zh.md): CLI、Python API、sidecar、OpenAI-compatible API。
+- [导出与压缩](docs/export_zh.md): 手动导出 IR 和生成 fastest variant。
+- [流式与长文本](docs/streaming_zh.md): 流式协议、长文本 full-AR、质量门禁。
+- [OpenVINO 编译缓存](docs/cache_zh.md): cache warmup 和缓存目录。
+- [大文件与产物策略](docs/artifacts_zh.md): 模型、IR、outputs、native build 的处理规则。
+- [安全说明](docs/security_zh.md): token、`.env`、凭据和提交检查。
+
+## 仓库结构
+
+```text
+qwen3_tts_ov/    runtime、exporter、CLI、sidecar 和 web demo
+native/          native C++ OpenVINO pipeline 源码
+scripts/         构建、压缩、benchmark、质量评测脚本
+devtools/        实验 benchmark、profiling 和 legacy 入口
+docs/            中文文档
+examples/        JSON/JSONL/长文本示例
+tests/           单元测试
 ```
 
-CustomVoice：
+默认不进入 git 的本地产物：
 
-```bash
-uv run python -m qwen3_tts_ov stream custom-voice \
-  --ir-dir openvino/custom_voice \
-  --device GPU \
-  --realtime-profile fastest \
-  --text "其实我真的有发现，我是一个特别善于观察别人情绪的人。" \
-  --speaker Vivian \
-  --instruct "用特别愤怒的语气说" \
-  --language Chinese \
-  --output outputs/custom_voice.wav
+```text
+models/
+openvino/
+openvino_full/
+outputs/
+.venv/
+.uv-cache/
+native/build/
 ```
 
-VoiceClone：
-
-```bash
-uv run python -m qwen3_tts_ov stream voice-clone \
-  --ir-dir openvino/base \
-  --device GPU \
-  --realtime-profile fastest \
-  --text "I am solving the equation, but it is a disaster." \
-  --language English \
-  --ref-audio /path/to/reference.wav \
-  --ref-text "Reference transcript for the audio." \
-  --output outputs/voice_clone.wav
-```
-
-## HTTP API
-
-WebSocket `/v1/tts/stream` 和 HTTP NDJSON `/v1/tts/stream` 都返回 `pcm_s16le` 音频块。OpenAI-compatible endpoint：
-
-```bash
-curl -N http://127.0.0.1:17860/v1/audio/speech \
-  -H "content-type: application/json" \
-  -d '{"model":"qwen3-tts-openvino","voice":"default","input":"你好，这是兼容 OpenAI Speech API 的流式 PCM。","language":"Chinese","task_type":"voice_design","instructions":"A calm young female voice.","stream":true,"response_format":"pcm"}' \
-  --output speech.pcm
-```
-
-## Python API
-
-```python
-from qwen3_tts_ov import OpenVINOQwen3TTS
-
-tts = OpenVINOQwen3TTS.from_ir("openvino/voice_design", device="GPU")
-for chunk in tts.stream_voice_design(
-    text="你好，这是 Python 流式 API 测试。",
-    instruct="A calm young female voice.",
-    language="Chinese",
-):
-    if chunk.audio.size:
-        print(chunk.index, chunk.audio.shape, chunk.is_final)
-```
-
-`from_ir()` 默认使用 `fastest` profile。需要低层实验参数时请直接调用构造函数或使用 `devtools/` 中的脚本。
-
-## Benchmark
-
-```bash
-uv run python scripts/benchmark_streaming_realtime.py \
-  --ir-dir openvino/voice_design \
-  --device GPU \
-  --profile-set fastest-gate \
-  --runs 3 \
-  --warmup-generations 1
-```
-
-输出写入 `outputs/realtime_bench/streaming_profiles.json`。`serve --realtime-profile auto` 会优先读取其中已接受的 p90 summary；没有结果时回到 `fastest`。
-
-## 常见问题
+## FAQ
 
 - **为什么仓库没有模型和 IR？**  
-  这些文件通常很大，必须本地下载和导出。
+  模型和导出的 IR 通常很大，必须本地下载和导出。
 
 - **为什么 native 是必需项？**  
-  当前最快路径依赖 C++ pipeline 将 codegen 和 streaming decoder 的关键循环移出 Python。缺少 native 库时生产路径会直接报错。
+  当前最快路径依赖 C++ pipeline 将 codec 自回归循环移出 Python。缺少 native 库时生产路径会直接报错。
 
-- **还保留旧优化实验吗？**  
-  保留在 `devtools/`，但不作为生产入口。主 README 只描述当前最快实现。
+- **如何先看一键构建会做什么？**
+  使用 `uv run python -m qwen3_tts_ov build-fastest --model ... --dry-run`。
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

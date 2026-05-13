@@ -8,6 +8,6 @@
   "stream": true,
   "response_format": "pcm",
   "chunk_strategy": "smooth",
-  "max_new_tokens": 128,
+  "max_new_tokens": 48,
   "min_new_tokens": 8
 }

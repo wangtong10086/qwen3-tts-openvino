@@ -12,6 +12,8 @@ import openvino as ov
 from .cache import merge_compile_config_with_cache_mode, normalize_ov_cache_mode, resolve_ov_cache_dir
 from .manifest import load_manifest, resolve_ir_dir
 from .profiles import (
+    FASTEST_GRAPH_VARIANT,
+    FASTEST_PROFILE_NAME,
     effective_codegen_unroll,
     effective_runtime_options,
     is_fastest_or_norepeat_mode,
@@ -174,6 +176,7 @@ def collect_warmup_tasks(
     manifest_graphs = manifest["graphs"]
     variant_graphs = load_graph_variant(manifest, effective_variant)
     use_no_repeat_graphs = is_fastest_or_norepeat_mode(mode)
+    fastest_paged_kv = mode == FASTEST_PROFILE_NAME or effective_variant == FASTEST_GRAPH_VARIANT
     tasks: list[WarmupTask] = []
 
     def add(label: str, graph: str | None, device_role: str = "runtime"):
@@ -187,7 +190,24 @@ def collect_warmup_tasks(
         add("core:text_embedding", graph_name(manifest_graphs, variant_graphs, "text_embedding"))
         add("core:codec_embedding", graph_name(manifest_graphs, variant_graphs, "codec_embedding"))
         add("core:code_frame_embedding", graph_name(manifest_graphs, variant_graphs, "code_frame_embedding"))
-        if effective_mode == "no-cache":
+        if fastest_paged_kv:
+            paged_seed_graphs = dict((manifest_graphs.get("paged_kv_seed") or {}))
+            paged_seed_graphs.update((variant_graphs.get("paged_kv_seed") or {}))
+            add(
+                "core:paged_kv_seed:talker_stateful_gqa",
+                paged_seed_graphs.get("talker_stateful_gqa")
+                or paged_seed_graphs.get("talker_stateful")
+                or paged_seed_graphs.get("fused_cache_step_gqa")
+                or paged_seed_graphs.get("fused_cache_step"),
+            )
+            add(
+                "core:subcode_greedy_cached",
+                variant_graphs.get("subcode_greedy_cached")
+                or manifest_graphs.get("subcode_greedy_cached")
+                or variant_graphs.get("subcode_greedy")
+                or manifest_graphs.get("subcode_greedy"),
+            )
+        elif effective_mode == "no-cache":
             add("core:talker", graph_name(manifest_graphs, variant_graphs, "talker"))
             add("core:subcode_greedy", graph_name(manifest_graphs, variant_graphs, "subcode_greedy"))
         elif effective_mode == "fused-no-cache":

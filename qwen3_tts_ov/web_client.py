@@ -468,6 +468,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
     let chunkCount = 0;
     let receivedSamples = 0;
     let startedAt = 0;
+    let endedAt = 0;
     let firstAudioAt = 0;
     let firstAudibleAt = 0;
     let lastAudioAt = 0;
@@ -481,6 +482,9 @@ WEB_CLIENT_HTML = r"""<!doctype html>
     let pendingAudioTiming = null;
     let timer = null;
     let forcedChunkStrategy = null;
+    let activeMaxNewTokens = 48;
+    let synthesisDone = false;
+    const autoSegmentUnits = 64;
     const strategyDefaults = {
       realtime: { initialChunkFrames: 8, chunkFrames: 12, leftContextFrames: 25 },
       low_latency: { initialChunkFrames: 8, chunkFrames: 12, leftContextFrames: 25 },
@@ -493,6 +497,34 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const host = location.host || "127.0.0.1:17860";
       return `${protocol}//${host}/v1/tts/stream`;
+    }
+
+    function speechTextUnitCount(text) {
+      const matches = String(text || "").match(/\s+|[A-Za-z0-9]+|[\u3400-\u9fff]|[^\s]/g) || [];
+      let count = 0;
+      for (const token of matches) {
+        if (!token || /^\s+$/.test(token)) continue;
+        if (/^[A-Za-z0-9]+$/.test(token)) {
+          count += 2;
+        } else if (/^[\u3400-\u9fff]$/.test(token)) {
+          count += 1;
+        } else if (!"。！？!?；;，,、.:：".includes(token)) {
+          count += 1;
+        }
+      }
+      return count;
+    }
+
+    function estimatedCodecFrames(text, requested) {
+      const units = speechTextUnitCount(text);
+      const estimate = Math.ceil(Math.max(48, units * 3.2 + 32));
+      return Math.min(2048, Math.max(Number(requested || 48), estimate));
+    }
+
+    function estimatedFullContextCodecFrames(text, requested) {
+      const units = speechTextUnitCount(text);
+      const estimate = Math.ceil(Math.max(48, units * 4.0 + 128));
+      return Math.min(2048, Math.max(Number(requested || 48), estimate));
     }
 
     function log(message) {
@@ -571,14 +603,29 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       const mode = els.mode.value;
       const strategy = forcedChunkStrategy || els.chunkStrategy.value;
       const defaults = strategyDefaults[strategy] || strategyDefaults.low_latency;
+      const textUnits = speechTextUnitCount(els.text.value);
+      const instructUnits = speechTextUnitCount(els.instruct.value);
+      const requestedMaxNewTokens = Number(els.maxNewTokens.value);
+      const fullContext = mode === "voice_design" && textUnits > autoSegmentUnits;
+      const autoSegment = false;
+      const effectiveMaxNewTokens = fullContext ? estimatedFullContextCodecFrames(els.text.value, requestedMaxNewTokens) : requestedMaxNewTokens;
+      const effectiveMaxPromptTokens = Math.min(2048, Math.max(512, textUnits + instructUnits + 96));
+      activeMaxNewTokens = effectiveMaxNewTokens;
       const payload = {
         mode,
         text: els.text.value,
         language: els.language.value,
         generation: {
-          max_new_tokens: Number(els.maxNewTokens.value),
+          max_new_tokens: effectiveMaxNewTokens,
           min_new_tokens: Number(els.minNewTokens.value),
+          max_prompt_tokens: effectiveMaxPromptTokens,
         },
+        auto_segment_text: false,
+        auto_segment_units: autoSegmentUnits,
+        auto_segment_append_prefix_to_prompt: false,
+        auto_segment_isolate_native_runner: true,
+        force_auto_segment_text: false,
+        full_context_text: fullContext,
         stream: {
           chunk_strategy: strategy,
           initial_chunk_frames: defaults.initialChunkFrames,
@@ -597,6 +644,9 @@ WEB_CLIENT_HTML = r"""<!doctype html>
         payload.ref_audio = els.refAudio.value;
         payload.ref_text = els.refText.value;
         payload.x_vector_only = els.xVectorOnly.checked;
+      }
+      if (fullContext) {
+        log(`长文本将使用完整上下文全自回归，预计约 ${activeMaxNewTokens} codec frames`);
       }
       return payload;
     }
@@ -636,17 +686,15 @@ WEB_CLIENT_HTML = r"""<!doctype html>
         this.inputSampleRate = inputSampleRate;
         this.outputSampleRate = this.context.sampleRate;
         this.callbacks = callbacks || {};
-        this.queue = [];
-        this.readOffset = 0;
-        this.queuedSamples = 0;
+        this.pending = [];
+        this.pendingSamples = 0;
+        this.sources = new Set();
+        this.nextStartTime = 0;
         this.started = false;
         this.stopped = false;
         this.underrunActive = false;
         this.firstOutputReported = false;
         this.targetBufferSamples = Math.max(1, Math.round(initialBufferSec * this.outputSampleRate));
-        this.node = this.context.createScriptProcessor(2048, 0, 1);
-        this.node.onaudioprocess = (event) => this.process(event.outputBuffer.getChannelData(0));
-        this.node.connect(this.context.destination);
       }
 
       async resume() {
@@ -664,56 +712,86 @@ WEB_CLIENT_HTML = r"""<!doctype html>
           this.context.resume().catch(() => {});
         }
         const floats = resampleLinear(pcm16ToFloat32(arrayBuffer), this.inputSampleRate, this.outputSampleRate);
-        this.queue.push(floats);
-        this.queuedSamples += floats.length;
-        if (!this.started && this.queuedSamples >= this.targetBufferSamples) {
-          this.started = true;
-          this.underrunActive = false;
-          if (this.callbacks.onStarted) this.callbacks.onStarted();
+        if (floats.length === 0) return this.queueSeconds();
+        if (!this.started) {
+          this.pending.push(floats);
+          this.pendingSamples += floats.length;
+          if (this.pendingSamples >= this.targetBufferSamples) {
+            this.startBuffered();
+          }
+        } else {
+          if (this.queueSeconds() < 0.04 && !this.underrunActive) {
+            this.underrunActive = true;
+            if (this.callbacks.onUnderrun) this.callbacks.onUnderrun();
+          }
+          this.schedule(floats);
         }
         return this.queueSeconds();
       }
 
-      queueSeconds() {
-        return this.queuedSamples / this.outputSampleRate;
+      startBuffered() {
+        if (this.started || this.pendingSamples <= 0) return;
+        this.started = true;
+        this.underrunActive = false;
+        this.nextStartTime = Math.max(this.context.currentTime + 0.06, this.nextStartTime || 0);
+        const items = this.pending;
+        this.pending = [];
+        this.pendingSamples = 0;
+        for (const floats of items) this.schedule(floats);
+        if (this.callbacks.onStarted) this.callbacks.onStarted();
       }
 
-      process(output) {
-        output.fill(0);
-        if (this.stopped || !this.started) return;
-        let wrote = 0;
-        for (let i = 0; i < output.length; i += 1) {
-          if (!this.queue.length) break;
-          const head = this.queue[0];
-          output[i] = head[this.readOffset];
-          this.readOffset += 1;
-          this.queuedSamples -= 1;
-          wrote += 1;
-          if (this.readOffset >= head.length) {
-            this.queue.shift();
-            this.readOffset = 0;
+      queueSeconds() {
+        if (!this.started) return this.pendingSamples / this.outputSampleRate;
+        return Math.max(0, this.nextStartTime - this.context.currentTime);
+      }
+
+      schedule(floats) {
+        if (this.stopped || floats.length === 0) return;
+        const buffer = this.context.createBuffer(1, floats.length, this.outputSampleRate);
+        buffer.copyToChannel(floats, 0);
+        const source = this.context.createBufferSource();
+        source.buffer = buffer;
+        source.connect(this.context.destination);
+        const startAt = Math.max(this.nextStartTime || 0, this.context.currentTime + 0.02);
+        this.nextStartTime = startAt + buffer.duration;
+        this.sources.add(source);
+        source.onended = () => {
+          try {
+            source.disconnect();
+          } catch (err) {
+            // ignore disconnect races during browser shutdown
           }
-        }
-        if (wrote > 0) {
-          this.underrunActive = false;
-          if (!this.firstOutputReported) {
-            this.firstOutputReported = true;
-            if (this.callbacks.onFirstOutput) this.callbacks.onFirstOutput();
+          this.sources.delete(source);
+          if (this.sources.size === 0 && this.started && !this.stopped) {
+            this.underrunActive = false;
+            if (this.callbacks.onEnded) this.callbacks.onEnded();
           }
-        }
-        if (wrote < output.length && !this.underrunActive) {
-          this.underrunActive = true;
-          if (this.callbacks.onUnderrun) this.callbacks.onUnderrun();
+        };
+        source.start(startAt);
+        this.underrunActive = false;
+        if (!this.firstOutputReported) {
+          this.firstOutputReported = true;
+          const delayMs = Math.max(0, (startAt - this.context.currentTime) * 1000);
+          setTimeout(() => {
+            if (!this.stopped && this.callbacks.onFirstOutput) this.callbacks.onFirstOutput();
+          }, delayMs);
         }
       }
 
       async stop() {
         this.stopped = true;
-        try {
-          this.node.disconnect();
-        } catch (err) {
-          // ignore disconnect races during browser shutdown
+        for (const source of Array.from(this.sources)) {
+          try {
+            source.stop();
+            source.disconnect();
+          } catch (err) {
+            // ignore stop races during browser shutdown
+          }
         }
+        this.sources.clear();
+        this.pending = [];
+        this.pendingSamples = 0;
         if (this.context && this.context.state !== "closed") {
           await this.context.close();
         }
@@ -751,17 +829,45 @@ WEB_CLIENT_HTML = r"""<!doctype html>
             updateMetrics(false);
           }
         },
+        onEnded: () => {
+          if (streamFinal && synthesisDone) {
+            els.playState.textContent = "播放完成";
+            updateMetrics(true);
+          }
+        },
       };
     }
 
     function setBusy(busy) {
       els.startBtn.disabled = busy;
       els.stopBtn.disabled = !busy;
-      els.playState.textContent = busy ? "合成中" : "空闲";
+      if (busy) {
+        els.playState.textContent = "合成中";
+      } else if (player && player.started && player.queueSeconds() > 0.05) {
+        els.playState.textContent = "播放中";
+      } else {
+        els.playState.textContent = "空闲";
+      }
+    }
+
+    function stopMetricsTimer() {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    }
+
+    function finishRun(final = false) {
+      if (!endedAt) endedAt = performance.now();
+      synthesisDone = Boolean(final);
+      stopMetricsTimer();
+      updateMetrics(final);
+      setBusy(false);
     }
 
     function updateMetrics(final = false) {
-      const elapsed = startedAt ? (performance.now() - startedAt) / 1000 : 0;
+      const clockNow = endedAt || performance.now();
+      const elapsed = startedAt ? (clockNow - startedAt) / 1000 : 0;
       els.totalTime.textContent = `${elapsed.toFixed(2)}s`;
       els.chunkCount.textContent = String(chunkCount);
       els.audioDuration.textContent = `${(receivedSamples / sampleRate).toFixed(2)}s`;
@@ -771,7 +877,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       els.underrunCount.textContent = String(underrunCount);
       els.rtfValue.textContent = latestRtf ? latestRtf.toFixed(2) : "-";
       els.strategyValue.textContent = els.chunkStrategy.value;
-      const maxTokens = Math.max(1, Number(els.maxNewTokens.value));
+      const maxTokens = Math.max(1, Number(activeMaxNewTokens || els.maxNewTokens.value));
       const expectedChunks = Math.max(1, Math.ceil(maxTokens / Math.max(1, Number(els.chunkFrames.value))));
       els.receiveBar.style.width = `${final ? 100 : Math.min(95, (chunkCount / expectedChunks) * 100)}%`;
       if (player) {
@@ -788,6 +894,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       chunkCount = 0;
       receivedSamples = 0;
       startedAt = performance.now();
+      endedAt = 0;
       firstAudioAt = 0;
       firstAudibleAt = 0;
       lastAudioAt = 0;
@@ -797,7 +904,9 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       targetBufferSec = 0.25;
       latestRtf = 0;
       pendingAudioTiming = null;
+      synthesisDone = false;
       sampleRate = 24000;
+      activeMaxNewTokens = Number(els.maxNewTokens.value);
       els.downloadBtn.disabled = true;
       els.receiveBar.style.width = "0%";
       els.queueBar.style.width = "0%";
@@ -861,10 +970,12 @@ WEB_CLIENT_HTML = r"""<!doctype html>
               `metadata sample_rate=${sampleRate}, format=${data.format}, ` +
               `strategy=${data.chunk_strategy || "-"}, initial=${data.initial_chunk_frames || "-"}, chunk=${data.chunk_frames || "-"}, ` +
               `profile=${data.realtime_profile || "-"}, variant=${data.graph_variant || "-"}, unroll=${data.codegen_unroll || 1}, schedule=${data.codegen_schedule || "current"}, ` +
-              `continuous=${data.continuous_long_output ? "yes" : "no"}, paged_kv=${data.paged_kv ? "yes" : "no"}`
+              `long=${data.long_text_mode || "-"}, segmented=${data.segmented ? "yes" : "no"}, ` +
+              `sample=${data.long_ar_do_sample ? "yes" : "no"}, continuous=${data.continuous_long_output ? "yes" : "no"}, paged_kv=${data.paged_kv ? "yes" : "no"}`
             );
           } else if (data.type === "final") {
             streamFinal = true;
+            if (player) player.startBuffered();
             if (data.timings) {
               latestRtf = Number(data.timings.stream_rtf || data.timings.rtf || latestRtf || 0);
             }
@@ -873,7 +984,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
               `final index=${data.index}, elapsed=${Number(data.elapsed || 0).toFixed(3)}s, ` +
               `stream_rtf=${latestRtf ? latestRtf.toFixed(2) : "-"}`
             );
-            setBusy(false);
+            finishRun(true);
             els.downloadBtn.disabled = chunks.length === 0;
             if (ws) ws.close();
           } else if (data.type === "audio") {
@@ -887,13 +998,16 @@ WEB_CLIENT_HTML = r"""<!doctype html>
               `unroll=${pendingAudioTiming && pendingAudioTiming.codegen_unroll ? pendingAudioTiming.codegen_unroll : 1}, ` +
               `schedule=${pendingAudioTiming && pendingAudioTiming.codegen_schedule ? pendingAudioTiming.codegen_schedule : "current"}, ` +
               `unroll_fallback=${pendingAudioTiming && pendingAudioTiming.unroll_fallback ? "yes" : "no"}, ` +
+              `long=${pendingAudioTiming && pendingAudioTiming.long_text_mode ? pendingAudioTiming.long_text_mode : "-"}, ` +
+              `segmented=${pendingAudioTiming && pendingAudioTiming.segmented ? "yes" : "no"}, ` +
+              `sample=${pendingAudioTiming && pendingAudioTiming.long_ar_do_sample ? "yes" : "no"}, ` +
               `continuous=${pendingAudioTiming && pendingAudioTiming.continuous_long_output ? "yes" : "no"}, ` +
               `chunk_rtf=${pendingAudioTiming && pendingAudioTiming.rtf ? Number(pendingAudioTiming.rtf).toFixed(2) : "-"}, ` +
               `stream_rtf=${pendingAudioTiming && pendingAudioTiming.stream_rtf ? Number(pendingAudioTiming.stream_rtf).toFixed(2) : "-"}`
             );
           } else if (data.type === "error") {
             log(`error ${data.message}`);
-            setBusy(false);
+            finishRun(false);
           } else {
             log(JSON.stringify(data));
           }
@@ -905,7 +1019,14 @@ WEB_CLIENT_HTML = r"""<!doctype html>
         if (lastAudioAt) lastChunkIntervalMs = now - lastAudioAt;
         lastAudioAt = now;
         chunks.push(event.data);
-        playPcmChunk(event.data);
+        try {
+          playPcmChunk(event.data);
+        } catch (err) {
+          log(`audio playback error ${err && err.message ? err.message : err}`);
+          finishRun(false);
+          if (ws) ws.close();
+          return;
+        }
         const chunkAudioMs = event.data.byteLength / 2 / sampleRate * 1000;
         const chunkElapsedMs = lastChunkIntervalMs || (now - startedAt);
         if (pendingAudioTiming) {
@@ -921,15 +1042,15 @@ WEB_CLIENT_HTML = r"""<!doctype html>
 
       ws.onerror = () => {
         log("WebSocket 连接错误");
-        setBusy(false);
+        finishRun(false);
       };
 
       ws.onclose = () => {
         ws = null;
-        if (els.stopBtn.disabled === false) setBusy(false);
+        if (els.stopBtn.disabled === false) finishRun(false);
       };
 
-      clearInterval(timer);
+      stopMetricsTimer();
       timer = setInterval(() => updateMetrics(false), 200);
     }
 
@@ -943,7 +1064,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
         player = null;
         audioContext = null;
       }
-      setBusy(false);
+      finishRun(false);
       log("已停止");
     }
 
