@@ -100,6 +100,18 @@ Open the web demo at `http://127.0.0.1:17860/`.
     (bundle_dir / "README_RELEASE.md").write_text(text, encoding="utf-8")
 
 
+def ensure_native_library_in_bundle(bundle_dir: Path, native_lib: Path) -> None:
+    targets = [
+        bundle_dir / "native" / "build" / native_lib.name,
+        bundle_dir / "_internal" / "native" / "build" / native_lib.name,
+        bundle_dir / "_internal" / native_lib.name,
+    ]
+    for target in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists() or target.stat().st_size != native_lib.stat().st_size:
+            shutil.copy2(native_lib, target)
+
+
 def make_archive(bundle_dir: Path, output: Path, archive_format: str) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
     if archive_format == "zip":
@@ -219,6 +231,7 @@ def main() -> None:
     if release_bundle.exists():
         shutil.rmtree(release_bundle)
     shutil.copytree(bundle_dir, release_bundle)
+    ensure_native_library_in_bundle(release_bundle, native_lib)
     write_release_readme(release_bundle, args.version)
     make_archive(release_bundle, output, archive_format)
     print(output, flush=True)

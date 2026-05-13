@@ -133,6 +133,20 @@ def test_package_release_dry_run_uses_server_entry_and_native_lib(tmp_path):
     assert "qwen3_tts_ov_server_entry.py" in " ".join(payload["cmd"])
 
 
+def test_package_release_places_native_library_in_frozen_search_paths(tmp_path):
+    package_release = load_script("scripts/package_release.py")
+    native_lib = tmp_path / "qwen3_tts_ov_genai.dll"
+    native_lib.write_bytes(b"fake dll")
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir()
+
+    package_release.ensure_native_library_in_bundle(bundle_dir, native_lib)
+
+    assert (bundle_dir / "native" / "build" / native_lib.name).read_bytes() == b"fake dll"
+    assert (bundle_dir / "_internal" / "native" / "build" / native_lib.name).read_bytes() == b"fake dll"
+    assert (bundle_dir / "_internal" / native_lib.name).read_bytes() == b"fake dll"
+
+
 def test_build_native_codegen_parses_dumpbin_exports():
     build_native = load_script("scripts/build_native_codegen.py")
     output = """

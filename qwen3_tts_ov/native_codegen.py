@@ -15,6 +15,9 @@ class NativeCodegenUnavailable(RuntimeError):
     pass
 
 
+_DLL_DIRECTORY_HANDLES = []
+
+
 def native_library_name() -> str:
     if os.name == "nt":
         return "qwen3_tts_ov_genai.dll"
@@ -64,6 +67,36 @@ def ensure_openvino_tokenizers_extension_env() -> None:
         os.environ["OPENVINO_TOKENIZERS_PATH_GENAI"] = str(extension_path)
 
 
+def ensure_windows_dll_search_paths(library_path: Path) -> None:
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return
+    roots = [library_path.parent]
+    frozen_root = getattr(sys, "_MEIPASS", None)
+    if frozen_root:
+        roots.append(Path(frozen_root))
+    if getattr(sys, "frozen", False):
+        roots.append(Path(sys.executable).resolve().parent)
+    for module_name, subdir in (
+        ("openvino", "libs"),
+        ("openvino_genai", ""),
+        ("openvino_tokenizers", "lib"),
+    ):
+        try:
+            module = __import__(module_name)
+        except Exception:
+            continue
+        module_dir = Path(getattr(module, "__file__", "")).resolve().parent
+        roots.append(module_dir / subdir if subdir else module_dir)
+
+    seen = set()
+    for root in roots:
+        root = root.resolve()
+        if root in seen or not root.exists():
+            continue
+        seen.add(root)
+        _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(root)))
+
+
 class NativeCodegenRunner:
     def __init__(
         self,
@@ -86,6 +119,7 @@ class NativeCodegenRunner:
                 f"native codegen library not found: {library_path}; build it with `uv run python scripts/build_native_codegen.py`"
             )
         ensure_openvino_tokenizers_extension_env()
+        ensure_windows_dll_search_paths(library_path)
         self.library_path = library_path
         self.lib = ctypes.CDLL(str(library_path))
         self._configure_api()
