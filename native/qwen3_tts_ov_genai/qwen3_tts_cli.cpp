@@ -210,12 +210,23 @@ std::string json_escape(const std::string& value) {
     return out;
 }
 
+void set_env_var(const char* name, const char* value, bool overwrite) {
+#ifdef _WIN32
+    if (!overwrite && std::getenv(name)) {
+        return;
+    }
+    _putenv_s(name, value);
+#else
+    setenv(name, value, overwrite ? 1 : 0);
+#endif
+}
+
 void ensure_tokenizer_extension_path() {
     if (std::getenv("OPENVINO_TOKENIZERS_PATH_GENAI")) {
         return;
     }
 #ifdef DEFAULT_OPENVINO_TOKENIZERS_PATH
-    setenv("OPENVINO_TOKENIZERS_PATH_GENAI", DEFAULT_OPENVINO_TOKENIZERS_PATH, 0);
+    set_env_var("OPENVINO_TOKENIZERS_PATH_GENAI", DEFAULT_OPENVINO_TOKENIZERS_PATH, false);
 #endif
 }
 
@@ -417,7 +428,7 @@ int main(int argc, char** argv) {
         ensure_tokenizer_extension_path();
         Options options = parse_args(argc, argv);
         if (options.ov_profile) {
-            setenv("QWEN3_TTS_OV_NATIVE_PERF_COUNT", "1", 1);
+            set_env_var("QWEN3_TTS_OV_NATIVE_PERF_COUNT", "1", true);
         }
         const auto total_started = Clock::now();
         std::filesystem::create_directories(options.cache_dir);

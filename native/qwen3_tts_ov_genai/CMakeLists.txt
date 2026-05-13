@@ -43,10 +43,12 @@ if(BUILD_NATIVE_CLI)
       "${CMAKE_CURRENT_SOURCE_DIR}"
   )
   if(OPENVINO_TOKENIZERS_PATH)
+    set(OPENVINO_TOKENIZERS_PATH_CPP "${OPENVINO_TOKENIZERS_PATH}")
+    file(TO_CMAKE_PATH "${OPENVINO_TOKENIZERS_PATH_CPP}" OPENVINO_TOKENIZERS_PATH_CPP)
     target_compile_definitions(
       qwen3_tts_ov_native_cli
       PRIVATE
-        DEFAULT_OPENVINO_TOKENIZERS_PATH="${OPENVINO_TOKENIZERS_PATH}"
+        DEFAULT_OPENVINO_TOKENIZERS_PATH="${OPENVINO_TOKENIZERS_PATH_CPP}"
     )
   endif()
   target_link_libraries(qwen3_tts_ov_native_cli PRIVATE qwen3_tts_ov_genai)
