@@ -80,6 +80,22 @@ def test_probe_selects_runtime_minimal_stream_decoders():
     )
 
 
+def test_probe_selects_optional_audio_encoder_graphs():
+    probe = load_script("probe_windows_gpu_npu.py")
+    manifest = {
+        "graphs": {
+            "speech_encoder": "speech_encoder.xml",
+            "speaker_encoder": "speaker_encoder.xml",
+            "text_embedding": "text_embedding.xml",
+        }
+    }
+
+    assert probe.select_audio_encoder_graphs(manifest) == [
+        ("speech_encoder", "speech_encoder.xml"),
+        ("speaker_encoder", "speaker_encoder.xml"),
+    ]
+
+
 def test_probe_zero_copy_reports_api_visibility_without_requiring_it():
     probe = load_script("probe_windows_gpu_npu.py")
 

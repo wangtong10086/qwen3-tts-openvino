@@ -33,6 +33,15 @@ def load_manifest(model_root: Path) -> tuple[Path, dict]:
         return ir_dir, json.load(handle)
 
 
+def load_optional_manifest(model_root: Path, mode_dir: str) -> tuple[Path, dict] | None:
+    ir_dir = model_root / mode_dir
+    manifest_path = ir_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        return ir_dir, json.load(handle)
+
+
 def select_stream_decoder_graphs(manifest: dict) -> tuple[str, str]:
     contexts = (manifest.get("streaming_decoder") or {}).get("contexts") or {}
     first_context = contexts.get("0") or contexts.get(0) or {}
@@ -44,24 +53,41 @@ def select_stream_decoder_graphs(manifest: dict) -> tuple[str, str]:
     return str(first_graph), str(steady_graph)
 
 
-def compile_decoder_graphs(core, ir_dir: Path, graphs: list[str], decoder_device: str, cache_dir: Path | None) -> list[dict]:
+def select_audio_encoder_graphs(manifest: dict) -> list[tuple[str, str]]:
+    graphs = manifest.get("graphs") or {}
+    selected = []
+    for key in ("speech_encoder", "speaker_encoder"):
+        graph = graphs.get(key)
+        if isinstance(graph, str) and graph:
+            selected.append((key, graph))
+    return selected
+
+
+def compile_named_graphs(
+    core,
+    ir_dir: Path,
+    graphs: list[tuple[str, str]],
+    device: str,
+    cache_dir: Path | None,
+) -> list[dict]:
     config = {}
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
         config["CACHE_DIR"] = str(cache_dir)
         config["CACHE_MODE"] = "OPTIMIZE_SPEED"
     compiled = []
-    for graph in graphs:
+    for label, graph in graphs:
         path = ir_dir / graph
         if not path.exists():
-            raise FileNotFoundError(f"streaming decoder graph not found: {path}")
+            raise FileNotFoundError(f"{label} graph not found: {path}")
         started = time.time()
-        model = core.compile_model(str(path), decoder_device, config)
+        model = core.compile_model(str(path), device, config)
         request = model.create_infer_request()
         compiled.append(
             {
+                "label": label,
                 "graph": graph,
-                "device": decoder_device,
+                "device": device,
                 "compile_ms": round((time.time() - started) * 1000.0, 3),
                 "inputs": [str(item.get_any_name()) for item in model.inputs],
                 "outputs": [str(item.get_any_name()) for item in model.outputs],
@@ -69,6 +95,16 @@ def compile_decoder_graphs(core, ir_dir: Path, graphs: list[str], decoder_device
             }
         )
     return compiled
+
+
+def compile_decoder_graphs(core, ir_dir: Path, graphs: list[str], decoder_device: str, cache_dir: Path | None) -> list[dict]:
+    return compile_named_graphs(
+        core,
+        ir_dir,
+        [(f"stream_decoder:{graph}", graph) for graph in graphs],
+        decoder_device,
+        cache_dir,
+    )
 
 
 def zero_copy_probe(core, devices: list[str]) -> dict:
@@ -118,6 +154,7 @@ def main() -> None:
     parser.add_argument("--model-root", required=True)
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default="NPU")
+    parser.add_argument("--skip-audio-encoders", action="store_true")
     parser.add_argument("--skip-if-missing-devices", action="store_true")
     parser.add_argument("--require-zero-copy", action="store_true")
     parser.add_argument("--cache-dir", default=None)
@@ -132,6 +169,7 @@ def main() -> None:
         "decoder_device": args.decoder_device,
         "available_devices": [],
         "decoder_compile": [],
+        "audio_encoder_compile": {"status": "not_run", "graphs": []},
         "zero_copy_probe": {},
     }
 
@@ -167,6 +205,46 @@ def main() -> None:
                 write_summary(summary, args.output_json)
                 raise SystemExit(0)
             raise
+        if args.skip_audio_encoders:
+            summary["audio_encoder_compile"] = {"status": "skipped", "reason": "disabled", "graphs": []}
+        else:
+            base_manifest = load_optional_manifest(Path(args.model_root).resolve(), "base")
+            if base_manifest is None:
+                summary["audio_encoder_compile"] = {
+                    "status": "skipped",
+                    "reason": "base manifest not found",
+                    "graphs": [],
+                }
+            else:
+                base_ir_dir, base_payload = base_manifest
+                audio_graphs = select_audio_encoder_graphs(base_payload)
+                if not audio_graphs:
+                    summary["audio_encoder_compile"] = {
+                        "status": "skipped",
+                        "reason": "base manifest has no audio encoder graphs",
+                        "graphs": [],
+                    }
+                else:
+                    try:
+                        summary["audio_encoder_compile"] = {
+                            "status": "ok",
+                            "graphs": compile_named_graphs(
+                                core,
+                                base_ir_dir,
+                                audio_graphs,
+                                args.decoder_device,
+                                Path(args.cache_dir).resolve() / "audio-encoders" if args.cache_dir else None,
+                            ),
+                        }
+                    except Exception as exc:
+                        if args.skip_if_missing_devices:
+                            summary["audio_encoder_compile"] = {
+                                "status": "skipped",
+                                "reason": f"NPU audio encoder compile failed: {exc}",
+                                "graphs": [],
+                            }
+                        else:
+                            raise
         summary["zero_copy_probe"] = zero_copy_probe(core, available_devices)
         if args.require_zero_copy:
             contexts = summary["zero_copy_probe"].get("contexts") or {}

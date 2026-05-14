@@ -125,7 +125,7 @@ self-hosted, Windows, X64, npu
 
 ## 零拷贝 Probe
 
-`probe_windows_gpu_npu.py` 会记录 OpenVINO Python remote-context API 的可见性：
+`probe_windows_gpu_npu.py` 会先编译 VoiceDesign streaming decoder 到 NPU。如果模型根目录还包含 `base/manifest.json`，它也会尝试把 VoiceClone 需要的 `speech_encoder` 和 `speaker_encoder` 编译到 NPU。最后会记录 OpenVINO Python remote-context API 的可见性：
 
 ```bash
 uv run python scripts/probe_windows_gpu_npu.py \
@@ -137,3 +137,5 @@ uv run python scripts/probe_windows_gpu_npu.py \
 ```
 
 当前零拷贝 probe 只作为诊断信息。真正的 GPU/NPU shared-handle zero-copy 需要 native handle 和 RemoteTensor 集成，未作为默认推理路径启用。需要把 remote-context 可用性作为硬性要求时，传入 `--require-zero-copy`。
+
+只想验证 streaming decoder、不验证 Base/VoiceClone 音频 encoder 时，传入 `--skip-audio-encoders`。
