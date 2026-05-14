@@ -58,8 +58,8 @@ uv run python -m qwen3_tts_ov serve \
 正式 runtime 发布使用 GitHub Actions 的 `release-runtime`：
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 该 workflow 会自动：
@@ -78,7 +78,7 @@ Linux 当前机器：
 ```bash
 uv run python scripts/package_release.py \
   --target linux-x64 \
-  --version 0.1.2 \
+  --version 0.1.3 \
   --profile runtime-minimal
 ```
 
@@ -86,7 +86,7 @@ Windows release 必须在 Windows runner 上构建：
 
 ```powershell
 uv run python scripts/build_native_codegen.py --backend cmake
-uv run python scripts/package_release.py --target windows-x64 --version 0.1.2 --profile runtime-minimal
+uv run python scripts/package_release.py --target windows-x64 --version 0.1.3 --profile runtime-minimal
 ```
 
 `runtime-minimal` 是最终用户推荐包，只保留当前最快稳定的 native paged-KV 长文本完整自回归路径。需要调试 fallback、实验图或更宽音频格式兼容时使用 `--profile full`，并按需安装 `audio-full` extra。
@@ -97,7 +97,7 @@ uv run python scripts/package_release.py --target windows-x64 --version 0.1.2 --
 uv run python scripts/package_ir.py \
   --ir-dir openvino/voice_design \
   --model-type voice_design \
-  --version 0.1.2 \
+  --version 0.1.3 \
   --profile runtime-minimal
 ```
 

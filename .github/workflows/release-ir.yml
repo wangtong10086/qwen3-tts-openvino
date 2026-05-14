@@ -6,7 +6,7 @@ on:
       version:
         description: Release version
         required: true
-        default: 0.1.2
+        default: 0.1.3
       ir_dir:
         description: Existing IR directory on the runner
         required: true
