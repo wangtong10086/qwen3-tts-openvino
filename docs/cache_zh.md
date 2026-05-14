@@ -28,6 +28,20 @@ uv run python -m qwen3_tts_ov cache-warmup \
 
 `fastest` 当前是 paged-KV no-cache profile，因此 `buckets` 不会强制编译旧 fixed-bucket 图；保留该参数是为了和其它诊断 profile 兼容。
 
+Windows GPU+NPU 异构部署时，让预热和服务端使用同一套设备决策：
+
+```powershell
+uv run python -m qwen3_tts_ov cache-warmup `
+  --ir-dir openvino/voice_design `
+  --device GPU `
+  --npu-offload decoder `
+  --realtime-profile fastest `
+  --graphs core,stream,buckets `
+  --preload-buckets warmup
+```
+
+`--npu-offload auto` 会在检测到 OpenVINO `NPU` 时把 streaming decoder 缓存预热到 NPU；`decoder/require` 会在缺少 NPU 时直接失败。
+
 ## 查看将编译哪些图
 
 ```bash

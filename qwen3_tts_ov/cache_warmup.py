@@ -466,6 +466,8 @@ def subprocess_base_args(args: argparse.Namespace, compile_config: dict) -> list
     ]
     if args.decoder_device:
         cmd.extend(["--decoder-device", args.decoder_device])
+    if getattr(args, "npu_offload", None):
+        cmd.extend(["--npu-offload", args.npu_offload])
     if args.ov_cache_dir:
         cmd.extend(["--ov-cache-dir", str(args.ov_cache_dir)])
     if args.disable_ov_cache:
@@ -524,6 +526,10 @@ def run_cache_warmup(args: argparse.Namespace, compile_config: dict) -> dict:
         "ir_dir": str(Path(args.ir_dir).resolve()),
         "cache_dir": None if cache_dir is None else str(cache_dir),
         "ov_cache_mode": normalize_ov_cache_mode(args.ov_cache_mode),
+        "device": args.device,
+        "decoder_device": args.decoder_device or args.device,
+        "npu_offload": getattr(args, "npu_offload", "off"),
+        "npu_offload_decision": getattr(args, "npu_offload_decision", None),
         "preferred_cache_bucket": normalize_preferred_cache_bucket(args.preferred_cache_bucket),
         "task_count": len(tasks),
         "tasks": [asdict(task) for task in tasks],

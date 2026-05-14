@@ -631,11 +631,27 @@ def run_serve(args):
     )
 
 
+def apply_npu_offload(args):
+    npu_offload = getattr(args, "npu_offload", "off")
+    if npu_offload is None:
+        return
+    from .server import resolve_npu_offload
+
+    decision = resolve_npu_offload(
+        device=getattr(args, "device", "GPU"),
+        decoder_device=getattr(args, "decoder_device", None),
+        npu_offload=npu_offload,
+    )
+    args.decoder_device = decision["decoder_device"]
+    args.npu_offload_decision = decision
+
+
 def run_cache_warmup_command(args):
     from .cache_warmup import run_cache_warmup, run_single_task
 
     apply_profile_defaults(args)
     apply_native_env(args)
+    apply_npu_offload(args)
     if args.single_task_json:
         result = run_single_task(args)
         print(json.dumps(result, ensure_ascii=False), flush=True)
@@ -669,6 +685,12 @@ def add_cache_warmup_args(parser):
     )
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
+    parser.add_argument(
+        "--npu-offload",
+        default="off",
+        choices=NPU_OFFLOAD_CHOICES,
+        help="Warm cache for Windows GPU+NPU mode. auto selects NPU decoder when available; decoder/require fail if NPU is missing.",
+    )
     parser.add_argument(
         "--realtime-profile",
         default=FASTEST_PROFILE_NAME,
@@ -720,6 +742,7 @@ def add_build_fastest_args(parser):
     )
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
+    parser.add_argument("--npu-offload", default="off", choices=NPU_OFFLOAD_CHOICES)
     parser.add_argument("--ov-cache-dir", default=None)
     parser.add_argument("--disable-ov-cache", action="store_true")
     parser.add_argument("--preload-buckets", default="warmup")

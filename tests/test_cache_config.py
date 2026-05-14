@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from qwen3_tts_ov.cache import build_ov_cache_config, default_ov_cache_root, normalize_ov_cache_mode, resolve_ov_cache_dir
-from qwen3_tts_ov.cache_warmup import collect_warmup_tasks, select_buckets
+from qwen3_tts_ov.cache_warmup import collect_warmup_tasks, select_buckets, subprocess_base_args
 from qwen3_tts_ov.cli import apply_native_env, apply_profile_defaults
 from qwen3_tts_ov.manifest import resolve_ir_dir
 from qwen3_tts_ov.profiles import (
@@ -117,6 +117,32 @@ def test_cache_warmup_prefers_common_low_latency_bucket():
     available = {80: "cache80.xml", 96: "cache96.xml", 112: "cache112.xml", 128: "cache128.xml"}
 
     assert select_buckets(available, "warmup") == {112: "cache112.xml"}
+
+
+def test_cache_warmup_subprocess_preserves_npu_offload():
+    args = SimpleNamespace(
+        ir_dir="openvino/voice_design",
+        device="GPU",
+        decoder_device="NPU",
+        npu_offload="decoder",
+        mode="no-cache",
+        cache_kernel="exact",
+        cache_step="fused",
+        graph_variant="int8_sym_paged_talker_split",
+        codegen_unroll=1,
+        codegen_schedule="current",
+        preferred_cache_bucket=0,
+        precision_hint="f16",
+        ov_cache_mode="optimize_speed",
+        ov_cache_dir=None,
+        disable_ov_cache=False,
+        allow_cpu_fallback=False,
+    )
+
+    cmd = subprocess_base_args(args, {})
+
+    assert cmd[cmd.index("--decoder-device") + 1] == "NPU"
+    assert cmd[cmd.index("--npu-offload") + 1] == "decoder"
 
 
 def test_resolve_cache_dir_is_namespaced(monkeypatch, tmp_path):

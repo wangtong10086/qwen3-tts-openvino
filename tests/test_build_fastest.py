@@ -11,6 +11,7 @@ def make_args(**overrides):
         "out_dir": None,
         "device": "GPU",
         "decoder_device": None,
+        "npu_offload": "off",
         "ov_cache_dir": None,
         "disable_ov_cache": False,
         "preload_buckets": "warmup",
@@ -87,6 +88,16 @@ def test_build_fastest_plans_default_voice_design_steps(tmp_path, monkeypatch):
     warmup = commands_by_name["warmup"]
     assert warmup[warmup.index("--realtime-profile") + 1] == "fastest"
     assert warmup[warmup.index("--warmup-strategy") + 1] == "smooth"
+
+
+def test_build_fastest_can_warm_gpu_npu_cache(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    args = make_args(skip_native=True, skip_export=True, skip_compress=True, npu_offload="decoder")
+
+    steps = build_fastest_steps(args)
+    warmup = next(step.command for step in steps if step.name == "warmup")
+
+    assert warmup[warmup.index("--npu-offload") + 1] == "decoder"
 
 
 def test_build_fastest_skips_export_and_compress_when_fastest_manifest_exists(tmp_path, monkeypatch):
