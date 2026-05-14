@@ -107,7 +107,13 @@ build/windows-gpu-npu-benchmark/npu_decoder/server.log
 build/windows-gpu-npu-benchmark/npu_audio/server.log
 ```
 
-重点看 `comparison.npu_decoder.computed_rtf_speedup`、`comparison.npu_audio.computed_rtf_speedup`，以及每组 `decoder_device`、`speaker_encoder_device`、`npu_offload_effective` 和 `median_computed_rtf`。如果 `decoder_device=NPU` 但 RTF 没有改善，这说明当前瓶颈仍主要在 GPU codegen/paged-KV，而 NPU offload 主要价值是降低 GPU 音频侧负载。
+重点看 `recommendation.recommended_npu_offload`、`comparison.npu_decoder.computed_rtf_speedup`、`comparison.npu_audio.computed_rtf_speedup`，以及每组 `decoder_device`、`speaker_encoder_device`、`npu_offload_effective` 和 `median_computed_rtf`。如果 `decoder_device=NPU` 但 RTF 没有改善，这说明当前瓶颈仍主要在 GPU codegen/paged-KV，而 NPU offload 主要价值是降低 GPU 音频侧负载。
+
+`benchmark-summary.json` 会给出三类推荐：
+
+- `recommendation.fastest`: RTF 最低的 NPU 场景。
+- `recommendation.lowest_gpu_utilization`: GPU utilization 降幅最大的 NPU 场景，需要 `-CollectCounters` 才有完整依据。
+- `recommendation.balanced` / `recommended_npu_offload`: 在允许的 RTF 回退范围内优先降低 GPU 负载的部署建议。
 
 要额外测试 prompt/text embedding 是否适合放到 NPU，显式加入 `npu_all`：
 

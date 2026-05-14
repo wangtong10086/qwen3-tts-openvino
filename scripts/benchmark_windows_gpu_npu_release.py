@@ -364,6 +364,90 @@ def check_acceptance(
     return failures
 
 
+def recommend_offload(results: list[dict], comparison: dict, *, max_rtf_regression: float | None = None) -> dict:
+    by_name = {item.get("name"): item for item in results if isinstance(item, dict)}
+    gpu_summary = (by_name.get("gpu_only") or {}).get("summary") or {}
+    gpu_rtf = gpu_summary.get("median_computed_rtf")
+    try:
+        gpu_rtf = None if gpu_rtf is None else float(gpu_rtf)
+    except (TypeError, ValueError):
+        gpu_rtf = None
+
+    candidates = []
+    for name, result in by_name.items():
+        if name == "gpu_only" or result.get("error"):
+            continue
+        summary = result.get("summary") or {}
+        effective = summary.get("npu_offload_effective")
+        if not effective or effective == "off":
+            continue
+        rtf = summary.get("median_computed_rtf")
+        try:
+            rtf = None if rtf is None else float(rtf)
+        except (TypeError, ValueError):
+            rtf = None
+        metrics = comparison.get(name) or {}
+        candidates.append(
+            {
+                "scenario": name,
+                "npu_offload": effective,
+                "median_computed_rtf": rtf,
+                "computed_rtf_delta": metrics.get("computed_rtf_delta"),
+                "computed_rtf_speedup": metrics.get("computed_rtf_speedup"),
+                "gpu_utilization_reduction": metrics.get("gpu_utilization_reduction"),
+                "npu_utilization_average": metrics.get("npu_utilization_average"),
+            }
+        )
+
+    def numeric(value: object, fallback: float) -> float:
+        return float(value) if isinstance(value, (int, float)) else fallback
+
+    fastest = min(
+        (item for item in candidates if item["median_computed_rtf"] is not None),
+        key=lambda item: item["median_computed_rtf"],
+        default=None,
+    )
+    lowest_gpu = max(
+        (item for item in candidates if item["gpu_utilization_reduction"] is not None),
+        key=lambda item: item["gpu_utilization_reduction"],
+        default=None,
+    )
+    allowed_regression = 0.0 if max_rtf_regression is None else float(max_rtf_regression)
+    eligible = [
+        item
+        for item in candidates
+        if item["median_computed_rtf"] is not None
+        and (
+            item["computed_rtf_delta"] is None
+            or numeric(item["computed_rtf_delta"], float("inf")) <= allowed_regression
+        )
+    ]
+    balanced = None
+    if eligible:
+        balanced = max(
+            eligible,
+            key=lambda item: (
+                numeric(item["gpu_utilization_reduction"], -1.0),
+                numeric(item["computed_rtf_speedup"], 0.0),
+                -numeric(item["median_computed_rtf"], float("inf")),
+            ),
+        )
+    if balanced is None and fastest is not None and gpu_rtf is not None and fastest["median_computed_rtf"] <= gpu_rtf:
+        balanced = fastest
+
+    recommendation = balanced or fastest
+    return {
+        "gpu_only_median_computed_rtf": gpu_rtf,
+        "allowed_rtf_regression": allowed_regression,
+        "fastest": fastest,
+        "lowest_gpu_utilization": lowest_gpu,
+        "balanced": balanced,
+        "recommended_scenario": recommendation["scenario"] if recommendation else "gpu_only",
+        "recommended_npu_offload": recommendation["npu_offload"] if recommendation else "off",
+        "candidates": candidates,
+    }
+
+
 def run_scenario(
     *,
     name: str,
@@ -608,6 +692,7 @@ def main() -> None:
         )
 
     comparison = compare_to_gpu_baseline(results)
+    recommendation = recommend_offload(results, comparison, max_rtf_regression=args.max_rtf_regression)
     acceptance_failures = check_acceptance(
         comparison,
         min_speedup=args.min_speedup,
@@ -635,6 +720,7 @@ def main() -> None:
         },
         "results": results,
         "comparison": comparison,
+        "recommendation": recommendation,
         "acceptance": {
             "min_speedup": args.min_speedup,
             "max_rtf_regression": args.max_rtf_regression,

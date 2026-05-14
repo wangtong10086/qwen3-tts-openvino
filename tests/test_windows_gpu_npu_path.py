@@ -238,6 +238,44 @@ def test_windows_gpu_npu_benchmark_acceptance_checks_speedup_and_regression():
     assert any("npu_audio" in item for item in failures)
 
 
+def test_windows_gpu_npu_benchmark_recommends_balanced_npu_offload():
+    benchmark = load_script("benchmark_windows_gpu_npu_release.py")
+    results = [
+        {
+            "name": "gpu_only",
+            "summary": {
+                "median_computed_rtf": 1.0,
+                "npu_offload_effective": "off",
+                "accelerator_counters": {"gpu": {"utilization_average": 80.0}},
+            },
+        },
+        {
+            "name": "npu_decoder",
+            "summary": {
+                "median_computed_rtf": 0.9,
+                "npu_offload_effective": "decoder",
+                "accelerator_counters": {"gpu": {"utilization_average": 72.0}},
+            },
+        },
+        {
+            "name": "npu_audio",
+            "summary": {
+                "median_computed_rtf": 1.02,
+                "npu_offload_effective": "audio",
+                "accelerator_counters": {"gpu": {"utilization_average": 56.0}},
+            },
+        },
+    ]
+
+    comparison = benchmark.compare_to_gpu_baseline(results)
+    recommendation = benchmark.recommend_offload(results, comparison, max_rtf_regression=0.03)
+
+    assert recommendation["fastest"]["scenario"] == "npu_decoder"
+    assert recommendation["lowest_gpu_utilization"]["scenario"] == "npu_audio"
+    assert recommendation["balanced"]["scenario"] == "npu_audio"
+    assert recommendation["recommended_npu_offload"] == "audio"
+
+
 def test_windows_gpu_npu_benchmark_counter_sampler_targets_server_pid(tmp_path):
     benchmark = load_script("benchmark_windows_gpu_npu_release.py")
 
