@@ -147,6 +147,7 @@ def main() -> None:
         "--device",
         args.device,
         "--no-warmup",
+        "--no-auto-download-model",
     ]
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)

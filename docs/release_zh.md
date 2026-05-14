@@ -1,9 +1,8 @@
 # Release 使用说明
 
-Release 面向最终调用方。调用方不需要 PyTorch、导出脚本或源码开发环境，只需要：
+Release 面向最终调用方。调用方不需要 PyTorch、导出脚本或源码开发环境，只需要下载 GitHub Release 中的 runtime App 包。
 
-1. GitHub Release 中的 runtime App 包。
-2. Hugging Face 上已经编译好的 OpenVINO IR。
+首次启动时，如果本地没有 OpenVINO IR，release server 会自动从 Hugging Face 下载默认公开 IR 到用户缓存目录，然后继续启动。
 
 当前正式版本：`v0.1.0`
 
@@ -15,12 +14,12 @@ Runtime App 包在 GitHub Release：
 - Windows: `qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal.zip`
 - Release 页面：<https://github.com/wangtong10086/qwen3-tts-openvino/releases/tag/v0.1.0>
 
-已编译 OpenVINO IR 在 Hugging Face：
+默认自动下载的已编译 OpenVINO IR 在 Hugging Face：
 
 - Model repo: <https://huggingface.co/waston10086/qwen3-tts-openvino-voice-design>
 - 使用目录：`openvino_realtime/`
 
-可以从网页下载，也可以用 Hugging Face CLI：
+离线部署或需要预下载时，可以从网页下载，也可以用 Hugging Face CLI：
 
 ```bash
 uv run --with huggingface_hub huggingface-cli download \
@@ -29,7 +28,7 @@ uv run --with huggingface_hub huggingface-cli download \
   --local-dir qwen3-tts-openvino-ir
 ```
 
-下载完成后，模型根目录应为：
+手动下载完成后，模型根目录应为：
 
 ```text
 qwen3-tts-openvino-ir/openvino_realtime
@@ -42,7 +41,6 @@ tar --zstd -xf qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal.tar.zst
 
 cd qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal
 ./qwen3-tts-ov-server \
-  --model-root ../qwen3-tts-openvino-ir/openvino_realtime \
   --device GPU
 ```
 
@@ -59,7 +57,6 @@ Expand-Archive qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal.zip -Destin
 
 cd qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal
 .\qwen3-tts-ov-server.exe `
-  --model-root ..\qwen3-tts-openvino-ir\openvino_realtime `
   --device GPU
 ```
 
@@ -99,9 +96,26 @@ curl -N http://127.0.0.1:17860/v1/audio/speech \
 ## 发布物边界
 
 - GitHub Release 只包含 runtime App 包，不包含模型权重或 OpenVINO IR。
-- Hugging Face model repo 存放已编译 OpenVINO IR，当前公开的是 VoiceDesign realtime IR。
+- Hugging Face model repo 存放已编译 OpenVINO IR，当前公开的是 VoiceDesign realtime IR。release server 默认在缺少本地 IR 时自动下载它。
 - OpenVINO compile cache 会在用户机器首次运行时生成，不随 release 分发。
 - 需要私有分发 IR 时，可以使用 `scripts/package_ir.py` 自行打包；当前公开分发推荐直接使用 Hugging Face。
+
+## 自动下载控制
+
+默认启动即可自动下载：
+
+```bash
+./qwen3-tts-ov-server --device GPU
+```
+
+常用控制参数：
+
+- `--no-auto-download-model`: 禁止启动时联网下载。
+- `--model-root <path>`: 使用本地已下载或私有分发的 IR。
+- `--model-cache-dir <path>`: 指定自动下载缓存目录。
+- `--model-repo <repo>`、`--model-revision <rev>`、`--model-subdir <dir>`: 指定下载来源。
+
+缓存目录也可以用环境变量 `QWEN3_TTS_OV_MODEL_CACHE_DIR` 指定。
 
 ## 系统要求
 

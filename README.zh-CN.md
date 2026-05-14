@@ -10,7 +10,7 @@ OpenVINO-only 的 Qwen3-TTS 12Hz 推理、导出、流式 sidecar 和 native 加
 
 | 目标 | 推荐路径 |
 | --- | --- |
-| 直接在 Linux/Windows 上运行 TTS 服务 | 下载 [GitHub Release runtime](https://github.com/wangtong10086/qwen3-tts-openvino/releases/tag/v0.1.0)，再下载 [Hugging Face 已编译 OpenVINO IR](https://huggingface.co/waston10086/qwen3-tts-openvino-voice-design) |
+| 直接在 Linux/Windows 上运行 TTS 服务 | 下载 [GitHub Release runtime](https://github.com/wangtong10086/qwen3-tts-openvino/releases/tag/v0.1.0)，首次启动会自动下载公开的 [Hugging Face OpenVINO IR](https://huggingface.co/waston10086/qwen3-tts-openvino-voice-design) |
 | 从 PyTorch 模型重新导出、压缩、调试 | 使用 `uv run python -m qwen3_tts_ov build-fastest ...` |
 | 维护发布包 | 推送 `v*` tag，自动运行 `release-runtime` 构建 Linux/Windows 包并上传 GitHub Releases |
 
@@ -23,16 +23,7 @@ qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal.tar.zst
 qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal.zip
 ```
 
-2. 从 Hugging Face 下载已编译 OpenVINO IR：
-
-```bash
-uv run --with huggingface_hub huggingface-cli download \
-  waston10086/qwen3-tts-openvino-voice-design \
-  --include "openvino_realtime/**" \
-  --local-dir qwen3-tts-openvino-ir
-```
-
-3. 启动 sidecar。
+2. 启动 sidecar。若本地没有 OpenVINO IR，release server 会自动下载默认公开 IR 到用户缓存目录，然后继续启动。
 
 Linux：
 
@@ -40,7 +31,6 @@ Linux：
 tar --zstd -xf qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal.tar.zst
 cd qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal
 ./qwen3-tts-ov-server \
-  --model-root ../qwen3-tts-openvino-ir/openvino_realtime \
   --device GPU
 ```
 
@@ -50,17 +40,25 @@ Windows：
 Expand-Archive qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal.zip -DestinationPath .
 cd qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal
 .\qwen3-tts-ov-server.exe `
-  --model-root ..\qwen3-tts-openvino-ir\openvino_realtime `
   --device GPU
 ```
 
-4. 打开浏览器：
+3. 打开浏览器：
 
 ```text
 http://127.0.0.1:17860/
 ```
 
 完整部署说明见 [docs/release_zh.md](docs/release_zh.md)。
+
+离线部署或需要预下载时，可以手动下载 IR，并在启动时传入 `--model-root qwen3-tts-openvino-ir/openvino_realtime`：
+
+```bash
+uv run --with huggingface_hub huggingface-cli download \
+  waston10086/qwen3-tts-openvino-voice-design \
+  --include "openvino_realtime/**" \
+  --local-dir qwen3-tts-openvino-ir
+```
 
 ## 开发者 Quick Start
 
@@ -93,7 +91,7 @@ uv run python -m qwen3_tts_ov serve \
 
 ## 常用入口
 
-- 最终用户启动：`qwen3-tts-ov-server --model-root qwen3-tts-openvino-ir/openvino_realtime --device GPU`
+- 最终用户启动：`qwen3-tts-ov-server --device GPU`
 - 一键构建：`uv run python -m qwen3_tts_ov build-fastest --model ...`
 - 开发服务：`uv run python -m qwen3_tts_ov serve --model-root openvino --device GPU`
 - 流式 CLI：`uv run python -m qwen3_tts_ov stream voice-design ...`

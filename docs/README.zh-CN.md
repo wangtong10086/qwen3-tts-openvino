@@ -6,14 +6,14 @@
 
 | 角色 | 先读 | 目的 |
 | --- | --- | --- |
-| 最终用户 | [Release 使用说明](release_zh.md) | 下载 GitHub Release runtime 和 Hugging Face OpenVINO IR，直接启动 sidecar |
+| 最终用户 | [Release 使用说明](release_zh.md) | 下载 GitHub Release runtime，首次启动自动下载 Hugging Face OpenVINO IR |
 | 源码开发者 | [Quick Start](quick_start_zh.md) | 从 PyTorch 模型导出最快 OpenVINO IR，并启动 Web Demo |
 | 发布维护者 | [开发说明](development_zh.md) | 构建 native、打包 runtime、触发 `release-runtime` |
 | 性能/质量调试 | [流式与长文本](streaming_zh.md) | 理解 full-AR 长文本、流式输出和质量门禁 |
 
 ## 入门与部署
 
-- [Release 使用说明](release_zh.md): 最终用户部署路径；runtime 来自 GitHub Release，已编译 IR 来自 Hugging Face。
+- [Release 使用说明](release_zh.md): 最终用户部署路径；runtime 来自 GitHub Release，已编译 IR 可自动从 Hugging Face 下载。
 - [Quick Start](quick_start_zh.md): 源码路径；下载 PyTorch 模型，一键构建 fastest IR，启动 Web Demo。
 - [运行接口](runtime_zh.md): CLI、Python API、sidecar、WebSocket、OpenAI-compatible Speech API。
 - [OpenVINO 编译缓存](cache_zh.md): cache warmup、缓存目录、预热策略。

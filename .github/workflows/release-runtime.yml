@@ -187,7 +187,7 @@ jobs:
           - Linux x64 runtime package
           - Windows x64 runtime package
 
-          This release contains runtime packages only. Model weights and OpenVINO IR packages are distributed separately.
+          This release contains runtime packages only. Model weights are not included. If no local OpenVINO IR is found, the server automatically downloads the public VoiceDesign OpenVINO IR from Hugging Face on first start.
           EOF
 
           flags=()

@@ -30,7 +30,7 @@ dist/release/    app/IR release 包
 当前公开发布方式：
 
 - GitHub Release 分发 runtime App 包，包含可执行 server、OpenVINO runtime 和 native 库。
-- Hugging Face model repo 分发已编译 OpenVINO IR。
+- Hugging Face model repo 分发已编译 OpenVINO IR；release server 缺少本地 IR 时默认自动下载到用户缓存目录。
 - OpenVINO compile cache 不进入任何 release 包，会在用户机器首次运行时生成。
 
 runtime 打包有两种 profile：

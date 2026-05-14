@@ -12,7 +12,7 @@ OpenVINO IR, generated audio, OpenVINO compile caches, or native build outputs.
 
 | Need | Use |
 | --- | --- |
-| Run TTS without a Python development environment | [GitHub Release runtime](https://github.com/wangtong10086/qwen3-tts-openvino/releases/tag/v0.1.0) + [Hugging Face OpenVINO IR](https://huggingface.co/waston10086/qwen3-tts-openvino-voice-design) |
+| Run TTS without a Python development environment | [GitHub Release runtime](https://github.com/wangtong10086/qwen3-tts-openvino/releases/tag/v0.1.0). The server auto-downloads the public [Hugging Face OpenVINO IR](https://huggingface.co/waston10086/qwen3-tts-openvino-voice-design) on first start. |
 | Rebuild or tune IR from PyTorch weights | `uv run python -m qwen3_tts_ov build-fastest ...` |
 | Publish Linux/Windows runtime packages | Push a `v*` tag to run `release-runtime` |
 
@@ -25,16 +25,8 @@ qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal.tar.zst
 qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal.zip
 ```
 
-2. Download the compiled OpenVINO IR from Hugging Face:
-
-```bash
-uv run --with huggingface_hub huggingface-cli download \
-  waston10086/qwen3-tts-openvino-voice-design \
-  --include "openvino_realtime/**" \
-  --local-dir qwen3-tts-openvino-ir
-```
-
-3. Start the sidecar with `--model-root qwen3-tts-openvino-ir/openvino_realtime`.
+2. Start the sidecar. If no local OpenVINO IR is found, it downloads the default
+   public IR to the user cache and continues startup.
 
 Linux:
 
@@ -42,7 +34,6 @@ Linux:
 tar --zstd -xf qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal.tar.zst
 cd qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal
 ./qwen3-tts-ov-server \
-  --model-root ../qwen3-tts-openvino-ir/openvino_realtime \
   --device GPU
 ```
 
@@ -52,11 +43,20 @@ Windows:
 Expand-Archive qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal.zip -DestinationPath .
 cd qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal
 .\qwen3-tts-ov-server.exe `
-  --model-root ..\qwen3-tts-openvino-ir\openvino_realtime `
   --device GPU
 ```
 
 Open `http://127.0.0.1:17860/`.
+
+For offline deployment, download the IR manually and pass
+`--model-root qwen3-tts-openvino-ir/openvino_realtime`:
+
+```bash
+uv run --with huggingface_hub huggingface-cli download \
+  waston10086/qwen3-tts-openvino-voice-design \
+  --include "openvino_realtime/**" \
+  --local-dir qwen3-tts-openvino-ir
+```
 
 ## Developer Quick Start
 

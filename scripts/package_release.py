@@ -95,22 +95,27 @@ This package contains the user-facing sidecar server only. It does not include O
 
 Release profile: `{profile}`.
 
-1. Extract the matching IR package next to this directory so `openvino/voice_design/manifest.json` exists.
-2. Start the server:
+On first start, the server automatically downloads the default public OpenVINO IR
+from Hugging Face to the user cache if no local model is found.
+
+Start the server:
 
 Linux:
 
 ```bash
-./{APP_NAME} --model-root openvino --device GPU
+./{APP_NAME} --device GPU
 ```
 
 Windows:
 
 ```powershell
-.\\{APP_NAME}.exe --model-root openvino --device GPU
+.\\{APP_NAME}.exe --device GPU
 ```
 
 Open the web demo at `http://127.0.0.1:17860/`.
+
+For offline use, download the IR manually and pass `--model-root <openvino_realtime>`.
+Use `--no-auto-download-model` to disable network access.
 
 The `runtime-minimal` profile supports common libsndfile-readable reference audio formats such as WAV/FLAC/OGG.
 Use the `full` profile for broader optional codec support.
@@ -184,6 +189,8 @@ def build_pyinstaller_command(args, target: str, native_lib: Path, entry_script:
         "openvino_genai",
         "--collect-all",
         "openvino_tokenizers",
+        "--collect-all",
+        "huggingface_hub",
         "--collect-all",
         "soundfile",
         "--collect-all",

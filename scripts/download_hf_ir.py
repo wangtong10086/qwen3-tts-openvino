@@ -8,21 +8,23 @@ from pathlib import Path
 
 from huggingface_hub import snapshot_download
 
+from qwen3_tts_ov.model_download import DEFAULT_RELEASE_MODEL_REPO, DEFAULT_RELEASE_MODEL_SUBDIR
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--repo-id", required=True)
+    parser.add_argument("--repo-id", default=DEFAULT_RELEASE_MODEL_REPO)
     parser.add_argument("--revision", default=None)
     parser.add_argument("--local-dir", required=True)
     parser.add_argument(
         "--allow-pattern",
         action="append",
         default=None,
-        help="Allowed file pattern. Can be repeated. Defaults to openvino_realtime/**.",
+        help=f"Allowed file pattern. Can be repeated. Defaults to {DEFAULT_RELEASE_MODEL_SUBDIR}/**.",
     )
     args = parser.parse_args()
 
-    patterns = args.allow_pattern or ["openvino_realtime/**"]
+    patterns = args.allow_pattern or [f"{DEFAULT_RELEASE_MODEL_SUBDIR}/**"]
     local_dir = Path(args.local_dir)
     local_dir.mkdir(parents=True, exist_ok=True)
     path = snapshot_download(

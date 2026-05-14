@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from qwen3_tts_ov import native_codegen
+from qwen3_tts_ov import model_download
 from qwen3_tts_ov.release_server import default_model_root
 
 
@@ -27,6 +28,52 @@ def test_release_server_default_model_root_prefers_cwd_openvino(tmp_path, monkey
     (tmp_path / "openvino").mkdir()
 
     assert default_model_root() == tmp_path / "openvino"
+
+
+def test_release_model_download_uses_local_manifest(tmp_path):
+    model_root = tmp_path / "openvino_realtime"
+    voice_design = model_root / "voice_design"
+    voice_design.mkdir(parents=True)
+    (voice_design / "manifest.json").write_text("{}", encoding="utf-8")
+
+    result = model_download.ensure_release_model_root(model_root, auto_download=True)
+
+    assert result.status == "local"
+    assert result.model_root == model_root
+
+
+def test_release_model_download_fetches_missing_model_root(tmp_path, monkeypatch):
+    def fake_snapshot_download(*, repo_id, revision, local_dir, subdir):
+        target = local_dir / subdir / "voice_design"
+        target.mkdir(parents=True)
+        (target / "manifest.json").write_text("{}", encoding="utf-8")
+        return local_dir
+
+    monkeypatch.setattr(model_download, "_snapshot_download", fake_snapshot_download)
+
+    result = model_download.ensure_release_model_root(
+        tmp_path / "missing",
+        auto_download=True,
+        repo_id="owner/repo",
+        revision="main",
+        subdir="openvino_realtime",
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert result.status == "downloaded"
+    assert result.model_root == tmp_path / "cache" / "owner--repo--main" / "openvino_realtime"
+    assert (result.model_root / "voice_design" / "manifest.json").exists()
+
+
+def test_release_model_download_can_be_disabled(tmp_path):
+    result = model_download.ensure_release_model_root(
+        tmp_path / "missing",
+        auto_download=False,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert result.status == "missing"
+    assert result.model_root == tmp_path / "missing"
 
 
 def test_native_library_name_is_platform_specific():
@@ -243,6 +290,7 @@ def test_package_release_dry_run_uses_server_entry_and_native_lib(tmp_path):
     assert payload["profile"] == "runtime-minimal"
     assert payload["native_lib"] == str(native_lib)
     assert "qwen3_tts_ov_server_entry.py" in " ".join(payload["cmd"])
+    assert "huggingface_hub" in " ".join(payload["cmd"])
     assert "librosa" in " ".join(payload["cmd"])
     assert "scipy" in " ".join(payload["cmd"])
 

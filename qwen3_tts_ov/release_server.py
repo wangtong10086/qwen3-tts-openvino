@@ -5,6 +5,12 @@ import os
 import sys
 from pathlib import Path
 
+from .model_download import (
+    DEFAULT_RELEASE_MODEL_REPO,
+    DEFAULT_RELEASE_MODEL_REVISION,
+    DEFAULT_RELEASE_MODEL_SUBDIR,
+    ensure_release_model_root,
+)
 from .native_codegen import native_library_candidates
 from .profiles import FASTEST_CHUNK_STRATEGY, FASTEST_PROFILE_NAME
 from .server import serve
@@ -53,7 +59,19 @@ def build_parser() -> argparse.ArgumentParser:
         prog="qwen3-tts-ov-server",
         description="Run the Qwen3-TTS OpenVINO release sidecar server.",
     )
-    parser.add_argument("--model-root", default=None, help="OpenVINO IR root. Defaults to ./openvino next to the executable.")
+    parser.add_argument(
+        "--model-root",
+        default=None,
+        help=(
+            "OpenVINO IR root. Defaults to ./openvino next to the executable; "
+            "if missing, the release server downloads the default Hugging Face IR to the user cache."
+        ),
+    )
+    parser.add_argument("--no-auto-download-model", action="store_true", help="Do not download the default OpenVINO IR when --model-root is missing.")
+    parser.add_argument("--model-repo", default=DEFAULT_RELEASE_MODEL_REPO, help="Hugging Face model repo used for automatic IR download.")
+    parser.add_argument("--model-revision", default=DEFAULT_RELEASE_MODEL_REVISION, help="Hugging Face revision used for automatic IR download.")
+    parser.add_argument("--model-subdir", default=DEFAULT_RELEASE_MODEL_SUBDIR, help="Subdirectory inside the Hugging Face repo used as --model-root after download.")
+    parser.add_argument("--model-cache-dir", default=None, help="Directory for downloaded OpenVINO IR. Defaults to the user cache directory.")
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
     parser.add_argument("--host", default="127.0.0.1")
@@ -83,6 +101,17 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     configure_native_library_env()
     model_root = Path(args.model_root).expanduser() if args.model_root else default_model_root()
+    model_download = ensure_release_model_root(
+        model_root,
+        auto_download=not args.no_auto_download_model,
+        repo_id=args.model_repo,
+        revision=args.model_revision,
+        subdir=args.model_subdir,
+        cache_dir=args.model_cache_dir,
+    )
+    if model_download.status in {"cached", "downloaded"}:
+        print(model_download.message, file=sys.stderr, flush=True)
+    model_root = model_download.model_root
     serve(
         model_root=model_root,
         host=args.host,

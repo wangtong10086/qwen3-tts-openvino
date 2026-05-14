@@ -2,7 +2,7 @@
 
 本页面面向源码开发者，目标是从 PyTorch 模型导出当前推荐的 `fastest` OpenVINO IR，并启动浏览器 Web Demo。
 
-如果你只是想直接运行服务，不需要重新导出模型，请先看 [Release 使用说明](release_zh.md)：runtime 在 GitHub Release，已编译 IR 在 Hugging Face。
+如果你只是想直接运行服务，不需要重新导出模型，请先看 [Release 使用说明](release_zh.md)：runtime 在 GitHub Release，首次启动可自动下载已编译 IR。
 
 ## 1. 准备开发环境
 
@@ -125,4 +125,4 @@ uv run python -m qwen3_tts_ov build-fastest \
 - `build-fastest` 报模型不存在：确认 `--model` 指向本地 PyTorch 模型目录。
 - `fastest` 报缺少 graph：重新导出或重新压缩 IR，不要切到旧 profile 绕过。
 - 首次请求很慢：先执行 `build-fastest` 或 [cache warmup](cache_zh.md)。
-- 只想部署不想导出：使用 [Release 使用说明](release_zh.md) 中的预编译包和 Hugging Face IR。
+- 只想部署不想导出：使用 [Release 使用说明](release_zh.md) 中的预编译包；缺少本地 IR 时会自动下载公开 Hugging Face IR。
