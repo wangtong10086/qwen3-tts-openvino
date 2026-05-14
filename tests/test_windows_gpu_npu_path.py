@@ -228,9 +228,21 @@ def test_windows_gpu_npu_benchmark_powershell_runs_probe_and_analyzer():
     assert "analyze_windows_gpu_npu_results.py" in script
     assert "--benchmark-summary" in script
     assert "--require-scenarios" in script
+    assert "RequireExercisedNpuStages" in script
     assert "$benchmarkSummary.status -eq \"skipped\"" in script
     assert "RequirePromptCompile" in script
     assert "RequireAudioCompile" in script
+
+
+def test_windows_gpu_npu_workflow_exposes_voice_clone_dispatch_inputs():
+    workflow = (REPO_ROOT / ".github" / "workflows" / "windows-gpu-npu.yml").read_text(encoding="utf-8")
+
+    assert "mode:" in workflow
+    assert "ref_audio:" in workflow
+    assert "x_vector_only:" in workflow
+    assert "benchmark_scenarios:" in workflow
+    assert "--require-exercised-npu-stages" in workflow
+    assert "workflow_dispatch input ref_audio is required when mode=voice_clone" in workflow
 
 
 def test_windows_gpu_npu_smoke_powershell_asserts_audio_and_prompt_devices():
@@ -651,6 +663,57 @@ def test_windows_gpu_npu_result_analyzer_warns_unexercised_audio_stage(tmp_path)
 
     assert report["status"] == "ok"
     assert any("not exercised" in item for item in report["warnings"])
+
+
+def test_windows_gpu_npu_result_analyzer_can_require_exercised_npu_stages(tmp_path):
+    analyzer = load_script("analyze_windows_gpu_npu_results.py")
+    benchmark_summary = {
+        "status": "ok",
+        "results": [
+            {
+                "name": "gpu_only",
+                "summary": {"median_computed_rtf": 1.0, "npu_offload_effective": "off", "decoder_device": "GPU"},
+            },
+            {
+                "name": "npu_audio",
+                "summary": {
+                    "median_computed_rtf": 0.9,
+                    "npu_offload_effective": "audio",
+                    "decoder_device": "NPU",
+                    "encoder_device": "NPU",
+                    "npu_offload_coverage": {
+                        "expected_npu_stages": ["stream_decoder", "speech_encoder", "speaker_encoder"],
+                        "exercised_npu_stages": ["stream_decoder"],
+                        "unexercised_npu_stages": ["speech_encoder", "speaker_encoder"],
+                    },
+                },
+            },
+        ],
+    }
+    benchmark_path = tmp_path / "benchmark.json"
+    benchmark_path.write_text(json.dumps(benchmark_summary), encoding="utf-8")
+    args = type(
+        "Args",
+        (),
+        {
+            "benchmark_summary": str(benchmark_path),
+            "probe_json": None,
+            "require_scenarios": "gpu_only,npu_audio",
+            "min_speedup": None,
+            "max_rtf_regression": None,
+            "min_gpu_utilization_reduction": None,
+            "require_counters": False,
+            "require_exercised_npu_stages": True,
+            "require_probe_ok": False,
+            "require_prompt_compile": False,
+            "require_audio_compile": False,
+        },
+    )()
+
+    report = analyzer.analyze(args)
+
+    assert report["status"] == "failed"
+    assert any("not exercised" in item for item in report["failures"])
 
 
 def test_server_health_reports_device_and_decoder_device(monkeypatch, tmp_path):

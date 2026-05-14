@@ -146,6 +146,7 @@ def validate_benchmark(
     max_rtf_regression: float | None,
     min_gpu_utilization_reduction: float | None,
     require_counters: bool,
+    require_exercised_npu_stages: bool = False,
 ) -> tuple[list[str], list[str], dict]:
     failures = []
     warnings = []
@@ -186,10 +187,16 @@ def validate_benchmark(
         if isinstance(coverage, dict):
             missing_stages = coverage.get("unexercised_npu_stages") or []
             if missing_stages:
-                warnings.append(
+                message = (
                     f"{scenario}: requested NPU offload includes stages not exercised by this request: "
                     f"{', '.join(str(item) for item in missing_stages)}"
                 )
+                if require_exercised_npu_stages:
+                    failures.append(message)
+                else:
+                    warnings.append(message)
+        elif require_exercised_npu_stages and scenario.startswith("npu_"):
+            failures.append(f"{scenario}: npu_offload_coverage missing")
         if require_counters:
             if not isinstance(counters, dict):
                 failures.append(f"{scenario}: accelerator counters missing")
@@ -226,6 +233,7 @@ def analyze(args: argparse.Namespace) -> dict:
         max_rtf_regression=args.max_rtf_regression,
         min_gpu_utilization_reduction=args.min_gpu_utilization_reduction,
         require_counters=args.require_counters,
+        require_exercised_npu_stages=getattr(args, "require_exercised_npu_stages", False),
     )
     probe_failures, probe_warnings, probe_details = validate_probe(
         probe,
@@ -247,6 +255,7 @@ def analyze(args: argparse.Namespace) -> dict:
             "max_rtf_regression": args.max_rtf_regression,
             "min_gpu_utilization_reduction": args.min_gpu_utilization_reduction,
             "require_counters": args.require_counters,
+            "require_exercised_npu_stages": getattr(args, "require_exercised_npu_stages", False),
             "require_probe_ok": args.require_probe_ok,
             "require_prompt_compile": args.require_prompt_compile,
             "require_audio_compile": args.require_audio_compile,
@@ -270,6 +279,11 @@ def main() -> None:
     parser.add_argument("--max-rtf-regression", type=float, default=None)
     parser.add_argument("--min-gpu-utilization-reduction", type=float, default=None)
     parser.add_argument("--require-counters", action="store_true")
+    parser.add_argument(
+        "--require-exercised-npu-stages",
+        action="store_true",
+        help="Fail when a requested NPU offload stage was not exercised by the benchmark request.",
+    )
     parser.add_argument("--require-probe-ok", action="store_true")
     parser.add_argument("--require-prompt-compile", action="store_true")
     parser.add_argument("--require-audio-compile", action="store_true")

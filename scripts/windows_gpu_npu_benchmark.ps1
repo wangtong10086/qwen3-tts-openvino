@@ -11,6 +11,7 @@ param(
   [string]$Text = "你好，这是 Windows GPU 加 NPU 推理性能对比测试。",
   [string]$RefAudio = "",
   [string]$RefText = "",
+  [switch]$XVectorOnly,
   [int]$MaxNewTokens = 48,
   [int]$Runs = 2,
   [int]$BasePort = 17990,
@@ -25,6 +26,7 @@ param(
   [switch]$CollectCounters,
   [switch]$RequirePromptCompile,
   [switch]$RequireAudioCompile,
+  [switch]$RequireExercisedNpuStages,
   [switch]$RequireZeroCopy,
   [switch]$Strict
 )
@@ -118,6 +120,9 @@ if ($RefAudio) {
 if ($RefText) {
   $argsList += @("--ref-text", $RefText)
 }
+if ($XVectorOnly) {
+  $argsList += "--x-vector-only"
+}
 if ($MinSpeedup -ge 0) {
   $argsList += @("--min-speedup", "$MinSpeedup")
 }
@@ -165,6 +170,9 @@ if ((-not $SkipProbe) -and (Test-Path $probeJson)) {
 }
 if ($CollectCounters) {
   $analysisArgs += "--require-counters"
+}
+if ($RequireExercisedNpuStages) {
+  $analysisArgs += "--require-exercised-npu-stages"
 }
 if ($MinSpeedup -ge 0) {
   $analysisArgs += @("--min-speedup", "$MinSpeedup")

@@ -37,6 +37,31 @@ on:
         description: Max codec frames for the real smoke request
         required: true
         default: "8"
+      mode:
+        description: Request mode for smoke/benchmark
+        required: true
+        type: choice
+        options:
+          - voice_design
+          - voice_clone
+        default: voice_design
+      ref_audio:
+        description: Reference audio path or URL for voice_clone mode
+        required: false
+        default: ""
+      ref_text:
+        description: Reference text for voice_clone mode
+        required: false
+        default: ""
+      x_vector_only:
+        description: Use VoiceClone x-vector-only path
+        required: true
+        type: boolean
+        default: false
+      benchmark_scenarios:
+        description: Comma-separated benchmark scenarios
+        required: true
+        default: gpu_only,npu_decoder,npu_audio
       benchmark_runs:
         description: Number of requests per GPU-only / GPU+NPU benchmark scenario
         required: true
@@ -46,6 +71,11 @@ on:
         required: true
         type: boolean
         default: true
+      require_exercised_npu_stages:
+        description: Fail if requested NPU offload stages are not exercised by the selected request mode
+        required: true
+        type: boolean
+        default: false
       text:
         description: Text used by the real smoke request
         required: true
@@ -139,32 +169,60 @@ jobs:
         shell: powershell
         env:
           REAL_TTS_TEXT: ${{ github.event.inputs.text || '你好，这是 Windows GPU 加 NPU 推理测试。' }}
+          REAL_TTS_MODE: ${{ github.event.inputs.mode || 'voice_design' }}
+          REAL_TTS_REF_AUDIO: ${{ github.event.inputs.ref_audio || '' }}
+          REAL_TTS_REF_TEXT: ${{ github.event.inputs.ref_text || '' }}
+          REAL_TTS_X_VECTOR_ONLY: ${{ github.event.inputs.x_vector_only || 'false' }}
         run: |
           [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
           $env:PYTHONIOENCODING = "utf-8"
-          uv run python scripts/smoke_release_tts.py `
-            --archive "dist/release/qwen3-tts-ov-server-windows-x64-${{ github.event.inputs.version || 'gpu-npu-smoke' }}-runtime-minimal.zip" `
-            --model-root build/hf-ir/openvino_realtime `
-            --work-dir build/windows-gpu-npu-smoke `
-            --port 17981 `
-            --device GPU `
-            --npu-offload audio `
-            --require-devices GPU,NPU `
-            --skip-if-missing-devices `
-            --expect-native-codegen-device GPU `
-            --expect-decoder-device NPU `
-            --expect-npu-offload-effective audio `
-            --text "$env:REAL_TTS_TEXT" `
-            --max-new-tokens "${{ github.event.inputs.max_new_tokens || '8' }}" `
-            --do-sample false `
-            --chunk-strategy smooth `
-            --summary-out build/windows-gpu-npu-smoke/summary.json
+          $argsList = @(
+            "scripts/smoke_release_tts.py",
+            "--archive", "dist/release/qwen3-tts-ov-server-windows-x64-${{ github.event.inputs.version || 'gpu-npu-smoke' }}-runtime-minimal.zip",
+            "--model-root", "build/hf-ir/openvino_realtime",
+            "--work-dir", "build/windows-gpu-npu-smoke",
+            "--port", "17981",
+            "--device", "GPU",
+            "--npu-offload", "audio",
+            "--require-devices", "GPU,NPU",
+            "--skip-if-missing-devices",
+            "--expect-native-codegen-device", "GPU",
+            "--expect-decoder-device", "NPU",
+            "--expect-npu-offload-effective", "audio",
+            "--mode", "$env:REAL_TTS_MODE",
+            "--text", "$env:REAL_TTS_TEXT",
+            "--max-new-tokens", "${{ github.event.inputs.max_new_tokens || '8' }}",
+            "--do-sample", "false",
+            "--chunk-strategy", "smooth",
+            "--summary-out", "build/windows-gpu-npu-smoke/summary.json"
+          )
+          if ($env:REAL_TTS_MODE -eq "voice_clone") {
+            if (-not $env:REAL_TTS_REF_AUDIO) {
+              throw "workflow_dispatch input ref_audio is required when mode=voice_clone"
+            }
+            $argsList += @("--ref-audio", "$env:REAL_TTS_REF_AUDIO")
+            if ($env:REAL_TTS_REF_TEXT) {
+              $argsList += @("--ref-text", "$env:REAL_TTS_REF_TEXT")
+            }
+            if ($env:REAL_TTS_X_VECTOR_ONLY -eq "true") {
+              $argsList += "--x-vector-only"
+            }
+            $argsList += @("--expect-encoder-device", "NPU", "--expect-speaker-encoder-device", "NPU")
+            if ($env:REAL_TTS_X_VECTOR_ONLY -ne "true") {
+              $argsList += @("--expect-speech-encoder-device", "NPU")
+            }
+          }
+          uv run python @argsList
 
       - name: Benchmark GPU-only vs GPU+NPU paths
         if: steps.probe.outputs.status == 'ok'
         shell: powershell
         env:
           REAL_TTS_TEXT: ${{ github.event.inputs.text || '你好，这是 Windows GPU 加 NPU 推理测试。' }}
+          REAL_TTS_MODE: ${{ github.event.inputs.mode || 'voice_design' }}
+          REAL_TTS_REF_AUDIO: ${{ github.event.inputs.ref_audio || '' }}
+          REAL_TTS_REF_TEXT: ${{ github.event.inputs.ref_text || '' }}
+          REAL_TTS_X_VECTOR_ONLY: ${{ github.event.inputs.x_vector_only || 'false' }}
         run: |
           [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
           $env:PYTHONIOENCODING = "utf-8"
@@ -175,9 +233,10 @@ jobs:
             "--work-dir", "build/windows-gpu-npu-benchmark",
             "--base-port", "17990",
             "--device", "GPU",
-            "--scenarios", "gpu_only,npu_decoder,npu_audio",
+            "--scenarios", "${{ github.event.inputs.benchmark_scenarios || 'gpu_only,npu_decoder,npu_audio' }}",
             "--require-devices", "GPU,NPU",
             "--skip-if-missing-devices",
+            "--mode", "$env:REAL_TTS_MODE",
             "--text", "$env:REAL_TTS_TEXT",
             "--max-new-tokens", "${{ github.event.inputs.max_new_tokens || '8' }}",
             "--runs", "${{ github.event.inputs.benchmark_runs || '2' }}",
@@ -187,6 +246,18 @@ jobs:
           if ("${{ github.event.inputs.collect_counters || 'true' }}" -eq "true") {
             $argsList += @("--collect-accelerator-counters", "--counter-scope", "server")
           }
+          if ($env:REAL_TTS_MODE -eq "voice_clone") {
+            if (-not $env:REAL_TTS_REF_AUDIO) {
+              throw "workflow_dispatch input ref_audio is required when mode=voice_clone"
+            }
+            $argsList += @("--ref-audio", "$env:REAL_TTS_REF_AUDIO")
+            if ($env:REAL_TTS_REF_TEXT) {
+              $argsList += @("--ref-text", "$env:REAL_TTS_REF_TEXT")
+            }
+            if ($env:REAL_TTS_X_VECTOR_ONLY -eq "true") {
+              $argsList += "--x-vector-only"
+            }
+          }
           uv run python @argsList
 
       - name: Analyze GPU+NPU benchmark artifacts
@@ -195,11 +266,18 @@ jobs:
         run: |
           [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
           $env:PYTHONIOENCODING = "utf-8"
-          uv run python scripts/analyze_windows_gpu_npu_results.py `
-            --benchmark-summary build/windows-gpu-npu-benchmark/benchmark-summary.json `
-            --probe-json build/gpu-npu-probe/probe.json `
-            --require-probe-ok `
-            --output-json build/windows-gpu-npu-benchmark/analysis.json
+          $argsList = @(
+            "scripts/analyze_windows_gpu_npu_results.py",
+            "--benchmark-summary", "build/windows-gpu-npu-benchmark/benchmark-summary.json",
+            "--probe-json", "build/gpu-npu-probe/probe.json",
+            "--require-scenarios", "${{ github.event.inputs.benchmark_scenarios || 'gpu_only,npu_decoder,npu_audio' }}",
+            "--require-probe-ok",
+            "--output-json", "build/windows-gpu-npu-benchmark/analysis.json"
+          )
+          if ("${{ github.event.inputs.require_exercised_npu_stages || 'false' }}" -eq "true") {
+            $argsList += "--require-exercised-npu-stages"
+          }
+          uv run python @argsList
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -220,3 +298,6 @@ jobs:
             build/windows-gpu-npu-benchmark/npu_audio/server.log
             build/windows-gpu-npu-benchmark/npu_audio/accelerator-counters.json
             build/windows-gpu-npu-benchmark/npu_audio/accelerator-counters.log
+            build/windows-gpu-npu-benchmark/npu_all/server.log
+            build/windows-gpu-npu-benchmark/npu_all/accelerator-counters.json
+            build/windows-gpu-npu-benchmark/npu_all/accelerator-counters.log

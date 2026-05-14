@@ -125,6 +125,17 @@ build/windows-gpu-npu-benchmark/npu_audio/server.log
 
 `benchmark-summary.json` 的每个场景还会记录 `summary.exercised_runtime_stages` 和 `summary.npu_offload_coverage`。例如 VoiceDesign 请求不会实际执行 `speech_encoder/speaker_encoder`，所以 `npu_audio` 会显示这些 stage 位于 `unexercised_npu_stages`。要真实覆盖 audio encoder，需要用 `-Mode voice_clone -RefAudio ...` 跑 benchmark。
 
+需要把“声明 NPU offload 的 stage 必须被本次请求实际执行”作为硬门禁时，加：
+
+```powershell
+.\scripts\windows_gpu_npu_benchmark.ps1 `
+  -Mode voice_clone `
+  -RefAudio C:\path\ref.wav `
+  -RefText "参考音频对应文本" `
+  -Scenarios gpu_only,npu_decoder,npu_audio `
+  -RequireExercisedNpuStages
+```
+
 `benchmark-summary.json` 会给出三类推荐：
 
 - `recommendation.fastest`: RTF 最低的 NPU 场景。
