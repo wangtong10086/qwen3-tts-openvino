@@ -99,14 +99,18 @@ jobs:
       - name: Real streaming TTS smoke from PowerShell
         if: matrix.os == 'windows-latest'
         shell: powershell
+        env:
+          REAL_TTS_TEXT: ${{ inputs.text }}
         run: |
+          [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+          $env:PYTHONIOENCODING = "utf-8"
           uv run python scripts/smoke_release_tts.py `
             --archive "dist/release/qwen3-tts-ov-server-${{ matrix.target }}-${{ inputs.version }}-runtime-minimal.${{ matrix.archive_ext }}" `
             --model-root build/hf-ir/openvino_realtime `
             --work-dir "build/real-tts-${{ matrix.target }}-powershell" `
             --port ${{ matrix.port }} `
             --device "${{ inputs.device }}" `
-            --text "${{ inputs.text }}" `
+            --text "$env:REAL_TTS_TEXT" `
             --max-new-tokens "${{ inputs.max_new_tokens }}" `
             --do-sample "${{ inputs.do_sample }}" `
             --chunk-strategy "${{ inputs.chunk_strategy }}" `
