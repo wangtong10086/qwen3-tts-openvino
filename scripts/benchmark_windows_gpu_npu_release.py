@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import statistics
 import subprocess
 import sys
@@ -154,6 +155,119 @@ def aggregate_metrics(metrics: list[dict]) -> dict:
     }
 
 
+def find_powershell() -> str | None:
+    return shutil.which("pwsh") or shutil.which("powershell")
+
+
+def read_json_file(path: Path) -> dict | None:
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def build_counter_sampler_command(
+    *,
+    powershell: str,
+    output_json: Path,
+    stop_file: Path,
+    interval_ms: int,
+) -> list[str]:
+    script = Path(__file__).resolve().with_name("collect_windows_accelerator_counters.ps1")
+    return [
+        powershell,
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(script),
+        "-OutputJson",
+        str(output_json),
+        "-StopFile",
+        str(stop_file),
+        "-IntervalMs",
+        str(max(100, int(interval_ms))),
+    ]
+
+
+def start_counter_sampler(
+    *,
+    enabled: bool,
+    scenario_dir: Path,
+    interval_ms: int,
+) -> dict | None:
+    if not enabled:
+        return None
+    powershell = find_powershell()
+    if not powershell:
+        return {
+            "status": "unavailable",
+            "error": "PowerShell executable not found; accelerator counters were not collected.",
+        }
+    output_json = scenario_dir / "accelerator-counters.json"
+    stop_file = scenario_dir / "accelerator-counters.stop"
+    log_path = scenario_dir / "accelerator-counters.log"
+    if stop_file.exists():
+        stop_file.unlink()
+    cmd = build_counter_sampler_command(
+        powershell=powershell,
+        output_json=output_json,
+        stop_file=stop_file,
+        interval_ms=interval_ms,
+    )
+    try:
+        log = log_path.open("w", encoding="utf-8")
+        process = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
+    except Exception as exc:
+        return {
+            "status": "failed_to_start",
+            "cmd": cmd,
+            "error": str(exc),
+        }
+    return {
+        "process": process,
+        "log": log,
+        "cmd": cmd,
+        "output_json": output_json,
+        "stop_file": stop_file,
+        "log_path": log_path,
+    }
+
+
+def stop_counter_sampler(sampler: dict | None, timeout: float = 10.0) -> dict | None:
+    if sampler is None:
+        return None
+    process = sampler.get("process")
+    if process is None:
+        return sampler
+    stop_file = Path(sampler["stop_file"])
+    try:
+        stop_file.write_text("stop\n", encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        terminate_process(process)
+    log = sampler.get("log")
+    if log:
+        log.close()
+    output_json = Path(sampler["output_json"])
+    summary = read_json_file(output_json)
+    if summary is None:
+        summary = {
+            "status": "missing_summary",
+            "cmd": sampler.get("cmd"),
+            "log_tail": tail(Path(sampler["log_path"])),
+        }
+    else:
+        summary["cmd"] = sampler.get("cmd")
+        summary["log_path"] = str(sampler.get("log_path"))
+    return summary
+
+
 def expected_offload_for_scenario(name: str, npu_offload: str) -> str | None:
     if name == "gpu_only":
         return "off"
@@ -167,16 +281,42 @@ def expected_offload_for_scenario(name: str, npu_offload: str) -> str | None:
 def compare_to_gpu_baseline(results: list[dict]) -> dict:
     by_name = {item["name"]: item for item in results}
     gpu_rtf = ((by_name.get("gpu_only") or {}).get("summary") or {}).get("median_computed_rtf")
+    gpu_util = accelerator_utilization_average(by_name.get("gpu_only"), "gpu")
     comparison = {}
     for name, result in by_name.items():
         if name == "gpu_only":
             continue
         npu_rtf = (result.get("summary") or {}).get("median_computed_rtf")
+        scenario_gpu_util = accelerator_utilization_average(result, "gpu")
+        scenario_npu_util = accelerator_utilization_average(result, "npu")
         comparison[name] = {
             "computed_rtf_delta": None if gpu_rtf is None or npu_rtf is None else npu_rtf - gpu_rtf,
             "computed_rtf_speedup": None if gpu_rtf is None or not npu_rtf else gpu_rtf / npu_rtf,
+            "gpu_utilization_average": scenario_gpu_util,
+            "npu_utilization_average": scenario_npu_util,
+            "gpu_utilization_delta": (
+                None if gpu_util is None or scenario_gpu_util is None else scenario_gpu_util - gpu_util
+            ),
+            "gpu_utilization_reduction": (
+                None
+                if gpu_util is None or scenario_gpu_util is None or gpu_util == 0
+                else (gpu_util - scenario_gpu_util) / gpu_util
+            ),
         }
     return comparison
+
+
+def accelerator_utilization_average(result: dict | None, category: str) -> float | None:
+    if not result:
+        return None
+    counters = ((result.get("summary") or {}).get("accelerator_counters") or {})
+    category_summary = counters.get(category) if isinstance(counters, dict) else None
+    if not isinstance(category_summary, dict):
+        return None
+    value = category_summary.get("utilization_average")
+    if not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 def check_acceptance(
@@ -184,17 +324,25 @@ def check_acceptance(
     *,
     min_speedup: float | None,
     max_rtf_regression: float | None,
+    min_gpu_utilization_reduction: float | None = None,
 ) -> list[str]:
     failures = []
     for name, metrics in comparison.items():
         speedup = metrics.get("computed_rtf_speedup")
         delta = metrics.get("computed_rtf_delta")
+        gpu_reduction = metrics.get("gpu_utilization_reduction")
         if min_speedup is not None and (speedup is None or float(speedup) < float(min_speedup)):
             failures.append(f"{name}: computed_rtf_speedup={speedup} < {min_speedup}")
         if max_rtf_regression is not None and (
             delta is None or float(delta) > float(max_rtf_regression)
         ):
             failures.append(f"{name}: computed_rtf_delta={delta} > {max_rtf_regression}")
+        if min_gpu_utilization_reduction is not None and (
+            gpu_reduction is None or float(gpu_reduction) < float(min_gpu_utilization_reduction)
+        ):
+            failures.append(
+                f"{name}: gpu_utilization_reduction={gpu_reduction} < {min_gpu_utilization_reduction}"
+            )
     return failures
 
 
@@ -213,6 +361,8 @@ def run_scenario(
     request_payload: dict,
     timeout: float,
     runs: int,
+    collect_accelerator_counters: bool,
+    counter_interval_ms: int,
 ) -> dict:
     scenario_dir = work_dir / name
     scenario_dir.mkdir(parents=True, exist_ok=True)
@@ -233,16 +383,26 @@ def run_scenario(
     try:
         health = wait_for_health(f"http://{host}:{port}/health", deadline=time.time() + timeout)
         metrics = []
-        for run_index in range(max(1, int(runs))):
-            started = time.time()
-            stream = run_stream_request(f"http://{host}:{port}/v1/tts/stream", request_payload, timeout=timeout)
-            metrics.append(
-                {
-                    "run_index": run_index,
-                    **metric_from_stream(stream, health, time.time() - started),
-                }
-            )
+        counter_sampler = start_counter_sampler(
+            enabled=collect_accelerator_counters,
+            scenario_dir=scenario_dir,
+            interval_ms=counter_interval_ms,
+        )
+        try:
+            for run_index in range(max(1, int(runs))):
+                started = time.time()
+                stream = run_stream_request(f"http://{host}:{port}/v1/tts/stream", request_payload, timeout=timeout)
+                metrics.append(
+                    {
+                        "run_index": run_index,
+                        **metric_from_stream(stream, health, time.time() - started),
+                    }
+                )
+        finally:
+            counter_summary = stop_counter_sampler(counter_sampler)
         summary = aggregate_metrics(metrics)
+        if counter_summary is not None:
+            summary["accelerator_counters"] = counter_summary
         expected_offload = expected_offload_for_scenario(name, npu_offload)
         if expected_offload and summary.get("npu_offload_effective") != expected_offload:
             return {
@@ -315,6 +475,23 @@ def main() -> None:
         type=float,
         default=None,
         help="Fail if any NPU scenario has median computed RTF worse than GPU-only by more than this value.",
+    )
+    parser.add_argument(
+        "--collect-accelerator-counters",
+        action="store_true",
+        help="Collect Windows GPU/NPU utilization counters during each scenario.",
+    )
+    parser.add_argument(
+        "--counter-interval-ms",
+        type=int,
+        default=500,
+        help="Sampling interval for --collect-accelerator-counters.",
+    )
+    parser.add_argument(
+        "--min-gpu-utilization-reduction",
+        type=float,
+        default=None,
+        help="Fail if any NPU scenario does not reduce average GPU utilization by this fraction.",
     )
     parser.add_argument("--summary-out", default=None)
     args = parser.parse_args()
@@ -394,6 +571,8 @@ def main() -> None:
                 request_payload=request_payload,
                 timeout=args.timeout,
                 runs=args.runs,
+                collect_accelerator_counters=args.collect_accelerator_counters,
+                counter_interval_ms=args.counter_interval_ms,
             )
         )
 
@@ -402,6 +581,7 @@ def main() -> None:
         comparison,
         min_speedup=args.min_speedup,
         max_rtf_regression=args.max_rtf_regression,
+        min_gpu_utilization_reduction=args.min_gpu_utilization_reduction,
     )
     status = "ok" if all("error" not in item for item in results) else "failed"
     if acceptance_failures:
@@ -418,12 +598,15 @@ def main() -> None:
             "chunk_strategy": args.chunk_strategy,
             "runs": args.runs,
             "scenarios": scenario_names,
+            "collect_accelerator_counters": args.collect_accelerator_counters,
+            "counter_interval_ms": args.counter_interval_ms,
         },
         "results": results,
         "comparison": comparison,
         "acceptance": {
             "min_speedup": args.min_speedup,
             "max_rtf_regression": args.max_rtf_regression,
+            "min_gpu_utilization_reduction": args.min_gpu_utilization_reduction,
             "failures": acceptance_failures,
         },
     }

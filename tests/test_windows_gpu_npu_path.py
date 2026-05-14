@@ -158,15 +158,43 @@ def test_windows_gpu_npu_benchmark_expected_offload_by_scenario():
 def test_windows_gpu_npu_benchmark_acceptance_checks_speedup_and_regression():
     benchmark = load_script("benchmark_windows_gpu_npu_release.py")
     results = [
-        {"name": "gpu_only", "summary": {"median_computed_rtf": 1.0}},
-        {"name": "npu_decoder", "summary": {"median_computed_rtf": 0.8}},
-        {"name": "npu_audio", "summary": {"median_computed_rtf": 1.05}},
+        {
+            "name": "gpu_only",
+            "summary": {
+                "median_computed_rtf": 1.0,
+                "accelerator_counters": {"gpu": {"utilization_average": 80.0}},
+            },
+        },
+        {
+            "name": "npu_decoder",
+            "summary": {
+                "median_computed_rtf": 0.8,
+                "accelerator_counters": {
+                    "gpu": {"utilization_average": 60.0},
+                    "npu": {"utilization_average": 25.0},
+                },
+            },
+        },
+        {
+            "name": "npu_audio",
+            "summary": {
+                "median_computed_rtf": 1.05,
+                "accelerator_counters": {"gpu": {"utilization_average": 79.0}},
+            },
+        },
     ]
 
     comparison = benchmark.compare_to_gpu_baseline(results)
 
     assert comparison["npu_decoder"]["computed_rtf_speedup"] == 1.25
-    failures = benchmark.check_acceptance(comparison, min_speedup=1.0, max_rtf_regression=0.03)
+    assert comparison["npu_decoder"]["gpu_utilization_reduction"] == 0.25
+    assert comparison["npu_decoder"]["npu_utilization_average"] == 25.0
+    failures = benchmark.check_acceptance(
+        comparison,
+        min_speedup=1.0,
+        max_rtf_regression=0.03,
+        min_gpu_utilization_reduction=0.05,
+    )
     assert any("npu_audio" in item for item in failures)
 
 

@@ -16,8 +16,10 @@ param(
   [int]$BasePort = 17990,
   [double]$MinSpeedup = -1,
   [double]$MaxRtfRegression = -1,
+  [double]$MinGpuUtilizationReduction = -1,
   [switch]$SkipBuild,
   [switch]$NoWarmup,
+  [switch]$CollectCounters,
   [switch]$Strict
 )
 
@@ -73,6 +75,12 @@ if ($MinSpeedup -ge 0) {
 }
 if ($MaxRtfRegression -ge 0) {
   $argsList += @("--max-rtf-regression", "$MaxRtfRegression")
+}
+if ($MinGpuUtilizationReduction -ge 0) {
+  $argsList += @("--min-gpu-utilization-reduction", "$MinGpuUtilizationReduction")
+}
+if ($CollectCounters) {
+  $argsList += "--collect-accelerator-counters"
 }
 if (-not $Strict) {
   $argsList += "--skip-if-missing-devices"

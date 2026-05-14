@@ -41,6 +41,11 @@ on:
         description: Number of requests per GPU-only / GPU+NPU benchmark scenario
         required: true
         default: "2"
+      collect_counters:
+        description: Collect Windows GPU/NPU utilization counters during benchmark
+        required: true
+        type: boolean
+        default: true
       text:
         description: Text used by the real smoke request
         required: true
@@ -162,20 +167,26 @@ jobs:
         run: |
           [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
           $env:PYTHONIOENCODING = "utf-8"
-          uv run python scripts/benchmark_windows_gpu_npu_release.py `
-            --archive "dist/release/qwen3-tts-ov-server-windows-x64-${{ github.event.inputs.version || 'gpu-npu-smoke' }}-runtime-minimal.zip" `
-            --model-root build/hf-ir/openvino_realtime `
-            --work-dir build/windows-gpu-npu-benchmark `
-            --base-port 17990 `
-            --device GPU `
-            --scenarios gpu_only,npu_decoder,npu_audio `
-            --require-devices GPU,NPU `
-            --skip-if-missing-devices `
-            --text "$env:REAL_TTS_TEXT" `
-            --max-new-tokens "${{ github.event.inputs.max_new_tokens || '8' }}" `
-            --runs "${{ github.event.inputs.benchmark_runs || '2' }}" `
-            --chunk-strategy smooth `
-            --summary-out build/windows-gpu-npu-benchmark/benchmark-summary.json
+          $argsList = @(
+            "scripts/benchmark_windows_gpu_npu_release.py",
+            "--archive", "dist/release/qwen3-tts-ov-server-windows-x64-${{ github.event.inputs.version || 'gpu-npu-smoke' }}-runtime-minimal.zip",
+            "--model-root", "build/hf-ir/openvino_realtime",
+            "--work-dir", "build/windows-gpu-npu-benchmark",
+            "--base-port", "17990",
+            "--device", "GPU",
+            "--scenarios", "gpu_only,npu_decoder,npu_audio",
+            "--require-devices", "GPU,NPU",
+            "--skip-if-missing-devices",
+            "--text", "$env:REAL_TTS_TEXT",
+            "--max-new-tokens", "${{ github.event.inputs.max_new_tokens || '8' }}",
+            "--runs", "${{ github.event.inputs.benchmark_runs || '2' }}",
+            "--chunk-strategy", "smooth",
+            "--summary-out", "build/windows-gpu-npu-benchmark/benchmark-summary.json"
+          )
+          if ("${{ github.event.inputs.collect_counters || 'true' }}" -eq "true") {
+            $argsList += "--collect-accelerator-counters"
+          }
+          uv run python @argsList
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -187,5 +198,11 @@ jobs:
             build/windows-gpu-npu-smoke/summary.json
             build/windows-gpu-npu-benchmark/benchmark-summary.json
             build/windows-gpu-npu-benchmark/gpu_only/server.log
+            build/windows-gpu-npu-benchmark/gpu_only/accelerator-counters.json
+            build/windows-gpu-npu-benchmark/gpu_only/accelerator-counters.log
             build/windows-gpu-npu-benchmark/npu_decoder/server.log
+            build/windows-gpu-npu-benchmark/npu_decoder/accelerator-counters.json
+            build/windows-gpu-npu-benchmark/npu_decoder/accelerator-counters.log
             build/windows-gpu-npu-benchmark/npu_audio/server.log
+            build/windows-gpu-npu-benchmark/npu_audio/accelerator-counters.json
+            build/windows-gpu-npu-benchmark/npu_audio/accelerator-counters.log

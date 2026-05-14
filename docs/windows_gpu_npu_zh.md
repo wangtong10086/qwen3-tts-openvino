@@ -104,16 +104,35 @@ build/windows-gpu-npu-benchmark/npu_audio/server.log
 
 重点看 `comparison.npu_decoder.computed_rtf_speedup`、`comparison.npu_audio.computed_rtf_speedup`，以及每组 `decoder_device`、`speaker_encoder_device`、`npu_offload_effective` 和 `median_computed_rtf`。如果 `decoder_device=NPU` 但 RTF 没有改善，这说明当前瓶颈仍主要在 GPU codegen/paged-KV，而 NPU offload 主要价值是降低 GPU 音频侧负载。
 
+要直接观察 GPU 负载是否下降，在 Windows 上启用性能计数器采样：
+
+```powershell
+.\scripts\windows_gpu_npu_benchmark.ps1 `
+  -Scenarios gpu_only,npu_decoder,npu_audio `
+  -CollectCounters
+```
+
+每个场景会额外生成：
+
+```text
+build/windows-gpu-npu-benchmark/<scenario>/accelerator-counters.json
+build/windows-gpu-npu-benchmark/<scenario>/accelerator-counters.log
+```
+
+`benchmark-summary.json` 中的 `summary.accelerator_counters.gpu.utilization_average` 和 `summary.accelerator_counters.npu.utilization_average` 来自 Windows `Get-Counter` 自动发现的 GPU/NPU utilization/usage/busy/load 计数器。计数器名称会因驱动和 Windows 版本不同而变化；如果机器没有暴露相关计数器，结果会标记为 `no_counters`，不会影响普通 benchmark。
+
 需要把性能收益变成硬性门禁时，增加阈值参数：
 
 ```powershell
 .\scripts\windows_gpu_npu_benchmark.ps1 `
   -Scenarios gpu_only,npu_decoder,npu_audio `
   -MinSpeedup 1.02 `
-  -MaxRtfRegression 0.03
+  -MaxRtfRegression 0.03 `
+  -CollectCounters `
+  -MinGpuUtilizationReduction 0.05
 ```
 
-`-MinSpeedup` 要求每个 NPU 场景的 RTF speedup 不低于阈值；`-MaxRtfRegression` 允许 NPU 场景比 GPU-only 慢的最大 RTF 差值。失败会使脚本退出非零。
+`-MinSpeedup` 要求每个 NPU 场景的 RTF speedup 不低于阈值；`-MaxRtfRegression` 允许 NPU 场景比 GPU-only 慢的最大 RTF 差值；`-MinGpuUtilizationReduction` 要求平均 GPU utilization 相对 GPU-only 至少下降指定比例。失败会使脚本退出非零。
 
 要实际触发 VoiceClone 的参考音频 encoder，可在含 `base/` IR 的模型根目录上增加：
 
