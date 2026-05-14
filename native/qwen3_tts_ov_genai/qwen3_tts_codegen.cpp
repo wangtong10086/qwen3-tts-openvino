@@ -282,6 +282,24 @@ ov::AnyMap compile_config(const char* cache_dir, const char* cache_mode) {
     return config;
 }
 
+bool is_gpu_device(const char* device) {
+    if (!device) {
+        return false;
+    }
+    return lower_text(std::string(device)).find("gpu") != std::string::npos;
+}
+
+ov::AnyMap compile_config_for_device(const char* cache_dir, const char* cache_mode, const char* device) {
+    ov::AnyMap config = compile_config(cache_dir, cache_mode);
+    if (!is_gpu_device(device)) {
+        config.erase("GPU_ENABLE_LARGE_ALLOCATIONS");
+        config.erase("GPU_QUEUE_PRIORITY");
+        config.erase("GPU_HOST_TASK_PRIORITY");
+        config.erase("GPU_QUEUE_THROTTLE");
+    }
+    return config;
+}
+
 ov::element::Type parse_element_type(const std::string& value) {
     const std::string text = lower_text(value);
     if (text == "f16" || text == "float16") {
@@ -2425,7 +2443,7 @@ public:
         if (!prefill_xml || !decode_xml || !device) {
             throw std::runtime_error("prefill_xml, decode_xml, and device are required");
         }
-        const auto config = compile_config(cache_dir, cache_mode);
+        const auto config = compile_config_for_device(cache_dir, cache_mode, device);
         m_runner.profile_enabled = env_enabled("QWEN3_TTS_OV_NATIVE_PERF_COUNT", false);
         m_runner.bucket = parse_cache_bucket(prefill_xml);
         if (m_runner.bucket <= 0) {
@@ -2458,7 +2476,7 @@ public:
         if (kv_heads <= 0 || kv_block_size <= 0 || kv_head_dim <= 0) {
             throw std::runtime_error("invalid paged KV cache shape");
         }
-        auto config = compile_config(cache_dir, cache_mode);
+        auto config = compile_config_for_device(cache_dir, cache_mode, device);
         const std::string precision = kv_cache_precision && std::strlen(kv_cache_precision) > 0 ? kv_cache_precision : "f16";
         const char* cache_input_precision_env = std::getenv("QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_INPUT_PRECISION");
         const std::string cache_input_precision =
@@ -2535,7 +2553,7 @@ public:
             const char* subcode_device_env = std::getenv("QWEN3_TTS_OV_NATIVE_SUBCODE_DEVICE");
             const std::string subcode_device =
                 subcode_device_env && std::strlen(subcode_device_env) > 0 ? subcode_device_env : device;
-            auto subcode_config = compile_config(cache_dir, cache_mode);
+            auto subcode_config = compile_config_for_device(cache_dir, cache_mode, subcode_device.c_str());
             m_runner.subcode_model = m_runner.core.compile_model(subcode_xml, subcode_device, subcode_config);
             m_runner.subcode_request = m_runner.subcode_model.create_infer_request();
         }
@@ -2578,7 +2596,7 @@ public:
         if (!tokenizer_dir || !text_embedding_xml || !codec_embedding_xml || !device) {
             throw std::runtime_error("tokenizer_dir, text_embedding_xml, codec_embedding_xml, and device are required");
         }
-        const auto config = compile_config(cache_dir, cache_mode);
+        const auto config = compile_config_for_device(cache_dir, cache_mode, device);
         m_runner.tokenizer = std::make_unique<ov::genai::Tokenizer>(std::filesystem::path(tokenizer_dir));
         m_runner.text_embedding_model = m_runner.core.compile_model(text_embedding_xml, device, config);
         m_runner.codec_embedding_model = m_runner.core.compile_model(codec_embedding_xml, device, config);
@@ -2765,7 +2783,7 @@ public:
         if (first_chunk_frames <= 0 || steady_chunk_frames <= 0 || num_code_groups <= 0 || decode_upsample_rate <= 0) {
             throw std::runtime_error("invalid stream decoder configuration");
         }
-        const auto config = compile_config(cache_dir, cache_mode);
+        const auto config = compile_config_for_device(cache_dir, cache_mode, device);
         m_runner.first_stream_decoder_model = m_runner.core.compile_model(first_decoder_xml, device, config);
         m_runner.steady_stream_decoder_model = m_runner.core.compile_model(steady_decoder_xml, device, config);
         m_runner.first_stream_decoder_request = m_runner.first_stream_decoder_model.create_infer_request();

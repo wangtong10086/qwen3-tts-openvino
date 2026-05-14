@@ -252,6 +252,17 @@ def test_windows_gpu_npu_workflow_builds_runtime_without_npu_validation():
     assert "--require-exercised-npu-stages" not in workflow
 
 
+def test_native_pipeline_filters_gpu_only_properties_for_npu_decoders():
+    source = (REPO_ROOT / "native" / "qwen3_tts_ov_genai" / "qwen3_tts_codegen.cpp").read_text(encoding="utf-8")
+
+    assert "compile_config_for_device" in source
+    assert 'config.erase("GPU_ENABLE_LARGE_ALLOCATIONS")' in source
+    assert 'config.erase("GPU_QUEUE_PRIORITY")' in source
+    assert 'config.erase("GPU_HOST_TASK_PRIORITY")' in source
+    assert 'config.erase("GPU_QUEUE_THROTTLE")' in source
+    assert "m_runner.first_stream_decoder_model = m_runner.core.compile_model(first_decoder_xml, device, config)" in source
+
+
 def test_windows_gpu_npu_smoke_powershell_asserts_audio_and_prompt_devices():
     script = (REPO_ROOT / "scripts" / "windows_gpu_npu_smoke.ps1").read_text(encoding="utf-8")
 
