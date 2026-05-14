@@ -237,6 +237,8 @@ def build_fastest_steps(args: argparse.Namespace) -> list[BuildStep]:
             warmup_cmd.extend(["--decoder-device", args.decoder_device])
         if getattr(args, "encoder_device", None):
             warmup_cmd.extend(["--encoder-device", args.encoder_device])
+        if getattr(args, "prompt_device", None):
+            warmup_cmd.extend(["--prompt-device", args.prompt_device])
         if getattr(args, "npu_offload", "off") != "off":
             warmup_cmd.extend(["--npu-offload", args.npu_offload])
         if args.ov_cache_dir:

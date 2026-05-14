@@ -306,11 +306,14 @@ def resolve_npu_offload(
     device: str | None,
     decoder_device: str | None,
     npu_offload: str | None,
+    prompt_device: str | None = None,
 ) -> dict:
     requested = normalize_npu_offload(npu_offload)
     main_device = str(device or "GPU")
     explicit_decoder = decoder_device is not None and str(decoder_device).strip() != ""
+    explicit_prompt = prompt_device is not None and str(prompt_device).strip() != ""
     effective_decoder = str(decoder_device or main_device)
+    effective_prompt = str(prompt_device or "")
     decision = {
         "requested_npu_offload": requested,
         "effective_npu_offload": "off",
@@ -318,6 +321,7 @@ def resolve_npu_offload(
         "device": main_device,
         "decoder_device": effective_decoder,
         "encoder_device": None,
+        "prompt_device": effective_prompt or None,
         "openvino_available_devices": [],
         "openvino_available_devices_error": None,
     }
@@ -355,6 +359,11 @@ def resolve_npu_offload(
             "npu offload requested but --decoder-device is not NPU. "
             "Use --decoder-device NPU, omit --decoder-device, or set --npu-offload off."
         )
+    if requested == "all" and explicit_prompt and not is_npu_device(effective_prompt):
+        raise ValueError(
+            "npu all offload requested but --prompt-device is not NPU. "
+            "Use --prompt-device NPU, omit --prompt-device, or set --npu-offload off/decoder/audio."
+        )
     if error:
         raise ValueError(f"npu offload requires OpenVINO NPU device, but device query failed: {error}")
     if not has_npu:
@@ -363,7 +372,12 @@ def resolve_npu_offload(
             f"Available devices: {available_devices or 'none'}"
         )
     decision["decoder_device"] = effective_decoder if explicit_decoder else "NPU"
-    if requested == "audio":
+    if requested == "all":
+        decision["encoder_device"] = "NPU"
+        decision["prompt_device"] = effective_prompt if explicit_prompt else "NPU"
+        decision["effective_npu_offload"] = "all"
+        decision["npu_offload_reason"] = "requested_npu_all"
+    elif requested == "audio":
         decision["encoder_device"] = "NPU"
         decision["effective_npu_offload"] = "audio"
         decision["npu_offload_reason"] = "requested_npu_audio"
@@ -1644,6 +1658,7 @@ def create_app(
     device: str = "GPU",
     decoder_device: str | None = None,
     encoder_device: str | None = None,
+    prompt_device: str | None = None,
     npu_offload: str = DEFAULT_NPU_OFFLOAD,
     allow_cpu_fallback: bool = False,
     mode: str = "cache",
@@ -1684,19 +1699,28 @@ def create_app(
     app = FastAPI(title="Qwen3-TTS OpenVINO Engine")
     model_root = Path(model_root)
     requested_encoder_device = encoder_device
+    requested_prompt_device = prompt_device
     npu_offload_decision = resolve_npu_offload(
         device=device,
         decoder_device=decoder_device,
+        prompt_device=prompt_device,
         npu_offload=npu_offload,
     )
     decoder_device = npu_offload_decision["decoder_device"]
-    if npu_offload_decision.get("effective_npu_offload") == "audio" and requested_encoder_device:
+    if npu_offload_decision.get("effective_npu_offload") in {"audio", "all"} and requested_encoder_device:
         if not is_npu_device(requested_encoder_device):
             raise ValueError(
-                "npu audio offload requested but --encoder-device is not NPU. "
+                "npu audio/all offload requested but --encoder-device is not NPU. "
                 "Use --encoder-device NPU, omit --encoder-device, or set --npu-offload off/decoder."
             )
+    if npu_offload_decision.get("effective_npu_offload") == "all" and requested_prompt_device:
+        if not is_npu_device(requested_prompt_device):
+            raise ValueError(
+                "npu all offload requested but --prompt-device is not NPU. "
+                "Use --prompt-device NPU, omit --prompt-device, or set --npu-offload off/decoder/audio."
+            )
     encoder_device = encoder_device or npu_offload_decision.get("encoder_device")
+    prompt_device = prompt_device or npu_offload_decision.get("prompt_device")
     npu_offload_metadata = {
         "npu_offload_requested": npu_offload_decision["requested_npu_offload"],
         "npu_offload_effective": npu_offload_decision["effective_npu_offload"],
@@ -1709,6 +1733,8 @@ def create_app(
         requested_devices.append(str(decoder_device))
     if encoder_device:
         requested_devices.append(str(encoder_device))
+    if prompt_device:
+        requested_devices.append(str(prompt_device))
     uses_gpu_device = any("GPU" in item.upper() for item in requested_devices)
     if realtime_profile not in REALTIME_PROFILE_CHOICES:
         raise ValueError(f"realtime_profile must be one of {', '.join(REALTIME_PROFILE_CHOICES)}")
@@ -1965,7 +1991,7 @@ def create_app(
         "native_buffer_reuse": os.environ.get("QWEN3_TTS_OV_NATIVE_BUFFER_REUSE") or "auto",
         "native_remote_embed": os.environ.get("QWEN3_TTS_OV_NATIVE_REMOTE_EMBED") or "auto",
         "native_prompt": os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT") or "off",
-        "native_prompt_device": os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE") or "CPU",
+        "native_prompt_device": os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE") or prompt_device or "CPU",
         "native_paged_kv": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV") or "off",
         "native_paged_kv_gqa": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA") or "on",
         "kv_cache_profile": effective_kv_cache_profile,
@@ -1994,6 +2020,8 @@ def create_app(
         "device": device,
         "decoder_device": decoder_device or device,
         "encoder_device": encoder_device,
+        "prompt_device": prompt_device,
+        "text_embedding_device": prompt_device or device,
         "speech_encoder_device": encoder_device or decoder_device or device,
         "speaker_encoder_device": encoder_device or device,
         **npu_offload_metadata,
@@ -2038,6 +2066,8 @@ def create_app(
         "device": device,
         "decoder_device": decoder_device or device,
         "encoder_device": encoder_device,
+        "prompt_device": prompt_device,
+        "text_embedding_device": prompt_device or device,
         "speech_encoder_device": encoder_device or decoder_device or device,
         "speaker_encoder_device": encoder_device or device,
         **npu_offload_metadata,
@@ -2055,7 +2085,7 @@ def create_app(
         "native_buffer_reuse": os.environ.get("QWEN3_TTS_OV_NATIVE_BUFFER_REUSE") or "auto",
         "native_remote_embed": os.environ.get("QWEN3_TTS_OV_NATIVE_REMOTE_EMBED") or "auto",
         "native_prompt": os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT") or "off",
-        "native_prompt_device": os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE") or "CPU",
+        "native_prompt_device": os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE") or prompt_device or "CPU",
         "native_paged_kv": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV") or "off",
         "native_paged_kv_gqa": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA") or "on",
         "kv_cache_profile": effective_kv_cache_profile,
@@ -2388,6 +2418,7 @@ def create_app(
             os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE_MODE") or "cached",
             os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION") or "on",
             os.environ.get("QWEN3_TTS_OV_NATIVE_SUBCODE_DEVICE") or "same",
+            str(prompt_device or ""),
             str(ov_cache_dir or "auto"),
             ov_cache_mode,
             bool(disable_ov_cache),
@@ -2398,6 +2429,7 @@ def create_app(
                 device=device,
                 decoder_device=decoder_device,
                 encoder_device=encoder_device,
+                prompt_device=prompt_device,
                 allow_cpu_fallback=allow_cpu_fallback,
                 mode=runtime_mode,
                 cache_kernel=runtime_cache_kernel,
@@ -3442,6 +3474,8 @@ def create_app(
                 "device": getattr(runtime, "device", device),
                 "decoder_device": getattr(runtime, "decoder_device", decoder_device or device),
                 "encoder_device": getattr(runtime, "encoder_device", encoder_device),
+                "prompt_device": getattr(runtime, "prompt_device", prompt_device),
+                "text_embedding_device": getattr(runtime, "text_embedding_device", prompt_device or device),
                 "speech_encoder_device": getattr(runtime, "speech_encoder_device", decoder_device or device),
                 "speaker_encoder_device": getattr(runtime, "speaker_encoder_device", device),
                 **npu_offload_metadata,
@@ -3818,6 +3852,7 @@ def serve(
     device: str = "GPU",
     decoder_device: str | None = None,
     encoder_device: str | None = None,
+    prompt_device: str | None = None,
     npu_offload: str = DEFAULT_NPU_OFFLOAD,
     allow_cpu_fallback: bool = False,
     mode: str = "cache",
@@ -3858,6 +3893,7 @@ def serve(
         device=device,
         decoder_device=decoder_device,
         encoder_device=encoder_device,
+        prompt_device=prompt_device,
         npu_offload=npu_offload,
         allow_cpu_fallback=allow_cpu_fallback,
         mode=mode,

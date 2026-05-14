@@ -96,6 +96,22 @@ def test_probe_selects_optional_audio_encoder_graphs():
     ]
 
 
+def test_probe_selects_prompt_graphs():
+    probe = load_script("probe_windows_gpu_npu.py")
+    manifest = {
+        "graphs": {
+            "text_embedding": "text_embedding.xml",
+            "codec_embedding": "codec_embedding.xml",
+            "talker": "talker.xml",
+        }
+    }
+
+    assert probe.select_prompt_graphs(manifest) == [
+        ("text_embedding", "text_embedding.xml"),
+        ("codec_embedding", "codec_embedding.xml"),
+    ]
+
+
 def test_probe_zero_copy_reports_api_visibility_without_requiring_it():
     probe = load_script("probe_windows_gpu_npu.py")
 
@@ -143,6 +159,7 @@ def test_windows_gpu_npu_benchmark_parses_default_scenarios():
 
     assert benchmark.parse_scenarios(None) == ["gpu_only", "npu_decoder", "npu_audio"]
     assert benchmark.parse_scenarios("npu_audio") == ["gpu_only", "npu_audio"]
+    assert benchmark.parse_scenarios("npu_all") == ["gpu_only", "npu_all"]
     with pytest.raises(ValueError, match="unknown scenarios"):
         benchmark.parse_scenarios("gpu_only,invalid")
 
@@ -153,6 +170,7 @@ def test_windows_gpu_npu_benchmark_expected_offload_by_scenario():
     assert benchmark.expected_offload_for_scenario("gpu_only", "off") == "off"
     assert benchmark.expected_offload_for_scenario("npu_decoder", "decoder") == "decoder"
     assert benchmark.expected_offload_for_scenario("npu_audio", "audio") == "audio"
+    assert benchmark.expected_offload_for_scenario("npu_all", "all") == "all"
 
 
 def test_windows_gpu_npu_benchmark_acceptance_checks_speedup_and_regression():
@@ -299,6 +317,27 @@ def test_server_audio_npu_offload_selects_npu_audio_devices(monkeypatch, tmp_pat
     assert health["warmup"]["speech_encoder_device"] == "NPU"
     assert health["warmup"]["speaker_encoder_device"] == "NPU"
     assert health["warmup"]["npu_offload_effective"] == "audio"
+
+
+def test_server_all_npu_offload_selects_prompt_and_audio_devices(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+
+    monkeypatch.setattr(server, "openvino_available_devices", lambda: (["CPU", "GPU.0", "NPU"], None))
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        realtime_profile="fastest",
+        device="GPU",
+        npu_offload="all",
+    )
+    client = fastapi_testclient.TestClient(app)
+
+    health = client.get("/health").json()
+
+    assert health["warmup"]["decoder_device"] == "NPU"
+    assert health["warmup"]["encoder_device"] == "NPU"
+    assert health["warmup"]["prompt_device"] == "NPU"
+    assert health["warmup"]["npu_offload_effective"] == "all"
 
 
 def test_server_auto_npu_offload_falls_back_without_npu(monkeypatch, tmp_path):

@@ -60,6 +60,7 @@ def add_runtime_args(
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
     parser.add_argument("--encoder-device", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--prompt-device", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--realtime-profile",
         default=FASTEST_PROFILE_NAME,
@@ -157,6 +158,7 @@ def build_runtime(args):
         disable_ov_cache=args.disable_ov_cache,
         profile=args.profile,
         encoder_device=getattr(args, "encoder_device", None),
+        prompt_device=getattr(args, "prompt_device", None) or getattr(args, "native_prompt_device", None),
     )
 
 
@@ -599,6 +601,7 @@ def run_serve(args):
         device=args.device,
         decoder_device=args.decoder_device,
         encoder_device=args.encoder_device,
+        prompt_device=args.prompt_device,
         npu_offload=args.npu_offload,
         allow_cpu_fallback=args.allow_cpu_fallback,
         mode=args.mode,
@@ -643,17 +646,26 @@ def apply_npu_offload(args):
     decision = resolve_npu_offload(
         device=getattr(args, "device", "GPU"),
         decoder_device=getattr(args, "decoder_device", None),
+        prompt_device=getattr(args, "prompt_device", None),
         npu_offload=npu_offload,
     )
     args.decoder_device = decision["decoder_device"]
-    if decision.get("effective_npu_offload") == "audio" and getattr(args, "encoder_device", None):
+    if decision.get("effective_npu_offload") in {"audio", "all"} and getattr(args, "encoder_device", None):
         if not is_npu_device(args.encoder_device):
             raise ValueError(
-                "npu audio offload requested but --encoder-device is not NPU. "
+                "npu audio/all offload requested but --encoder-device is not NPU. "
                 "Use --encoder-device NPU, omit --encoder-device, or set --npu-offload off/decoder."
+            )
+    if decision.get("effective_npu_offload") == "all" and getattr(args, "prompt_device", None):
+        if not is_npu_device(args.prompt_device):
+            raise ValueError(
+                "npu all offload requested but --prompt-device is not NPU. "
+                "Use --prompt-device NPU, omit --prompt-device, or set --npu-offload off/decoder/audio."
             )
     if not getattr(args, "encoder_device", None):
         args.encoder_device = decision.get("encoder_device")
+    if not getattr(args, "prompt_device", None):
+        args.prompt_device = decision.get("prompt_device")
     args.npu_offload_decision = decision
 
 
@@ -697,11 +709,12 @@ def add_cache_warmup_args(parser):
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
     parser.add_argument("--encoder-device", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--prompt-device", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--npu-offload",
         default="off",
         choices=NPU_OFFLOAD_CHOICES,
-        help="Warm cache for Windows GPU+NPU mode. auto selects NPU decoder when available; decoder/require fail if NPU is missing.",
+        help="Warm cache for Windows GPU+NPU mode. all also warms prompt/text embedding on NPU.",
     )
     parser.add_argument(
         "--realtime-profile",
@@ -755,6 +768,7 @@ def add_build_fastest_args(parser):
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
     parser.add_argument("--encoder-device", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--prompt-device", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--npu-offload", default="off", choices=NPU_OFFLOAD_CHOICES)
     parser.add_argument("--ov-cache-dir", default=None)
     parser.add_argument("--disable-ov-cache", action="store_true")
@@ -881,7 +895,7 @@ def main(argv=None):
         "--npu-offload",
         default="off",
         choices=NPU_OFFLOAD_CHOICES,
-        help="Windows heterogeneous mode: off, auto, decoder, or require. auto selects NPU for the streaming decoder when GPU+NPU are available.",
+        help="Windows heterogeneous mode: off, auto, decoder, audio, all, or require.",
     )
     serve_parser.add_argument("--no-warmup", action="store_true")
     serve_parser.add_argument("--preload-modes", default="voice_design")

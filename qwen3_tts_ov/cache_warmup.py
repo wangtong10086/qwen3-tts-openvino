@@ -187,7 +187,7 @@ def collect_warmup_tasks(
         graph_sections.update({"core", "stream", "buckets", "decoder"})
 
     if "core" in graph_sections:
-        add("core:text_embedding", graph_name(manifest_graphs, variant_graphs, "text_embedding"))
+        add("core:text_embedding", graph_name(manifest_graphs, variant_graphs, "text_embedding"), "prompt")
         add("core:codec_embedding", graph_name(manifest_graphs, variant_graphs, "codec_embedding"))
         add("core:code_frame_embedding", graph_name(manifest_graphs, variant_graphs, "code_frame_embedding"))
         if fastest_paged_kv:
@@ -337,6 +337,7 @@ def compile_warmup_task(
     device: str,
     decoder_device: str | None,
     encoder_device: str | None = None,
+    prompt_device: str | None = None,
     mode: str,
     cache_kernel: str,
     cache_step: str,
@@ -369,6 +370,8 @@ def compile_warmup_task(
         manifest,
         device=device,
         decoder_device=decoder_device,
+        encoder_device=encoder_device,
+        prompt_device=prompt_device,
         mode=effective_mode,
         cache_kernel=effective_kernel,
         cache_step=effective_step,
@@ -384,6 +387,8 @@ def compile_warmup_task(
         task_device = decoder_device or device
     elif task.device_role == "encoder":
         task_device = encoder_device or device
+    elif task.device_role == "prompt":
+        task_device = prompt_device or device
     else:
         task_device = device
     started = time.time()
@@ -424,6 +429,7 @@ def run_single_task(args: argparse.Namespace) -> dict:
         device=args.device,
         decoder_device=args.decoder_device,
         encoder_device=getattr(args, "encoder_device", None),
+        prompt_device=getattr(args, "prompt_device", None),
         mode=args.mode,
         cache_kernel=args.cache_kernel,
         cache_step=args.cache_step,
@@ -475,6 +481,8 @@ def subprocess_base_args(args: argparse.Namespace, compile_config: dict) -> list
         cmd.extend(["--decoder-device", args.decoder_device])
     if getattr(args, "encoder_device", None):
         cmd.extend(["--encoder-device", args.encoder_device])
+    if getattr(args, "prompt_device", None):
+        cmd.extend(["--prompt-device", args.prompt_device])
     if getattr(args, "npu_offload", None):
         cmd.extend(["--npu-offload", args.npu_offload])
     if args.ov_cache_dir:
@@ -517,6 +525,7 @@ def run_cache_warmup(args: argparse.Namespace, compile_config: dict) -> dict:
         device=args.device,
         decoder_device=args.decoder_device,
         encoder_device=getattr(args, "encoder_device", None),
+        prompt_device=getattr(args, "prompt_device", None),
         mode=effective_mode,
         cache_kernel=effective_kernel,
         cache_step=effective_step,
@@ -539,6 +548,7 @@ def run_cache_warmup(args: argparse.Namespace, compile_config: dict) -> dict:
         "device": args.device,
         "decoder_device": args.decoder_device or args.device,
         "encoder_device": getattr(args, "encoder_device", None),
+        "prompt_device": getattr(args, "prompt_device", None),
         "npu_offload": getattr(args, "npu_offload", "off"),
         "npu_offload_decision": getattr(args, "npu_offload_decision", None),
         "preferred_cache_bucket": normalize_preferred_cache_bucket(args.preferred_cache_bucket),
@@ -578,6 +588,7 @@ def run_cache_warmup(args: argparse.Namespace, compile_config: dict) -> dict:
                     device=args.device,
                     decoder_device=args.decoder_device,
                     encoder_device=getattr(args, "encoder_device", None),
+                    prompt_device=getattr(args, "prompt_device", None),
                     mode=args.mode,
                     cache_kernel=args.cache_kernel,
                     cache_step=args.cache_step,

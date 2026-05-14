@@ -63,6 +63,16 @@ def select_audio_encoder_graphs(manifest: dict) -> list[tuple[str, str]]:
     return selected
 
 
+def select_prompt_graphs(manifest: dict) -> list[tuple[str, str]]:
+    graphs = manifest.get("graphs") or {}
+    selected = []
+    for key in ("text_embedding", "codec_embedding"):
+        graph = graphs.get(key)
+        if isinstance(graph, str) and graph:
+            selected.append((key, graph))
+    return selected
+
+
 def compile_named_graphs(
     core,
     ir_dir: Path,
@@ -154,6 +164,7 @@ def main() -> None:
     parser.add_argument("--model-root", required=True)
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default="NPU")
+    parser.add_argument("--skip-prompt-graphs", action="store_true")
     parser.add_argument("--skip-audio-encoders", action="store_true")
     parser.add_argument("--skip-if-missing-devices", action="store_true")
     parser.add_argument("--require-zero-copy", action="store_true")
@@ -169,6 +180,7 @@ def main() -> None:
         "decoder_device": args.decoder_device,
         "available_devices": [],
         "decoder_compile": [],
+        "prompt_compile": {"status": "not_run", "graphs": []},
         "audio_encoder_compile": {"status": "not_run", "graphs": []},
         "zero_copy_probe": {},
     }
@@ -205,6 +217,37 @@ def main() -> None:
                 write_summary(summary, args.output_json)
                 raise SystemExit(0)
             raise
+        if args.skip_prompt_graphs:
+            summary["prompt_compile"] = {"status": "skipped", "reason": "disabled", "graphs": []}
+        else:
+            prompt_graphs = select_prompt_graphs(manifest)
+            if not prompt_graphs:
+                summary["prompt_compile"] = {
+                    "status": "skipped",
+                    "reason": "voice_design manifest has no prompt graphs",
+                    "graphs": [],
+                }
+            else:
+                try:
+                    summary["prompt_compile"] = {
+                        "status": "ok",
+                        "graphs": compile_named_graphs(
+                            core,
+                            ir_dir,
+                            prompt_graphs,
+                            args.decoder_device,
+                            Path(args.cache_dir).resolve() / "prompt" if args.cache_dir else None,
+                        ),
+                    }
+                except Exception as exc:
+                    if args.skip_if_missing_devices:
+                        summary["prompt_compile"] = {
+                            "status": "skipped",
+                            "reason": f"NPU prompt graph compile failed: {exc}",
+                            "graphs": [],
+                        }
+                    else:
+                        raise
         if args.skip_audio_encoders:
             summary["audio_encoder_compile"] = {"status": "skipped", "reason": "disabled", "graphs": []}
         else:

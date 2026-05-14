@@ -26,6 +26,7 @@ SCENARIOS = {
     "gpu_only": {"npu_offload": "off"},
     "npu_decoder": {"npu_offload": "decoder"},
     "npu_audio": {"npu_offload": "audio"},
+    "npu_all": {"npu_offload": "all"},
 }
 
 
@@ -119,6 +120,8 @@ def metric_from_stream(stream: dict, health: dict, wall_elapsed: float) -> dict:
         "device": first_stream_or_health_value(stream, health, "device", None),
         "decoder_device": first_stream_or_health_value(stream, health, "decoder_device", None),
         "encoder_device": first_stream_or_health_value(stream, health, "encoder_device", None),
+        "prompt_device": first_stream_or_health_value(stream, health, "prompt_device", None),
+        "text_embedding_device": first_stream_or_health_value(stream, health, "text_embedding_device", None),
         "speech_encoder_device": first_stream_or_health_value(stream, health, "speech_encoder_device", None),
         "speaker_encoder_device": first_stream_or_health_value(stream, health, "speaker_encoder_device", None),
         "native_codegen_device": first_stream_or_health_value(stream, health, "native_codegen_device", None),
@@ -147,6 +150,8 @@ def aggregate_metrics(metrics: list[dict]) -> dict:
         "median_elapsed": statistics.median(elapsed) if elapsed else None,
         "decoder_device": metrics[-1].get("decoder_device") if metrics else None,
         "encoder_device": metrics[-1].get("encoder_device") if metrics else None,
+        "prompt_device": metrics[-1].get("prompt_device") if metrics else None,
+        "text_embedding_device": metrics[-1].get("text_embedding_device") if metrics else None,
         "speech_encoder_device": metrics[-1].get("speech_encoder_device") if metrics else None,
         "speaker_encoder_device": metrics[-1].get("speaker_encoder_device") if metrics else None,
         "native_codegen_device": metrics[-1].get("native_codegen_device") if metrics else None,
@@ -286,6 +291,8 @@ def expected_offload_for_scenario(name: str, npu_offload: str) -> str | None:
         return "decoder"
     if npu_offload == "audio":
         return "audio"
+    if npu_offload == "all":
+        return "all"
     return None
 
 
@@ -462,7 +469,7 @@ def main() -> None:
     parser.add_argument(
         "--scenarios",
         default="gpu_only,npu_decoder,npu_audio",
-        help="Comma-separated benchmark scenarios: gpu_only,npu_decoder,npu_audio.",
+        help="Comma-separated benchmark scenarios: gpu_only,npu_decoder,npu_audio,npu_all.",
     )
     parser.add_argument("--require-devices", default="GPU,NPU")
     parser.add_argument("--skip-if-missing-devices", action="store_true")

@@ -125,7 +125,8 @@ def test_cache_warmup_subprocess_preserves_npu_offload():
         device="GPU",
         decoder_device="NPU",
         encoder_device="NPU",
-        npu_offload="audio",
+        prompt_device="NPU",
+        npu_offload="all",
         mode="no-cache",
         cache_kernel="exact",
         cache_step="fused",
@@ -144,7 +145,8 @@ def test_cache_warmup_subprocess_preserves_npu_offload():
 
     assert cmd[cmd.index("--decoder-device") + 1] == "NPU"
     assert cmd[cmd.index("--encoder-device") + 1] == "NPU"
-    assert cmd[cmd.index("--npu-offload") + 1] == "audio"
+    assert cmd[cmd.index("--prompt-device") + 1] == "NPU"
+    assert cmd[cmd.index("--npu-offload") + 1] == "all"
 
 
 def test_resolve_cache_dir_is_namespaced(monkeypatch, tmp_path):
@@ -178,6 +180,20 @@ def test_resolve_cache_dir_is_namespaced(monkeypatch, tmp_path):
 
     assert str(first).startswith(str(tmp_path / "cache-root"))
     assert first != second
+    third = resolve_ov_cache_dir(
+        tmp_path / "ir",
+        manifest,
+        device="GPU",
+        decoder_device="GPU",
+        prompt_device="NPU",
+        mode="cache",
+        cache_kernel="exact",
+        cache_step="fused",
+        graph_variant="fp16",
+        precision_hint="f16",
+        compile_config={},
+    )
+    assert third != first
 
 
 def test_normalize_ov_cache_mode_accepts_cli_values():
@@ -219,6 +235,7 @@ def test_collect_warmup_tasks_uses_strategy_stream_decoders(tmp_path):
 
     labels = [task.label for task in tasks]
     assert "core:text_embedding" in labels
+    assert next(task for task in tasks if task.label == "core:text_embedding").device_role == "prompt"
     assert "stream:c0_t8" in labels
     assert "stream:c25_t12" in labels
     assert "bucket:fused_cache_step_buckets:128" in labels

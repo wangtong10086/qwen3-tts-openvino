@@ -75,11 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
     parser.add_argument("--encoder-device", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--prompt-device", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--npu-offload",
         default="off",
         choices=NPU_OFFLOAD_CHOICES,
-        help="Windows heterogeneous mode: off, auto, decoder, or require. auto selects NPU for decoder when GPU+NPU are available.",
+        help="Windows heterogeneous mode: off, auto, decoder, audio, all, or require.",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=17860)
@@ -157,6 +158,7 @@ def main(argv: list[str] | None = None) -> None:
         device=args.device,
         decoder_device=args.decoder_device,
         encoder_device=args.encoder_device,
+        prompt_device=args.prompt_device,
         npu_offload=args.npu_offload,
         allow_cpu_fallback=args.allow_cpu_fallback,
         realtime_profile=args.realtime_profile,

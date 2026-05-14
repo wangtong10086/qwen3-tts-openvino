@@ -57,6 +57,7 @@ release server 和源码 CLI 都支持同一组参数：
 qwen3-tts-ov-server.exe --device GPU --npu-offload auto
 qwen3-tts-ov-server.exe --device GPU --npu-offload decoder
 qwen3-tts-ov-server.exe --device GPU --npu-offload audio
+qwen3-tts-ov-server.exe --device GPU --npu-offload all
 ```
 
 ```bash
@@ -69,9 +70,10 @@ uv run python -m qwen3_tts_ov serve --device GPU --npu-offload auto
 - `auto`: 主设备是 GPU、且 OpenVINO 能看到 `NPU` 时，自动把 streaming decoder 放到 NPU；没有 NPU 时退回 GPU。
 - `decoder`: 强制把 streaming decoder 放到 NPU；缺少 NPU 或同时传入非 NPU 的 `--decoder-device` 会启动失败。
 - `audio`: 强制把 streaming decoder 和 VoiceClone 参考音频侧 encoder 放到 NPU，用于进一步降低 GPU 负载。
+- `all`: 在 `audio` 基础上，把 prompt/text embedding 也放到 NPU，用于测试更激进的 GPU 卸载路径。
 - `require`: 当前等价于 `decoder` 的严格模式，用于 CI 或部署验收。
 
-`/health` 和流式 metadata 会返回 `decoder_device`、`encoder_device`、`speech_encoder_device`、`speaker_encoder_device`、`npu_offload_requested`、`npu_offload_effective`、`npu_offload_reason`，用于确认实际是否命中 GPU codegen + NPU audio path。
+`/health` 和流式 metadata 会返回 `decoder_device`、`encoder_device`、`prompt_device`、`speech_encoder_device`、`speaker_encoder_device`、`npu_offload_requested`、`npu_offload_effective`、`npu_offload_reason`，用于确认实际是否命中 GPU codegen + NPU audio/prompt path。
 
 ## GPU-only 与 GPU+NPU 对比
 
@@ -91,6 +93,7 @@ uv run python -m qwen3_tts_ov serve --device GPU --npu-offload auto
 gpu_only:    --device GPU --npu-offload off
 npu_decoder: --device GPU --npu-offload decoder
 npu_audio:   --device GPU --npu-offload audio
+npu_all:     --device GPU --npu-offload all
 ```
 
 输出文件：
@@ -103,6 +106,17 @@ build/windows-gpu-npu-benchmark/npu_audio/server.log
 ```
 
 重点看 `comparison.npu_decoder.computed_rtf_speedup`、`comparison.npu_audio.computed_rtf_speedup`，以及每组 `decoder_device`、`speaker_encoder_device`、`npu_offload_effective` 和 `median_computed_rtf`。如果 `decoder_device=NPU` 但 RTF 没有改善，这说明当前瓶颈仍主要在 GPU codegen/paged-KV，而 NPU offload 主要价值是降低 GPU 音频侧负载。
+
+要额外测试 prompt/text embedding 是否适合放到 NPU，显式加入 `npu_all`：
+
+```powershell
+.\scripts\windows_gpu_npu_benchmark.ps1 `
+  -Scenarios gpu_only,npu_decoder,npu_audio,npu_all `
+  -Runs 2 `
+  -MaxNewTokens 48
+```
+
+如果 `npu_all` 比 `npu_audio` 更慢或 NPU 编译失败，保持生产路径使用 `audio`；如果 `npu_all` 的 GPU utilization 降幅更明显且 RTF 不回退，再考虑把它作为特定机器的部署配置。
 
 要直接观察 GPU 负载是否下降，在 Windows 上启用性能计数器采样：
 
@@ -176,7 +190,7 @@ self-hosted, Windows, X64, npu
 
 ## 零拷贝 Probe
 
-`probe_windows_gpu_npu.py` 会先编译 VoiceDesign streaming decoder 到 NPU。如果模型根目录还包含 `base/manifest.json`，它也会尝试把 VoiceClone 需要的 `speech_encoder` 和 `speaker_encoder` 编译到 NPU。最后会记录 OpenVINO Python remote-context API 的可见性：
+`probe_windows_gpu_npu.py` 会先编译 VoiceDesign streaming decoder 到 NPU，并额外尝试把 VoiceDesign prompt 相关的 `text_embedding`、`codec_embedding` 编译到 NPU，用于判断 `--npu-offload all` 是否可行。如果模型根目录还包含 `base/manifest.json`，它也会尝试把 VoiceClone 需要的 `speech_encoder` 和 `speaker_encoder` 编译到 NPU。最后会记录 OpenVINO Python remote-context API 的可见性：
 
 ```bash
 uv run python scripts/probe_windows_gpu_npu.py \
@@ -189,4 +203,4 @@ uv run python scripts/probe_windows_gpu_npu.py \
 
 当前零拷贝 probe 只作为诊断信息。真正的 GPU/NPU shared-handle zero-copy 需要 native handle 和 RemoteTensor 集成，未作为默认推理路径启用。需要把 remote-context 可用性作为硬性要求时，传入 `--require-zero-copy`。
 
-只想验证 streaming decoder、不验证 Base/VoiceClone 音频 encoder 时，传入 `--skip-audio-encoders`。
+只想验证 streaming decoder、不验证 prompt 或 Base/VoiceClone 音频 encoder 时，传入 `--skip-prompt-graphs` 或 `--skip-audio-encoders`。

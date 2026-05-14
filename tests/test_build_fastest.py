@@ -12,6 +12,7 @@ def make_args(**overrides):
         "device": "GPU",
         "decoder_device": None,
         "encoder_device": None,
+        "prompt_device": None,
         "npu_offload": "off",
         "ov_cache_dir": None,
         "disable_ov_cache": False,

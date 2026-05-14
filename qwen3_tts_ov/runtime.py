@@ -549,6 +549,7 @@ class OpenVINOQwen3TTS:
         profile: bool = False,
         ov_profile: bool = False,
         encoder_device: str | None = None,
+        prompt_device: str | None = None,
     ):
         self.ir_dir = resolve_ir_dir(ir_dir, fallback_to_local_voice_design=True, warn=True)
         self.manifest = load_manifest(self.ir_dir)
@@ -681,8 +682,10 @@ class OpenVINOQwen3TTS:
         self.device = device
         self.decoder_device = decoder_device or device
         self.encoder_device = encoder_device
+        self.prompt_device = prompt_device
         self.speech_encoder_device = encoder_device or self.decoder_device
         self.speaker_encoder_device = encoder_device or self.device
+        self.text_embedding_device = prompt_device or self.device
         self.allow_cpu_fallback = allow_cpu_fallback
         self.precision_hint = precision_hint
         self.disable_ov_cache = bool(disable_ov_cache)
@@ -697,6 +700,8 @@ class OpenVINOQwen3TTS:
             self.manifest,
             device=self.device,
             decoder_device=self.decoder_device,
+            encoder_device=self.encoder_device,
+            prompt_device=self.prompt_device,
             mode=self.mode,
             cache_kernel=self.cache_kernel,
             cache_step=self.cache_step,
@@ -733,7 +738,14 @@ class OpenVINOQwen3TTS:
         print(f"OpenVINO available devices: {self.core.available_devices}", flush=True)
         started = time.time()
         self.text_embedding = compile_model(
-            self.core, self.ir_dir / graphs["text_embedding"], device, self.cache_dir, allow_cpu_fallback, ov_profile, self.precision_hint, self.compile_config
+            self.core,
+            self.ir_dir / graphs["text_embedding"],
+            self.text_embedding_device,
+            self.cache_dir,
+            allow_cpu_fallback,
+            ov_profile,
+            self.precision_hint,
+            self.compile_config,
         )
         self.text_embedding_request = self.text_embedding.create_infer_request()
         self.codec_embedding = compile_model(
@@ -831,11 +843,9 @@ class OpenVINOQwen3TTS:
         self.decoder_graphs = {int(k): v for k, v in graphs["speech_decoder"].items()}
         self.decoders = {}
         if not allow_cpu_fallback and device == "GPU":
-            gpu_models = [
-                self.text_embedding,
-                self.codec_embedding,
-                self.fused_step if self.mode == "fused-no-cache" else self.talker,
-            ]
+            gpu_models = [self.codec_embedding, self.fused_step if self.mode == "fused-no-cache" else self.talker]
+            if str(self.text_embedding_device).upper().startswith("GPU"):
+                gpu_models.append(self.text_embedding)
             gpu_models = [compiled for compiled in gpu_models if compiled is not None]
             if self.subcode_greedy is not None:
                 gpu_models.append(self.subcode_greedy)
@@ -1739,6 +1749,9 @@ class OpenVINOQwen3TTS:
                 os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE_MODE") or "minimal"
             ).strip().lower()
             effective_paged_split_subcode = bool(paged_kv_requested and self._native_paged_kv_split_subcode_enabled())
+            effective_prompt_device = str(
+                os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE") or self.prompt_device or "CPU"
+            )
             key = (
                 "paged_kv" if paged_kv_requested else "stateful_bucket",
                 str(prefill_graph),
@@ -1764,6 +1777,7 @@ class OpenVINOQwen3TTS:
                 effective_paged_kv_static_blocks if paged_kv_requested else 0,
                 effective_paged_kv_static_mode if paged_kv_requested else "",
                 effective_paged_split_subcode,
+                effective_prompt_device,
             )
             if key not in self.native_audio_runners:
                 from .native_codegen import NativeCodegenRunner
@@ -1814,7 +1828,7 @@ class OpenVINOQwen3TTS:
                     tokenizer_dir=tokenizer_dir,
                     text_embedding_graph=self.ir_dir / self.graph_name(self.manifest["graphs"], "text_embedding"),
                     codec_embedding_graph=self.ir_dir / self.graph_name(self.manifest["graphs"], "codec_embedding"),
-                    device=str(os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE") or "CPU"),
+                    device=effective_prompt_device,
                     ids=self.ids,
                     cache_dir=cache_dir,
                     cache_mode=cache_mode,
