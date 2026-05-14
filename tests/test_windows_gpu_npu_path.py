@@ -276,6 +276,60 @@ def test_windows_gpu_npu_benchmark_recommends_balanced_npu_offload():
     assert recommendation["recommended_npu_offload"] == "audio"
 
 
+def test_release_server_loads_windows_npu_offload_summary(monkeypatch, tmp_path):
+    from qwen3_tts_ov import release_server
+    from qwen3_tts_ov.model_download import ModelDownloadResult
+
+    summary_path = tmp_path / "benchmark-summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "recommendation": {
+                    "recommended_scenario": "npu_decoder",
+                    "recommended_npu_offload": "decoder",
+                    "balanced": {"scenario": "npu_audio", "npu_offload": "audio"},
+                    "fastest": {"scenario": "npu_decoder", "npu_offload": "decoder"},
+                    "lowest_gpu_utilization": {"scenario": "npu_all", "npu_offload": "all"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    monkeypatch.setattr(release_server, "configure_native_library_env", lambda: None)
+    monkeypatch.setattr(
+        release_server,
+        "ensure_release_model_root",
+        lambda model_root, **_: ModelDownloadResult(
+            model_root=Path(model_root),
+            status="local",
+            repo_id="repo",
+            revision="main",
+            subdir="openvino_realtime",
+            cache_dir=tmp_path / "cache",
+            message="local",
+        ),
+    )
+    monkeypatch.setattr(release_server, "serve", lambda **kwargs: captured.update(kwargs))
+
+    release_server.main(
+        [
+            "--model-root",
+            str(tmp_path / "openvino"),
+            "--no-auto-download-model",
+            "--npu-offload-summary",
+            str(summary_path),
+            "--npu-offload-policy",
+            "lowest-gpu",
+            "--no-warmup",
+        ]
+    )
+
+    assert captured["npu_offload"] == "all"
+
+
 def test_windows_gpu_npu_benchmark_counter_sampler_targets_server_pid(tmp_path):
     benchmark = load_script("benchmark_windows_gpu_npu_release.py")
 

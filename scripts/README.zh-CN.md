@@ -28,6 +28,14 @@ uv run qwen3-tts-ov --help
 - `analyze_windows_gpu_npu_results.py`: 离线审计 Windows GPU+NPU artifact，检查实际设备、probe 编译、RTF、GPU utilization 降幅和阈值门禁。
 - `windows_gpu_npu_benchmark.ps1`: Windows 本地 PowerShell benchmark 入口，会构建/下载模型、运行 GPU+NPU probe、执行 GPU-only/NPU 对比 benchmark，并生成 `analysis.json`；传入 `-CollectCounters` 可同时记录 GPU/NPU 利用率。
 
+`benchmark_windows_gpu_npu_release.py` 生成的 `benchmark-summary.json` 可以直接传给 release server：
+
+```powershell
+qwen3-tts-ov-server.exe --npu-offload-summary build\windows-gpu-npu-benchmark\benchmark-summary.json
+```
+
+服务端会按 `recommendation` 自动设置 `--npu-offload`；默认策略是 `balanced`。
+
 日常不需要手动串联这些脚本，优先使用正式 CLI：
 
 ```bash

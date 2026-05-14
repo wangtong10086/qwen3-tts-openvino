@@ -115,6 +115,18 @@ build/windows-gpu-npu-benchmark/npu_audio/server.log
 - `recommendation.lowest_gpu_utilization`: GPU utilization 降幅最大的 NPU 场景，需要 `-CollectCounters` 才有完整依据。
 - `recommendation.balanced` / `recommended_npu_offload`: 在允许的 RTF 回退范围内优先降低 GPU 负载的部署建议。
 
+release server 可以直接读取 benchmark 结果并应用推荐配置：
+
+```powershell
+qwen3-tts-ov-server.exe `
+  --model-root build\hf-ir\openvino_realtime `
+  --device GPU `
+  --npu-offload-summary build\windows-gpu-npu-benchmark\benchmark-summary.json `
+  --npu-offload-policy balanced
+```
+
+`--npu-offload-policy` 可选 `balanced`、`fastest`、`lowest-gpu` 或 `recommended`。生产部署默认建议 `balanced`：在不明显牺牲 RTF 的前提下优先降低 GPU 负载。
+
 要额外测试 prompt/text embedding 是否适合放到 NPU，显式加入 `npu_all`：
 
 ```powershell
