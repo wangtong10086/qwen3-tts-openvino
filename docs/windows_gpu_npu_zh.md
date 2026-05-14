@@ -87,7 +87,7 @@ uv run python -m qwen3_tts_ov serve --device GPU --npu-offload auto
   -MaxNewTokens 48
 ```
 
-该脚本会使用同一个 release 包和同一份 IR 依次启动三组服务：
+该脚本会先运行 NPU probe，再使用同一个 release 包和同一份 IR 依次启动多组服务，最后生成 `analysis.json`：
 
 ```text
 gpu_only:    --device GPU --npu-offload off
@@ -100,6 +100,7 @@ npu_all:     --device GPU --npu-offload all
 
 ```text
 build/windows-gpu-npu-benchmark/benchmark-summary.json
+build/windows-gpu-npu-benchmark/probe.json
 build/windows-gpu-npu-benchmark/analysis.json
 build/windows-gpu-npu-benchmark/gpu_only/server.log
 build/windows-gpu-npu-benchmark/npu_decoder/server.log
@@ -156,7 +157,17 @@ build/windows-gpu-npu-benchmark/<scenario>/accelerator-counters.log
   -MinGpuUtilizationReduction 0.05
 ```
 
-`-MinSpeedup` 要求每个 NPU 场景的 RTF speedup 不低于阈值；`-MaxRtfRegression` 允许 NPU 场景比 GPU-only 慢的最大 RTF 差值；`-MinGpuUtilizationReduction` 要求平均 GPU utilization 相对 GPU-only 至少下降指定比例。失败会使脚本退出非零。
+`-MinSpeedup` 要求每个 NPU 场景的 RTF speedup 不低于阈值；`-MaxRtfRegression` 允许 NPU 场景比 GPU-only 慢的最大 RTF 差值；`-MinGpuUtilizationReduction` 要求平均 GPU utilization 相对 GPU-only 至少下降指定比例。失败会使脚本退出非零，并把失败原因写入 `analysis.json`。
+
+需要把 prompt 或 VoiceClone audio encoder 的 NPU 编译也作为硬门禁时，增加：
+
+```powershell
+.\scripts\windows_gpu_npu_benchmark.ps1 `
+  -Scenarios gpu_only,npu_decoder,npu_audio,npu_all `
+  -Strict `
+  -RequirePromptCompile `
+  -RequireAudioCompile
+```
 
 如果已经有 workflow artifact 或本地 benchmark 结果，可以离线审计：
 

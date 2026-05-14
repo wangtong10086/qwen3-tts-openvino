@@ -26,7 +26,7 @@ uv run qwen3-tts-ov --help
 - `collect_windows_accelerator_counters.ps1`: Windows 性能计数器采集器，自动发现 GPU/NPU utilization/usage/busy/load counter，优先按 release server PID 过滤进程级 counter，用于验证 NPU offload 是否降低 GPU 负载。
 - `benchmark_windows_gpu_npu_release.py`: 对同一个 release 包分别运行 GPU-only、NPU decoder、NPU audio 和可选 NPU all，输出首包、RTF、总耗时、实际设备和可选 GPU/NPU 计数器；可选 `--mode voice_clone` 触发参考音频 encoder。
 - `analyze_windows_gpu_npu_results.py`: 离线审计 Windows GPU+NPU artifact，检查实际设备、probe 编译、RTF、GPU utilization 降幅和阈值门禁。
-- `windows_gpu_npu_benchmark.ps1`: Windows 本地 PowerShell benchmark 入口，会构建/下载模型后调用上面的 Python benchmark；传入 `-CollectCounters` 可同时记录 GPU/NPU 利用率。
+- `windows_gpu_npu_benchmark.ps1`: Windows 本地 PowerShell benchmark 入口，会构建/下载模型、运行 GPU+NPU probe、执行 GPU-only/NPU 对比 benchmark，并生成 `analysis.json`；传入 `-CollectCounters` 可同时记录 GPU/NPU 利用率。
 
 日常不需要手动串联这些脚本，优先使用正式 CLI：
 

@@ -165,6 +165,27 @@ def test_windows_gpu_npu_benchmark_parses_default_scenarios():
         benchmark.parse_scenarios("gpu_only,invalid")
 
 
+def test_windows_gpu_npu_benchmark_powershell_runs_probe_and_analyzer():
+    script = (REPO_ROOT / "scripts" / "windows_gpu_npu_benchmark.ps1").read_text(encoding="utf-8")
+
+    assert "function Invoke-Checked" in script
+    assert "probe_windows_gpu_npu.py" in script
+    assert "analyze_windows_gpu_npu_results.py" in script
+    assert "--benchmark-summary" in script
+    assert "--require-scenarios" in script
+    assert "$benchmarkSummary.status -eq \"skipped\"" in script
+    assert "RequirePromptCompile" in script
+    assert "RequireAudioCompile" in script
+
+
+def test_windows_gpu_npu_powershell_entrypoints_check_native_exit_codes():
+    for name in ("windows_gpu_npu_smoke.ps1", "windows_gpu_npu_benchmark.ps1"):
+        script = (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8")
+        assert "function Invoke-Checked" in script
+        assert "if ($LASTEXITCODE -ne 0)" in script
+        assert "exit code ${LASTEXITCODE}" in script
+
+
 def test_windows_gpu_npu_benchmark_expected_offload_by_scenario():
     benchmark = load_script("benchmark_windows_gpu_npu_release.py")
 

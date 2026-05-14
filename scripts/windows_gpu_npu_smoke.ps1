@@ -20,21 +20,38 @@ $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 $env:PYTHONIOENCODING = "utf-8"
 
+function Invoke-Checked {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$FilePath,
+    [Parameter(Mandatory = $true)]
+    [string[]]$Arguments
+  )
+  & $FilePath @Arguments
+  if ($LASTEXITCODE -ne 0) {
+    throw "$FilePath failed with exit code ${LASTEXITCODE}: $($Arguments -join ' ')"
+  }
+}
+
 if (-not $SkipBuild) {
-  uv sync --extra native --extra server --extra release
-  uv run python scripts/build_native_codegen.py --backend cmake
-  uv run python scripts/package_release.py `
-    --target windows-x64 `
-    --version $Version `
-    --profile runtime-minimal
+  Invoke-Checked "uv" @("sync", "--extra", "native", "--extra", "server", "--extra", "release")
+  Invoke-Checked "uv" @("run", "python", "scripts/build_native_codegen.py", "--backend", "cmake")
+  Invoke-Checked "uv" @(
+    "run", "python", "scripts/package_release.py",
+    "--target", "windows-x64",
+    "--version", $Version,
+    "--profile", "runtime-minimal"
+  )
 }
 
 if (-not (Test-Path $ModelRoot)) {
-  uv run --with huggingface_hub python scripts/download_hf_ir.py `
-    --repo-id $HfRepo `
-    --revision $HfRevision `
-    --local-dir build/hf-ir `
-    --allow-pattern "openvino_realtime/**"
+  Invoke-Checked "uv" @(
+    "run", "--with", "huggingface_hub", "python", "scripts/download_hf_ir.py",
+    "--repo-id", $HfRepo,
+    "--revision", $HfRevision,
+    "--local-dir", "build/hf-ir",
+    "--allow-pattern", "openvino_realtime/**"
+  )
 }
 
 if (-not $Archive) {
@@ -56,26 +73,28 @@ if ($RequireZeroCopy) {
   $probeArgs += "--require-zero-copy"
 }
 
-uv run python @probeArgs
+Invoke-Checked "uv" (@("run", "python") + $probeArgs)
 $probe = Get-Content "$WorkDir/probe.json" -Raw | ConvertFrom-Json
 if ($probe.status -ne "ok") {
   Write-Host "GPU+NPU smoke skipped: $($probe.skip_reason)"
   exit 0
 }
 
-uv run python scripts/smoke_release_tts.py `
-  --archive $Archive `
-  --model-root $ModelRoot `
-  --work-dir $WorkDir `
-  --port $Port `
-  --device $Device `
-  --npu-offload $NpuOffload `
-  --require-devices "$Device,$DecoderDevice" `
-  --skip-if-missing-devices `
-  --expect-native-codegen-device $Device `
-  --expect-decoder-device $DecoderDevice `
-  --text $Text `
-  --max-new-tokens $MaxNewTokens `
-  --do-sample false `
-  --chunk-strategy smooth `
-  --summary-out "$WorkDir/summary.json"
+Invoke-Checked "uv" @(
+  "run", "python", "scripts/smoke_release_tts.py",
+  "--archive", $Archive,
+  "--model-root", $ModelRoot,
+  "--work-dir", $WorkDir,
+  "--port", "$Port",
+  "--device", $Device,
+  "--npu-offload", $NpuOffload,
+  "--require-devices", "$Device,$DecoderDevice",
+  "--skip-if-missing-devices",
+  "--expect-native-codegen-device", $Device,
+  "--expect-decoder-device", $DecoderDevice,
+  "--text", $Text,
+  "--max-new-tokens", "$MaxNewTokens",
+  "--do-sample", "false",
+  "--chunk-strategy", "smooth",
+  "--summary-out", "$WorkDir/summary.json"
+)
