@@ -40,7 +40,7 @@ uv run python -m qwen3_tts_ov cache-warmup `
   --preload-buckets warmup
 ```
 
-`--npu-offload auto` 会在检测到 OpenVINO `NPU` 时把 streaming decoder 缓存预热到 NPU；`decoder/require` 会在缺少 NPU 时直接失败。
+`--npu-offload auto` 会在检测到 OpenVINO `NPU` 时把 streaming decoder 缓存预热到 NPU；`decoder/audio/require` 会在缺少 NPU 时直接失败。`audio` 还会把 VoiceClone 参考音频侧 encoder 的缓存预热到 NPU。
 
 ## 查看将编译哪些图
 

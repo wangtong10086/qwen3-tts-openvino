@@ -113,12 +113,12 @@ def test_windows_gpu_npu_benchmark_builds_scenario_commands(tmp_path):
         port=17991,
         device="GPU",
         ov_cache_dir=tmp_path / "cache-npu",
-        npu_offload="decoder",
+        npu_offload="audio",
     )
 
     assert "--npu-offload" in gpu_cmd
     assert gpu_cmd[gpu_cmd.index("--npu-offload") + 1] == "off"
-    assert npu_cmd[npu_cmd.index("--npu-offload") + 1] == "decoder"
+    assert npu_cmd[npu_cmd.index("--npu-offload") + 1] == "audio"
     assert "--decoder-device" not in npu_cmd
 
 
@@ -137,6 +137,8 @@ def test_windows_gpu_npu_benchmark_metric_uses_audio_duration():
     assert metric["computed_rtf"] == 0.5
     assert metric["server_rtf"] == 0.4
     assert metric["decoder_device"] == "NPU"
+    assert metric["speech_encoder_device"] is None
+    assert metric["speaker_encoder_device"] is None
     assert metric["native_codegen_device"] == "GPU"
     assert metric["npu_offload_effective"] == "decoder"
 
@@ -180,6 +182,28 @@ def test_server_auto_npu_offload_selects_npu_decoder(monkeypatch, tmp_path):
     assert health["warmup"]["npu_offload_requested"] == "auto"
     assert health["warmup"]["npu_offload_effective"] == "decoder"
     assert health["warmup"]["npu_offload_reason"] == "auto_selected_npu_decoder"
+
+
+def test_server_audio_npu_offload_selects_npu_audio_devices(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+
+    monkeypatch.setattr(server, "openvino_available_devices", lambda: (["CPU", "GPU.0", "NPU"], None))
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        realtime_profile="fastest",
+        device="GPU",
+        npu_offload="audio",
+    )
+    client = fastapi_testclient.TestClient(app)
+
+    health = client.get("/health").json()
+
+    assert health["warmup"]["decoder_device"] == "NPU"
+    assert health["warmup"]["encoder_device"] == "NPU"
+    assert health["warmup"]["speech_encoder_device"] == "NPU"
+    assert health["warmup"]["speaker_encoder_device"] == "NPU"
+    assert health["warmup"]["npu_offload_effective"] == "audio"
 
 
 def test_server_auto_npu_offload_falls_back_without_npu(monkeypatch, tmp_path):
@@ -228,4 +252,19 @@ def test_server_npu_offload_rejects_conflicting_decoder_device(monkeypatch, tmp_
             device="GPU",
             decoder_device="GPU",
             npu_offload="decoder",
+        )
+
+
+def test_server_audio_npu_offload_rejects_conflicting_encoder_device(monkeypatch, tmp_path):
+    pytest.importorskip("fastapi.testclient")
+
+    monkeypatch.setattr(server, "openvino_available_devices", lambda: (["CPU", "GPU.0", "NPU"], None))
+    with pytest.raises(ValueError, match="encoder-device is not NPU"):
+        server.create_app(
+            model_root=tmp_path / "openvino",
+            warmup=False,
+            realtime_profile="fastest",
+            device="GPU",
+            encoder_device="GPU",
+            npu_offload="audio",
         )

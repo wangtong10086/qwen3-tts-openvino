@@ -74,6 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-cache-dir", default=None, help="Directory for downloaded OpenVINO IR. Defaults to the user cache directory.")
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
+    parser.add_argument("--encoder-device", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--npu-offload",
         default="off",
@@ -155,6 +156,7 @@ def main(argv: list[str] | None = None) -> None:
         port=args.port,
         device=args.device,
         decoder_device=args.decoder_device,
+        encoder_device=args.encoder_device,
         npu_offload=args.npu_offload,
         allow_cpu_fallback=args.allow_cpu_fallback,
         realtime_profile=args.realtime_profile,

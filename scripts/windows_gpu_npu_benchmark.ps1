@@ -4,7 +4,7 @@ param(
   [string]$Version = "gpu-npu-smoke",
   [string]$WorkDir = "build/windows-gpu-npu-benchmark",
   [string]$Device = "GPU",
-  [string]$NpuOffload = "decoder",
+  [string]$NpuOffload = "audio",
   [string]$HfRepo = "waston10086/qwen3-tts-openvino-voice-design",
   [string]$HfRevision = "main",
   [string]$Text = "你好，这是 Windows GPU 加 NPU 推理性能对比测试。",

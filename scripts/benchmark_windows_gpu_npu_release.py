@@ -99,6 +99,9 @@ def metric_from_stream(stream: dict, health: dict, wall_elapsed: float) -> dict:
         "decode_path": timings.get("decode_path") or metadata.get("decode_path"),
         "device": first_stream_or_health_value(stream, health, "device", None),
         "decoder_device": first_stream_or_health_value(stream, health, "decoder_device", None),
+        "encoder_device": first_stream_or_health_value(stream, health, "encoder_device", None),
+        "speech_encoder_device": first_stream_or_health_value(stream, health, "speech_encoder_device", None),
+        "speaker_encoder_device": first_stream_or_health_value(stream, health, "speaker_encoder_device", None),
         "native_codegen_device": first_stream_or_health_value(stream, health, "native_codegen_device", None),
         "npu_offload_effective": first_stream_or_health_value(stream, health, "npu_offload_effective", None),
         "npu_offload_reason": first_stream_or_health_value(stream, health, "npu_offload_reason", None),
@@ -124,6 +127,9 @@ def aggregate_metrics(metrics: list[dict]) -> dict:
         "median_server_rtf": statistics.median(server_rtf) if server_rtf else None,
         "median_elapsed": statistics.median(elapsed) if elapsed else None,
         "decoder_device": metrics[-1].get("decoder_device") if metrics else None,
+        "encoder_device": metrics[-1].get("encoder_device") if metrics else None,
+        "speech_encoder_device": metrics[-1].get("speech_encoder_device") if metrics else None,
+        "speaker_encoder_device": metrics[-1].get("speaker_encoder_device") if metrics else None,
         "native_codegen_device": metrics[-1].get("native_codegen_device") if metrics else None,
         "npu_offload_effective": metrics[-1].get("npu_offload_effective") if metrics else None,
         "npu_offload_reason": metrics[-1].get("npu_offload_reason") if metrics else None,
@@ -174,11 +180,31 @@ def run_scenario(
                     **metric_from_stream(stream, health, time.time() - started),
                 }
             )
+        summary = aggregate_metrics(metrics)
+        expected_offload = {
+            "off": "off",
+            "auto": "decoder",
+            "decoder": "decoder",
+            "require": "decoder",
+            "audio": "audio",
+        }.get(npu_offload)
+        if expected_offload and summary.get("npu_offload_effective") != expected_offload:
+            return {
+                "name": name,
+                "cmd": cmd,
+                "error": (
+                    f"expected npu_offload_effective={expected_offload}, "
+                    f"got {summary.get('npu_offload_effective')!r}"
+                ),
+                "summary": summary,
+                "health": {"ok": health.get("ok"), "warmup": health.get("warmup", {})},
+                "server_log_tail": tail(log_path),
+            }
         return {
             "name": name,
             "cmd": cmd,
             "health": {"ok": health.get("ok"), "warmup": health.get("warmup", {})},
-            "summary": aggregate_metrics(metrics),
+            "summary": summary,
         }
     except Exception as exc:
         return {
@@ -203,7 +229,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--base-port", type=int, default=17990)
     parser.add_argument("--device", default="GPU")
-    parser.add_argument("--npu-offload", default="decoder", choices=("auto", "decoder", "require"))
+    parser.add_argument("--npu-offload", default="audio", choices=("auto", "decoder", "audio", "require"))
     parser.add_argument("--require-devices", default="GPU,NPU")
     parser.add_argument("--skip-if-missing-devices", action="store_true")
     parser.add_argument("--timeout", type=float, default=900.0)
@@ -264,7 +290,7 @@ def main() -> None:
             "decoder_device": None,
         },
         {
-            "name": "gpu_npu_decoder",
+            "name": "gpu_npu_audio" if args.npu_offload == "audio" else "gpu_npu_decoder",
             "port": args.base_port + 1,
             "npu_offload": args.npu_offload,
             "decoder_device": None,
@@ -292,7 +318,8 @@ def main() -> None:
 
     by_name = {item["name"]: item for item in results}
     gpu_rtf = ((by_name.get("gpu_only") or {}).get("summary") or {}).get("median_computed_rtf")
-    npu_rtf = ((by_name.get("gpu_npu_decoder") or {}).get("summary") or {}).get("median_computed_rtf")
+    npu_result = by_name.get("gpu_npu_audio") or by_name.get("gpu_npu_decoder") or {}
+    npu_rtf = (npu_result.get("summary") or {}).get("median_computed_rtf")
     comparison = {
         "computed_rtf_delta": None if gpu_rtf is None or npu_rtf is None else npu_rtf - gpu_rtf,
         "computed_rtf_speedup": None if gpu_rtf is None or not npu_rtf else gpu_rtf / npu_rtf,

@@ -59,6 +59,7 @@ def add_runtime_args(
     )
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
+    parser.add_argument("--encoder-device", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--realtime-profile",
         default=FASTEST_PROFILE_NAME,
@@ -155,6 +156,7 @@ def build_runtime(args):
         ov_cache_mode=args.ov_cache_mode,
         disable_ov_cache=args.disable_ov_cache,
         profile=args.profile,
+        encoder_device=getattr(args, "encoder_device", None),
     )
 
 
@@ -596,6 +598,7 @@ def run_serve(args):
         port=args.port,
         device=args.device,
         decoder_device=args.decoder_device,
+        encoder_device=args.encoder_device,
         npu_offload=args.npu_offload,
         allow_cpu_fallback=args.allow_cpu_fallback,
         mode=args.mode,
@@ -635,7 +638,7 @@ def apply_npu_offload(args):
     npu_offload = getattr(args, "npu_offload", "off")
     if npu_offload is None:
         return
-    from .server import resolve_npu_offload
+    from .server import is_npu_device, resolve_npu_offload
 
     decision = resolve_npu_offload(
         device=getattr(args, "device", "GPU"),
@@ -643,6 +646,14 @@ def apply_npu_offload(args):
         npu_offload=npu_offload,
     )
     args.decoder_device = decision["decoder_device"]
+    if decision.get("effective_npu_offload") == "audio" and getattr(args, "encoder_device", None):
+        if not is_npu_device(args.encoder_device):
+            raise ValueError(
+                "npu audio offload requested but --encoder-device is not NPU. "
+                "Use --encoder-device NPU, omit --encoder-device, or set --npu-offload off/decoder."
+            )
+    if not getattr(args, "encoder_device", None):
+        args.encoder_device = decision.get("encoder_device")
     args.npu_offload_decision = decision
 
 
@@ -685,6 +696,7 @@ def add_cache_warmup_args(parser):
     )
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
+    parser.add_argument("--encoder-device", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--npu-offload",
         default="off",
@@ -742,6 +754,7 @@ def add_build_fastest_args(parser):
     )
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
+    parser.add_argument("--encoder-device", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--npu-offload", default="off", choices=NPU_OFFLOAD_CHOICES)
     parser.add_argument("--ov-cache-dir", default=None)
     parser.add_argument("--disable-ov-cache", action="store_true")

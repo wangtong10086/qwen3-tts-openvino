@@ -215,7 +215,7 @@ def collect_warmup_tasks(
         elif effective_mode == "cache" and effective_step == "split":
             add("core:subcode_greedy", graph_name(manifest_graphs, variant_graphs, "subcode_greedy"))
         add("core:speech_encoder", manifest_graphs.get("speech_encoder"), "decoder")
-        add("core:speaker_encoder", manifest_graphs.get("speaker_encoder"))
+        add("core:speaker_encoder", manifest_graphs.get("speaker_encoder"), "encoder")
 
     if "buckets" in graph_sections and effective_mode == "cache":
         if effective_step == "fused" and effective_unroll > 1:
@@ -336,6 +336,7 @@ def compile_warmup_task(
     *,
     device: str,
     decoder_device: str | None,
+    encoder_device: str | None = None,
     mode: str,
     cache_kernel: str,
     cache_step: str,
@@ -379,7 +380,12 @@ def compile_warmup_task(
         ov_cache_dir=ov_cache_dir,
         disable_ov_cache=disable_ov_cache,
     )
-    task_device = (decoder_device or device) if task.device_role == "decoder" else device
+    if task.device_role == "decoder":
+        task_device = decoder_device or device
+    elif task.device_role == "encoder":
+        task_device = encoder_device or device
+    else:
+        task_device = device
     started = time.time()
     core = ov.Core()
     compiled = compile_model(
@@ -417,6 +423,7 @@ def run_single_task(args: argparse.Namespace) -> dict:
         task,
         device=args.device,
         decoder_device=args.decoder_device,
+        encoder_device=getattr(args, "encoder_device", None),
         mode=args.mode,
         cache_kernel=args.cache_kernel,
         cache_step=args.cache_step,
@@ -466,6 +473,8 @@ def subprocess_base_args(args: argparse.Namespace, compile_config: dict) -> list
     ]
     if args.decoder_device:
         cmd.extend(["--decoder-device", args.decoder_device])
+    if getattr(args, "encoder_device", None):
+        cmd.extend(["--encoder-device", args.encoder_device])
     if getattr(args, "npu_offload", None):
         cmd.extend(["--npu-offload", args.npu_offload])
     if args.ov_cache_dir:
@@ -507,6 +516,7 @@ def run_cache_warmup(args: argparse.Namespace, compile_config: dict) -> dict:
         manifest,
         device=args.device,
         decoder_device=args.decoder_device,
+        encoder_device=getattr(args, "encoder_device", None),
         mode=effective_mode,
         cache_kernel=effective_kernel,
         cache_step=effective_step,
@@ -528,6 +538,7 @@ def run_cache_warmup(args: argparse.Namespace, compile_config: dict) -> dict:
         "ov_cache_mode": normalize_ov_cache_mode(args.ov_cache_mode),
         "device": args.device,
         "decoder_device": args.decoder_device or args.device,
+        "encoder_device": getattr(args, "encoder_device", None),
         "npu_offload": getattr(args, "npu_offload", "off"),
         "npu_offload_decision": getattr(args, "npu_offload_decision", None),
         "preferred_cache_bucket": normalize_preferred_cache_bucket(args.preferred_cache_bucket),
@@ -566,6 +577,7 @@ def run_cache_warmup(args: argparse.Namespace, compile_config: dict) -> dict:
                     task,
                     device=args.device,
                     decoder_device=args.decoder_device,
+                    encoder_device=getattr(args, "encoder_device", None),
                     mode=args.mode,
                     cache_kernel=args.cache_kernel,
                     cache_step=args.cache_step,

@@ -160,7 +160,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=17970)
     parser.add_argument("--device", default="CPU")
     parser.add_argument("--decoder-device", default=None)
-    parser.add_argument("--npu-offload", default=None, choices=("off", "auto", "decoder", "require"))
+    parser.add_argument("--npu-offload", default=None, choices=("off", "auto", "decoder", "audio", "require"))
     parser.add_argument("--require-devices", default="")
     parser.add_argument("--skip-if-missing-devices", action="store_true")
     parser.add_argument("--expect-native-codegen-device", default=None)
@@ -282,6 +282,7 @@ def main() -> None:
             "model_root": str(model_root),
             "device": args.device,
             "decoder_device": effective_decoder_device,
+            "encoder_device": first_stream_or_health_value(stream, health, "encoder_device", None),
             "npu_offload": args.npu_offload,
             "npu_offload_effective": first_stream_or_health_value(stream, health, "npu_offload_effective", None),
             "required_devices": required_devices,

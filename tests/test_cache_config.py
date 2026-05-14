@@ -124,7 +124,8 @@ def test_cache_warmup_subprocess_preserves_npu_offload():
         ir_dir="openvino/voice_design",
         device="GPU",
         decoder_device="NPU",
-        npu_offload="decoder",
+        encoder_device="NPU",
+        npu_offload="audio",
         mode="no-cache",
         cache_kernel="exact",
         cache_step="fused",
@@ -142,7 +143,8 @@ def test_cache_warmup_subprocess_preserves_npu_offload():
     cmd = subprocess_base_args(args, {})
 
     assert cmd[cmd.index("--decoder-device") + 1] == "NPU"
-    assert cmd[cmd.index("--npu-offload") + 1] == "decoder"
+    assert cmd[cmd.index("--encoder-device") + 1] == "NPU"
+    assert cmd[cmd.index("--npu-offload") + 1] == "audio"
 
 
 def test_resolve_cache_dir_is_namespaced(monkeypatch, tmp_path):

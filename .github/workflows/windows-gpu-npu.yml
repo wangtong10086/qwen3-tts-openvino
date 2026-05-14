@@ -143,7 +143,7 @@ jobs:
             --work-dir build/windows-gpu-npu-smoke `
             --port 17981 `
             --device GPU `
-            --npu-offload decoder `
+            --npu-offload audio `
             --require-devices GPU,NPU `
             --skip-if-missing-devices `
             --expect-native-codegen-device GPU `
@@ -187,4 +187,4 @@ jobs:
             build/windows-gpu-npu-smoke/summary.json
             build/windows-gpu-npu-benchmark/benchmark-summary.json
             build/windows-gpu-npu-benchmark/gpu_only/server.log
-            build/windows-gpu-npu-benchmark/gpu_npu_decoder/server.log
+            build/windows-gpu-npu-benchmark/gpu_npu_audio/server.log

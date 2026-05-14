@@ -548,6 +548,7 @@ class OpenVINOQwen3TTS:
         calibration_limit: int = 64,
         profile: bool = False,
         ov_profile: bool = False,
+        encoder_device: str | None = None,
     ):
         self.ir_dir = resolve_ir_dir(ir_dir, fallback_to_local_voice_design=True, warn=True)
         self.manifest = load_manifest(self.ir_dir)
@@ -679,6 +680,9 @@ class OpenVINOQwen3TTS:
         self.mode = mode
         self.device = device
         self.decoder_device = decoder_device or device
+        self.encoder_device = encoder_device
+        self.speech_encoder_device = encoder_device or self.decoder_device
+        self.speaker_encoder_device = encoder_device or self.device
         self.allow_cpu_fallback = allow_cpu_fallback
         self.precision_hint = precision_hint
         self.disable_ov_cache = bool(disable_ov_cache)
@@ -802,7 +806,7 @@ class OpenVINOQwen3TTS:
             self.speech_encoder = compile_model(
                 self.core,
                 self.ir_dir / graphs["speech_encoder"],
-                self.decoder_device,
+                self.speech_encoder_device,
                 self.cache_dir,
                 allow_cpu_fallback,
                 ov_profile,
@@ -816,7 +820,7 @@ class OpenVINOQwen3TTS:
             self.speaker_encoder = compile_model(
                 self.core,
                 self.ir_dir / graphs["speaker_encoder"],
-                device,
+                self.speaker_encoder_device,
                 self.cache_dir,
                 allow_cpu_fallback,
                 ov_profile,
