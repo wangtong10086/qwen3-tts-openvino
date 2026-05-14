@@ -94,6 +94,53 @@ def test_probe_zero_copy_reports_api_visibility_without_requiring_it():
     assert result["contexts"]["NPU"]["status"] == "unavailable"
 
 
+def test_windows_gpu_npu_benchmark_builds_scenario_commands(tmp_path):
+    benchmark = load_script("benchmark_windows_gpu_npu_release.py")
+
+    gpu_cmd = benchmark.build_server_command(
+        exe=tmp_path / "qwen3-tts-ov-server.exe",
+        model_root=tmp_path / "openvino",
+        host="127.0.0.1",
+        port=17990,
+        device="GPU",
+        ov_cache_dir=tmp_path / "cache-gpu",
+        npu_offload="off",
+    )
+    npu_cmd = benchmark.build_server_command(
+        exe=tmp_path / "qwen3-tts-ov-server.exe",
+        model_root=tmp_path / "openvino",
+        host="127.0.0.1",
+        port=17991,
+        device="GPU",
+        ov_cache_dir=tmp_path / "cache-npu",
+        npu_offload="decoder",
+    )
+
+    assert "--npu-offload" in gpu_cmd
+    assert gpu_cmd[gpu_cmd.index("--npu-offload") + 1] == "off"
+    assert npu_cmd[npu_cmd.index("--npu-offload") + 1] == "decoder"
+    assert "--decoder-device" not in npu_cmd
+
+
+def test_windows_gpu_npu_benchmark_metric_uses_audio_duration():
+    benchmark = load_script("benchmark_windows_gpu_npu_release.py")
+    stream = {
+        "audio_bytes": 48000,
+        "metadata": {"sample_rate": 24000, "decoder_device": "NPU"},
+        "final": {"elapsed": 0.5, "timings": {"stream_rtf": 0.4}},
+    }
+    health = {"warmup": {"native_codegen_device": "GPU", "npu_offload_effective": "decoder"}, "runtimes": {}}
+
+    metric = benchmark.metric_from_stream(stream, health, wall_elapsed=0.7)
+
+    assert metric["audio_seconds"] == 1.0
+    assert metric["computed_rtf"] == 0.5
+    assert metric["server_rtf"] == 0.4
+    assert metric["decoder_device"] == "NPU"
+    assert metric["native_codegen_device"] == "GPU"
+    assert metric["npu_offload_effective"] == "decoder"
+
+
 def test_server_health_reports_device_and_decoder_device(monkeypatch, tmp_path):
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
 

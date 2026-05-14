@@ -37,6 +37,10 @@ on:
         description: Max codec frames for the real smoke request
         required: true
         default: "8"
+      benchmark_runs:
+        description: Number of requests per GPU-only / GPU+NPU benchmark scenario
+        required: true
+        default: "2"
       text:
         description: Text used by the real smoke request
         required: true
@@ -150,6 +154,29 @@ jobs:
             --chunk-strategy smooth `
             --summary-out build/windows-gpu-npu-smoke/summary.json
 
+      - name: Benchmark GPU-only vs GPU+NPU decoder
+        if: steps.probe.outputs.status == 'ok'
+        shell: powershell
+        env:
+          REAL_TTS_TEXT: ${{ github.event.inputs.text || '你好，这是 Windows GPU 加 NPU 推理测试。' }}
+        run: |
+          [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+          $env:PYTHONIOENCODING = "utf-8"
+          uv run python scripts/benchmark_windows_gpu_npu_release.py `
+            --archive "dist/release/qwen3-tts-ov-server-windows-x64-${{ github.event.inputs.version || 'gpu-npu-smoke' }}-runtime-minimal.zip" `
+            --model-root build/hf-ir/openvino_realtime `
+            --work-dir build/windows-gpu-npu-benchmark `
+            --base-port 17990 `
+            --device GPU `
+            --npu-offload decoder `
+            --require-devices GPU,NPU `
+            --skip-if-missing-devices `
+            --text "$env:REAL_TTS_TEXT" `
+            --max-new-tokens "${{ github.event.inputs.max_new_tokens || '8' }}" `
+            --runs "${{ github.event.inputs.benchmark_runs || '2' }}" `
+            --chunk-strategy smooth `
+            --summary-out build/windows-gpu-npu-benchmark/benchmark-summary.json
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -158,3 +185,6 @@ jobs:
             build/gpu-npu-probe/probe.json
             build/windows-gpu-npu-smoke/server.log
             build/windows-gpu-npu-smoke/summary.json
+            build/windows-gpu-npu-benchmark/benchmark-summary.json
+            build/windows-gpu-npu-benchmark/gpu_only/server.log
+            build/windows-gpu-npu-benchmark/gpu_npu_decoder/server.log

@@ -71,6 +71,35 @@ uv run python -m qwen3_tts_ov serve --device GPU --npu-offload auto
 
 `/health` 和流式 metadata 会返回 `decoder_device`、`npu_offload_requested`、`npu_offload_effective`、`npu_offload_reason`，用于确认实际是否命中 GPU codegen + NPU decoder。
 
+## GPU-only 与 GPU+NPU 对比
+
+功能 smoke 只能证明路径可运行，不能证明性能收益。要对比 NPU 是否降低 decoder 对 GPU 的占用或改善端到端指标，运行：
+
+```powershell
+.\scripts\windows_gpu_npu_benchmark.ps1 `
+  -Device GPU `
+  -NpuOffload decoder `
+  -Runs 2 `
+  -MaxNewTokens 48
+```
+
+该脚本会使用同一个 release 包和同一份 IR 依次启动两组服务：
+
+```text
+gpu_only:         --device GPU --npu-offload off
+gpu_npu_decoder:  --device GPU --npu-offload decoder
+```
+
+输出文件：
+
+```text
+build/windows-gpu-npu-benchmark/benchmark-summary.json
+build/windows-gpu-npu-benchmark/gpu_only/server.log
+build/windows-gpu-npu-benchmark/gpu_npu_decoder/server.log
+```
+
+重点看 `comparison.computed_rtf_speedup`、每组 `decoder_device`、`npu_offload_effective` 和 `median_computed_rtf`。如果 `decoder_device=NPU` 但 RTF 没有改善，这说明当前瓶颈仍主要在 GPU codegen/paged-KV，而 decoder offload 主要价值是降低 GPU decoder 负载。
+
 ## GitHub Actions
 
 测试 workflow 位于：
