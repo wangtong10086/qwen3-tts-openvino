@@ -64,6 +64,44 @@ def test_smoke_expected_device_checks_stream_metadata_and_health():
         )
 
 
+def test_smoke_expected_value_checks_offload_metadata_and_health():
+    smoke = load_script("smoke_release_tts.py")
+    stream = {"metadata": {"npu_offload_effective": "audio"}}
+    health = {"warmup": {"npu_offload_effective": "decoder"}, "runtimes": {}}
+
+    smoke.assert_expected_value(
+        label="npu_offload_effective",
+        expected="audio",
+        stream=stream,
+        health=health,
+        metadata_key="npu_offload_effective",
+    )
+    smoke.assert_expected_value(
+        label="npu_offload_effective",
+        expected="decoder",
+        stream={"metadata": {}},
+        health=health,
+        metadata_key="npu_offload_effective",
+    )
+    with pytest.raises(RuntimeError):
+        smoke.assert_expected_value(
+            label="npu_offload_effective",
+            expected="all",
+            stream=stream,
+            health=health,
+            metadata_key="npu_offload_effective",
+        )
+
+
+def test_smoke_script_supports_all_npu_offload_and_device_expectations():
+    script = (REPO_ROOT / "scripts" / "smoke_release_tts.py").read_text(encoding="utf-8")
+
+    assert '"all"' in script
+    assert "--expect-encoder-device" in script
+    assert "--expect-prompt-device" in script
+    assert "--expect-npu-offload-effective" in script
+
+
 def test_probe_selects_runtime_minimal_stream_decoders():
     probe = load_script("probe_windows_gpu_npu.py")
     manifest = {
@@ -176,6 +214,15 @@ def test_windows_gpu_npu_benchmark_powershell_runs_probe_and_analyzer():
     assert "$benchmarkSummary.status -eq \"skipped\"" in script
     assert "RequirePromptCompile" in script
     assert "RequireAudioCompile" in script
+
+
+def test_windows_gpu_npu_smoke_powershell_asserts_audio_and_prompt_devices():
+    script = (REPO_ROOT / "scripts" / "windows_gpu_npu_smoke.ps1").read_text(encoding="utf-8")
+
+    assert "expect-npu-offload-effective" in script
+    assert "expect-encoder-device" in script
+    assert "expect-prompt-device" in script
+    assert "expectedNpuOffload" in script
 
 
 def test_windows_gpu_npu_powershell_entrypoints_check_native_exit_codes():

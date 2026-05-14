@@ -153,6 +153,10 @@ jobs:
             --skip-if-missing-devices `
             --expect-native-codegen-device GPU `
             --expect-decoder-device NPU `
+            --expect-encoder-device NPU `
+            --expect-speech-encoder-device NPU `
+            --expect-speaker-encoder-device NPU `
+            --expect-npu-offload-effective audio `
             --text "$env:REAL_TTS_TEXT" `
             --max-new-tokens "${{ github.event.inputs.max_new_tokens || '8' }}" `
             --do-sample false `

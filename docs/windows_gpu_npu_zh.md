@@ -35,6 +35,8 @@ WSL 当前不作为 NPU 验证环境。测试需要 Windows 原生 Intel GPU/NPU
   -MaxNewTokens 8
 ```
 
+`-NpuOffload audio` 会额外断言 `encoder_device`、`speech_encoder_device`、`speaker_encoder_device` 都为 NPU；`-NpuOffload all` 还会断言 `prompt_device` 和 `text_embedding_device` 为 NPU。这样 smoke 不只验证“能跑”，也验证实际 offload 范围。
+
 如果机器没有 NPU，默认会输出 skipped summary 并正常退出。需要强制失败时加：
 
 ```powershell

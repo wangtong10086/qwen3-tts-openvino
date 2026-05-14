@@ -5,6 +5,7 @@ param(
   [string]$WorkDir = "build/windows-gpu-npu-smoke",
   [string]$Device = "GPU",
   [string]$DecoderDevice = "NPU",
+  [ValidateSet("decoder", "audio", "all", "auto", "require")]
   [string]$NpuOffload = "decoder",
   [string]$HfRepo = "waston10086/qwen3-tts-openvino-voice-design",
   [string]$HfRevision = "main",
@@ -80,7 +81,8 @@ if ($probe.status -ne "ok") {
   exit 0
 }
 
-Invoke-Checked "uv" @(
+$expectedNpuOffload = if ($NpuOffload -eq "require" -or $NpuOffload -eq "auto") { "decoder" } else { $NpuOffload }
+$smokeArgs = @(
   "run", "python", "scripts/smoke_release_tts.py",
   "--archive", $Archive,
   "--model-root", $ModelRoot,
@@ -92,9 +94,25 @@ Invoke-Checked "uv" @(
   "--skip-if-missing-devices",
   "--expect-native-codegen-device", $Device,
   "--expect-decoder-device", $DecoderDevice,
+  "--expect-npu-offload-effective", $expectedNpuOffload,
   "--text", $Text,
   "--max-new-tokens", "$MaxNewTokens",
   "--do-sample", "false",
   "--chunk-strategy", "smooth",
   "--summary-out", "$WorkDir/summary.json"
 )
+if ($NpuOffload -eq "audio" -or $NpuOffload -eq "all") {
+  $smokeArgs += @(
+    "--expect-encoder-device", $DecoderDevice,
+    "--expect-speech-encoder-device", $DecoderDevice,
+    "--expect-speaker-encoder-device", $DecoderDevice
+  )
+}
+if ($NpuOffload -eq "all") {
+  $smokeArgs += @(
+    "--expect-prompt-device", $DecoderDevice,
+    "--expect-text-embedding-device", $DecoderDevice
+  )
+}
+
+Invoke-Checked "uv" $smokeArgs

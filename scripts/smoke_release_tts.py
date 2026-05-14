@@ -137,6 +137,27 @@ def assert_expected_device(
         raise RuntimeError(f"expected {label}={expected_name}, got candidates={candidates!r}")
 
 
+def assert_expected_value(
+    *,
+    label: str,
+    expected: str | None,
+    stream: dict,
+    health: dict,
+    metadata_key: str,
+    health_key: str | None = None,
+) -> None:
+    if not expected:
+        return
+    expected_value = str(expected)
+    candidates = []
+    metadata = stream.get("metadata") if isinstance(stream, dict) else None
+    if isinstance(metadata, dict) and metadata.get(metadata_key) is not None:
+        candidates.append(str(metadata[metadata_key]))
+    candidates.extend(health_runtime_values(health, health_key or metadata_key))
+    if expected_value not in candidates:
+        raise RuntimeError(f"expected {label}={expected_value}, got candidates={candidates!r}")
+
+
 def first_stream_or_health_value(stream: dict, health: dict, key: str, default: str | None = None) -> str | None:
     metadata = stream.get("metadata") if isinstance(stream, dict) else None
     if isinstance(metadata, dict) and metadata.get(key) is not None:
@@ -160,11 +181,17 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=17970)
     parser.add_argument("--device", default="CPU")
     parser.add_argument("--decoder-device", default=None)
-    parser.add_argument("--npu-offload", default=None, choices=("off", "auto", "decoder", "audio", "require"))
+    parser.add_argument("--npu-offload", default=None, choices=("off", "auto", "decoder", "audio", "all", "require"))
     parser.add_argument("--require-devices", default="")
     parser.add_argument("--skip-if-missing-devices", action="store_true")
     parser.add_argument("--expect-native-codegen-device", default=None)
     parser.add_argument("--expect-decoder-device", default=None)
+    parser.add_argument("--expect-encoder-device", default=None)
+    parser.add_argument("--expect-prompt-device", default=None)
+    parser.add_argument("--expect-text-embedding-device", default=None)
+    parser.add_argument("--expect-speech-encoder-device", default=None)
+    parser.add_argument("--expect-speaker-encoder-device", default=None)
+    parser.add_argument("--expect-npu-offload-effective", default=None)
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--text", default="你好。")
     parser.add_argument("--instruct", default="A calm young female voice.")
@@ -270,6 +297,48 @@ def main() -> None:
             health=health,
             metadata_key="decoder_device",
         )
+        assert_expected_device(
+            label="encoder_device",
+            expected=args.expect_encoder_device,
+            stream=stream,
+            health=health,
+            metadata_key="encoder_device",
+        )
+        assert_expected_device(
+            label="prompt_device",
+            expected=args.expect_prompt_device,
+            stream=stream,
+            health=health,
+            metadata_key="prompt_device",
+        )
+        assert_expected_device(
+            label="text_embedding_device",
+            expected=args.expect_text_embedding_device,
+            stream=stream,
+            health=health,
+            metadata_key="text_embedding_device",
+        )
+        assert_expected_device(
+            label="speech_encoder_device",
+            expected=args.expect_speech_encoder_device,
+            stream=stream,
+            health=health,
+            metadata_key="speech_encoder_device",
+        )
+        assert_expected_device(
+            label="speaker_encoder_device",
+            expected=args.expect_speaker_encoder_device,
+            stream=stream,
+            health=health,
+            metadata_key="speaker_encoder_device",
+        )
+        assert_expected_value(
+            label="npu_offload_effective",
+            expected=args.expect_npu_offload_effective,
+            stream=stream,
+            health=health,
+            metadata_key="npu_offload_effective",
+        )
         effective_decoder_device = first_stream_or_health_value(
             stream,
             health,
@@ -283,6 +352,11 @@ def main() -> None:
             "device": args.device,
             "decoder_device": effective_decoder_device,
             "encoder_device": first_stream_or_health_value(stream, health, "encoder_device", None),
+            "prompt_device": first_stream_or_health_value(stream, health, "prompt_device", None),
+            "text_embedding_device": first_stream_or_health_value(stream, health, "text_embedding_device", None),
+            "speech_encoder_device": first_stream_or_health_value(stream, health, "speech_encoder_device", None),
+            "speaker_encoder_device": first_stream_or_health_value(stream, health, "speaker_encoder_device", None),
+            "native_codegen_device": first_stream_or_health_value(stream, health, "native_codegen_device", None),
             "npu_offload": args.npu_offload,
             "npu_offload_effective": first_stream_or_health_value(stream, health, "npu_offload_effective", None),
             "required_devices": required_devices,
