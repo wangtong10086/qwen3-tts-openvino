@@ -198,7 +198,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ir-dir", required=True)
     parser.add_argument("--model-type", default="voice_design", choices=["voice_design", "custom_voice", "base"])
-    parser.add_argument("--version", default="0.1.1")
+    parser.add_argument("--version", default="0.1.2")
     parser.add_argument("--out-dir", default="dist/release")
     parser.add_argument("--format", default="auto", choices=["auto", "zip", "tar.gz", "tar.zst"])
     parser.add_argument("--profile", default="runtime-minimal", choices=IR_PROFILES)

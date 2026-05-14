@@ -23,6 +23,18 @@ on:
         description: Max codec frames for the real smoke request
         required: true
         default: "8"
+      do_sample:
+        description: Request sampling mode: false, true, or auto to use server defaults
+        required: true
+        default: "false"
+      text:
+        description: Text used by the real smoke request
+        required: true
+        default: "你好。"
+      chunk_strategy:
+        description: Streaming chunk strategy
+        required: true
+        default: smooth
 
 jobs:
   smoke:
@@ -78,7 +90,10 @@ jobs:
             --work-dir "build/real-tts-${{ matrix.target }}" \
             --port ${{ matrix.port }} \
             --device "${{ inputs.device }}" \
+            --text "${{ inputs.text }}" \
             --max-new-tokens "${{ inputs.max_new_tokens }}" \
+            --do-sample "${{ inputs.do_sample }}" \
+            --chunk-strategy "${{ inputs.chunk_strategy }}" \
             --summary-out "build/real-tts-${{ matrix.target }}/summary.json"
         shell: bash
       - uses: actions/upload-artifact@v4

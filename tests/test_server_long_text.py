@@ -78,6 +78,33 @@ def test_builtin_long_ar_profile_uses_int8_paged_split_when_manifest_supports_it
     assert profile["runtime"]["graph_variant"] == "int8_sym_paged_talker_split"
     assert profile["runtime"]["native_paged_kv"] == "require"
     assert profile["runtime"]["native_paged_kv_split_subcode"] == "1"
+    assert profile["profile_env"]["native_paged_kv_split_subcode_mode"] == "cached"
+    assert profile["split_subcode_mode_fallback"]["requested"] == "cached_exact"
+    assert profile["split_subcode_mode_fallback"]["effective"] == "cached"
+
+
+def test_builtin_long_ar_profile_keeps_cached_exact_when_manifest_supports_it():
+    manifest = {
+        "graphs": {
+            "subcode_greedy_cached": "subcode_greedy_cached.xml",
+            "subcode_greedy_cached_exact": "subcode_greedy_cached_exact.xml",
+            "paged_kv_seed": {"talker_stateful_gqa": "talker_stateful_sdpa_paged_gqa_seed.xml"},
+        },
+        "graph_variants": {
+            "int8_sym_paged_talker_split": {
+                "graphs": {
+                    "paged_kv_seed": {
+                        "talker_stateful_gqa": "talker_stateful_sdpa_paged_gqa_seed_int8_sym_paged_talker_split.xml"
+                    }
+                }
+            }
+        },
+    }
+
+    profile = server.builtin_long_text_profile_from_manifest(manifest)
+
+    assert profile["profile_env"]["native_paged_kv_split_subcode_mode"] == "cached_exact"
+    assert "split_subcode_mode_fallback" not in profile
 
 
 def test_builtin_long_ar_profile_falls_back_to_fp16_paged_seed_without_int8_variant():

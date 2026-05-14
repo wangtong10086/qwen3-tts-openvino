@@ -12,7 +12,7 @@ OpenVINO IR, generated audio, OpenVINO compile caches, or native build outputs.
 
 | Need | Use |
 | --- | --- |
-| Run TTS without a Python development environment | [GitHub Release runtime](https://github.com/wangtong10086/qwen3-tts-openvino/releases/tag/v0.1.1). The server auto-downloads the public [Hugging Face OpenVINO IR](https://huggingface.co/waston10086/qwen3-tts-openvino-voice-design) on first start. |
+| Run TTS without a Python development environment | [GitHub Release runtime](https://github.com/wangtong10086/qwen3-tts-openvino/releases/tag/v0.1.2). The server auto-downloads the public [Hugging Face OpenVINO IR](https://huggingface.co/waston10086/qwen3-tts-openvino-voice-design) on first start. |
 | Rebuild or tune IR from PyTorch weights | `uv run python -m qwen3_tts_ov build-fastest ...` |
 | Publish Linux/Windows runtime packages | Push a `v*` tag to run `release-runtime` |
 
@@ -21,8 +21,8 @@ OpenVINO IR, generated audio, OpenVINO compile caches, or native build outputs.
 1. Download one runtime package from GitHub Releases:
 
 ```text
-qwen3-tts-ov-server-linux-x64-0.1.1-runtime-minimal.tar.zst
-qwen3-tts-ov-server-windows-x64-0.1.1-runtime-minimal.zip
+qwen3-tts-ov-server-linux-x64-0.1.2-runtime-minimal.tar.zst
+qwen3-tts-ov-server-windows-x64-0.1.2-runtime-minimal.zip
 ```
 
 2. Start the sidecar. If no local OpenVINO IR is found, it downloads the default
@@ -31,8 +31,8 @@ qwen3-tts-ov-server-windows-x64-0.1.1-runtime-minimal.zip
 Linux:
 
 ```bash
-tar --zstd -xf qwen3-tts-ov-server-linux-x64-0.1.1-runtime-minimal.tar.zst
-cd qwen3-tts-ov-server-linux-x64-0.1.1-runtime-minimal
+tar --zstd -xf qwen3-tts-ov-server-linux-x64-0.1.2-runtime-minimal.tar.zst
+cd qwen3-tts-ov-server-linux-x64-0.1.2-runtime-minimal
 ./qwen3-tts-ov-server \
   --device GPU
 ```
@@ -40,8 +40,8 @@ cd qwen3-tts-ov-server-linux-x64-0.1.1-runtime-minimal
 Windows:
 
 ```powershell
-Expand-Archive qwen3-tts-ov-server-windows-x64-0.1.1-runtime-minimal.zip -DestinationPath .
-cd qwen3-tts-ov-server-windows-x64-0.1.1-runtime-minimal
+Expand-Archive qwen3-tts-ov-server-windows-x64-0.1.2-runtime-minimal.zip -DestinationPath .
+cd qwen3-tts-ov-server-windows-x64-0.1.2-runtime-minimal
 .\qwen3-tts-ov-server.exe `
   --device GPU
 ```

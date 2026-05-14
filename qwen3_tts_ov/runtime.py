@@ -1639,11 +1639,27 @@ class OpenVINOQwen3TTS:
                             or graphs_root.get("subcode_greedy")
                         )
                     if not subcode_graph_name and split_subcode_mode.endswith("_exact"):
-                        raise RuntimeError(
-                            f"native paged-KV split-subcode mode {split_subcode_mode!r} requires "
-                            f"graphs.subcode_greedy{'_cached' if split_subcode_mode.startswith('cached') else ''}_exact; "
-                            "re-export with `--subcode-attention-kernels exact`"
+                        fallback_mode = "cached" if split_subcode_mode.startswith("cached") else "recompute"
+                        fallback_graph_name = (
+                            (self.variant_graphs or {}).get("subcode_greedy_cached")
+                            or graphs_root.get("subcode_greedy_cached")
+                            or (self.variant_graphs or {}).get("subcode_greedy")
+                            or graphs_root.get("subcode_greedy")
+                        ) if fallback_mode == "cached" else (
+                            (self.variant_graphs or {}).get("subcode_greedy")
+                            or graphs_root.get("subcode_greedy")
+                            or (self.variant_graphs or {}).get("subcode_greedy_cached")
+                            or graphs_root.get("subcode_greedy_cached")
                         )
+                        if fallback_graph_name:
+                            split_subcode_mode = fallback_mode
+                            subcode_graph_name = fallback_graph_name
+                        else:
+                            raise RuntimeError(
+                                f"native paged-KV split-subcode mode {split_subcode_mode!r} requires "
+                                f"graphs.subcode_greedy{'_cached' if split_subcode_mode.startswith('cached') else ''}_exact; "
+                                "re-export with `--subcode-attention-kernels exact`"
+                            )
                     if not subcode_graph_name:
                         raise RuntimeError(
                             "native paged-KV split-subcode mode requires graphs.subcode_greedy_cached "

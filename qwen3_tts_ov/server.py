@@ -663,6 +663,65 @@ def explicit_long_text_profile(name: str | None) -> dict | None:
     }
 
 
+def manifest_graph_name(manifest: dict, graph_name: str, graph_variant: str | None = None) -> str | None:
+    graphs = manifest.get("graphs") or {}
+    if graph_variant and graph_variant != "fp16":
+        variant_graphs = ((manifest.get("graph_variants") or {}).get(graph_variant) or {}).get("graphs") or {}
+        value = variant_graphs.get(graph_name)
+        if isinstance(value, str) and value:
+            return value
+    value = graphs.get(graph_name)
+    return value if isinstance(value, str) and value else None
+
+
+def split_subcode_mode_for_manifest(manifest: dict, graph_variant: str | None = None) -> str | None:
+    if manifest_graph_name(manifest, "subcode_greedy_cached_exact", graph_variant):
+        return "cached_exact"
+    if manifest_graph_name(manifest, "subcode_greedy_cached", graph_variant):
+        return "cached"
+    if manifest_graph_name(manifest, "subcode_greedy_exact", graph_variant):
+        return "recompute_exact"
+    if manifest_graph_name(manifest, "subcode_greedy", graph_variant):
+        return "recompute"
+    return None
+
+
+def normalize_long_text_profile_for_manifest(profile: dict | None, manifest: dict) -> dict | None:
+    if not profile:
+        return profile
+    runtime = dict(profile.get("runtime") or {})
+    profile_env = dict(profile.get("profile_env") or {})
+    split_enabled = str(runtime.get("native_paged_kv_split_subcode") or "").lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+        "require",
+    }
+    if not split_enabled:
+        return profile
+    requested_mode = str(profile_env.get("native_paged_kv_split_subcode_mode") or "cached").strip().lower()
+    if requested_mode not in {"cached_exact", "recompute_exact"}:
+        return profile
+    required_graph = "subcode_greedy_cached_exact" if requested_mode == "cached_exact" else "subcode_greedy_exact"
+    graph_variant = runtime.get("graph_variant")
+    if manifest_graph_name(manifest, required_graph, graph_variant):
+        return profile
+    fallback_mode = split_subcode_mode_for_manifest(manifest, graph_variant)
+    if not fallback_mode:
+        return profile
+    normalized = dict(profile)
+    normalized["runtime"] = runtime
+    normalized["profile_env"] = profile_env
+    profile_env["native_paged_kv_split_subcode_mode"] = fallback_mode
+    normalized["split_subcode_mode_fallback"] = {
+        "requested": requested_mode,
+        "effective": fallback_mode,
+        "reason": "manifest_has_no_exact_subcode_graph",
+    }
+    return normalized
+
+
 def builtin_long_text_profile_from_manifest(manifest: dict) -> dict | None:
     """Return the fastest built-in full-AR long-text profile supported by an IR.
 
@@ -680,14 +739,14 @@ def builtin_long_text_profile_from_manifest(manifest: dict) -> dict | None:
         profile = explicit_long_text_profile("paged-sample-int8")
         if profile:
             profile["source"] = "builtin_manifest"
-        return profile
+        return normalize_long_text_profile_for_manifest(profile, manifest)
 
     fp16_seed = graphs.get("paged_kv_seed") or {}
     if has_cached_subcode and fp16_seed.get("talker_stateful_gqa"):
         profile = explicit_long_text_profile("paged-sample-fp16")
         if profile:
             profile["source"] = "builtin_manifest"
-        return profile
+        return normalize_long_text_profile_for_manifest(profile, manifest)
     return None
 
 
@@ -1278,6 +1337,10 @@ def create_app(
                     )
                 else:
                     selected_quality_profile = builtin_long_text_profile_from_manifest(runtime_manifest)
+            selected_quality_profile = normalize_long_text_profile_for_manifest(
+                selected_quality_profile,
+                runtime_manifest,
+            )
             if selected_quality_profile:
                 apply_long_text_profile_env(selected_quality_profile)
                 profile_runtime = selected_quality_profile.get("runtime") or {}

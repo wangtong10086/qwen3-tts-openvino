@@ -71,6 +71,13 @@ def main() -> None:
     parser.add_argument("--instruct", default="A calm young female voice.")
     parser.add_argument("--language", default="Chinese")
     parser.add_argument("--max-new-tokens", type=int, default=8)
+    parser.add_argument(
+        "--do-sample",
+        choices=("false", "true", "auto"),
+        default="false",
+        help="Sampling flag for the request. 'auto' omits do_sample and uses the server default.",
+    )
+    parser.add_argument("--chunk-strategy", default="smooth")
     parser.add_argument("--summary-out", default=None)
     args = parser.parse_args()
 
@@ -104,18 +111,21 @@ def main() -> None:
         process = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
     try:
         health = wait_for_health(f"http://{args.host}:{args.port}/health", deadline=time.time() + 90)
+        generation = {
+            "max_new_tokens": args.max_new_tokens,
+            "min_new_tokens": 1,
+        }
+        if args.do_sample != "auto":
+            generation["do_sample"] = args.do_sample == "true"
+
         request_payload = {
             "mode": "voice_design",
             "text": args.text,
             "language": args.language,
             "instruct": args.instruct,
-            "generation": {
-                "max_new_tokens": args.max_new_tokens,
-                "min_new_tokens": 1,
-                "do_sample": False,
-            },
+            "generation": generation,
             "stream": {
-                "chunk_strategy": "smooth",
+                "chunk_strategy": args.chunk_strategy,
                 "format": "pcm_s16le",
             },
         }
@@ -128,6 +138,12 @@ def main() -> None:
             "executable": str(exe),
             "model_root": str(model_root),
             "device": args.device,
+            "request": {
+                "text": args.text,
+                "max_new_tokens": args.max_new_tokens,
+                "do_sample": args.do_sample,
+                "chunk_strategy": args.chunk_strategy,
+            },
             "health": {"ok": health.get("ok"), "warmup": health.get("warmup", {})},
             "stream": stream,
         }

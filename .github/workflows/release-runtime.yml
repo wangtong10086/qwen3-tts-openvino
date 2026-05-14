@@ -12,9 +12,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release version, for example 0.1.1
+        description: Release version, for example 0.1.2
         required: true
-        default: 0.1.1
+        default: 0.1.2
       publish_release:
         description: Upload runtime packages to GitHub Releases
         required: true
