@@ -59,6 +59,10 @@ def run_stream_request(url: str, payload: dict, timeout: float) -> dict:
 
 
 def main() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--archive", required=True)
     parser.add_argument("--model-root", required=True)
