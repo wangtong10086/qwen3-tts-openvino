@@ -46,6 +46,15 @@ cd qwen3-tts-ov-server-windows-x64-0.1.3-runtime-minimal
   --device GPU
 ```
 
+On Windows systems with Intel GPU+NPU support, you can offload the streaming
+decoder to NPU:
+
+```powershell
+.\qwen3-tts-ov-server.exe `
+  --device GPU `
+  --npu-offload decoder
+```
+
 Open `http://127.0.0.1:17860/`.
 
 For offline deployment, download the IR manually and pass

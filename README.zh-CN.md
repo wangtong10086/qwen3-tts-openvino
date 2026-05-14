@@ -43,13 +43,21 @@ cd qwen3-tts-ov-server-windows-x64-0.1.3-runtime-minimal
   --device GPU
 ```
 
+Windows Intel GPU+NPU 机器可以把流式 decoder 放到 NPU，降低 GPU 音频侧负载：
+
+```powershell
+.\qwen3-tts-ov-server.exe `
+  --device GPU `
+  --npu-offload decoder
+```
+
 3. 打开浏览器：
 
 ```text
 http://127.0.0.1:17860/
 ```
 
-完整部署说明见 [docs/release_zh.md](docs/release_zh.md)。
+完整部署说明见 [docs/release_zh.md](docs/release_zh.md)。Windows GPU+NPU 验证路径见 [docs/windows_gpu_npu_zh.md](docs/windows_gpu_npu_zh.md)。
 
 离线部署或需要预下载时，可以手动下载 IR，并在启动时传入 `--model-root qwen3-tts-openvino-ir/openvino_realtime`：
 

@@ -11,13 +11,13 @@ WSL 当前不作为 NPU 验证环境。测试需要 Windows 原生 Intel GPU/NPU
 
 ## WSL 导出 NPU 静态 IR
 
-Windows NPU 编译要求 streaming decoder 使用固定输入 shape。可以在 WSL 中导出 IR，再复制到 Windows 原生 runtime 验证：
+Windows NPU 编译要求 streaming decoder 使用固定输入 shape。可以在 WSL 中导出 IR，再复制到 Windows 原生 runtime 验证。下面用 `D:\qwen3-tts-ov-npu-build` 作为临时构建目录示例：
 
 ```bash
 PYTHONPATH=/home/wt/Qwen3-TTS uv run python -m qwen3_tts_ov export \
   --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
   --model-type voice_design \
-  --out-dir /mnt/d/qwen3-tts-ov-win-build/npu-static/ir/openvino/voice_design \
+  --out-dir /mnt/d/qwen3-tts-ov-npu-build/ir/openvino/voice_design \
   --skip-fixed-cache-graphs \
   --cache-buckets 96 \
   --cache-kernels exact \
@@ -37,7 +37,7 @@ PYTHONPATH=/home/wt/Qwen3-TTS uv run python -m qwen3_tts_ov export \
   --stream-decoder-input-shape static
 
 uv run python scripts/compress_openvino_weights.py \
-  --ir-dir /mnt/d/qwen3-tts-ov-win-build/npu-static/ir/openvino/voice_design \
+  --ir-dir /mnt/d/qwen3-tts-ov-npu-build/ir/openvino/voice_design \
   --preset fastest
 ```
 
@@ -47,12 +47,12 @@ uv run python scripts/compress_openvino_weights.py \
 
 ```bash
 uv run python scripts/package_ir.py \
-  --ir-dir /mnt/d/qwen3-tts-ov-win-build/npu-static/ir/openvino/voice_design \
+  --ir-dir /mnt/d/qwen3-tts-ov-npu-build/ir/openvino/voice_design \
   --model-type voice_design \
   --version npu-static \
   --profile runtime-minimal \
   --format zip \
-  --out-dir /mnt/d/qwen3-tts-ov-win-build/npu-static
+  --out-dir /mnt/d/qwen3-tts-ov-npu-build
 ```
 
 导出的 streaming decoder 关键 shape 应为：
@@ -65,6 +65,65 @@ speech_decoder_stream_c25_t24.xml  [1,49,16]
 ```
 
 Windows 严格验证使用 `--npu-offload decoder`；该模式不会静默回退 GPU，适合判断 NPU decoder 是否真正可编译。
+
+## 干净 Windows 测试目录
+
+建议把 Windows runtime 和已打包的 IR 解压到一个单独目录，避免旧 OpenVINO compile cache、旧 raw IR 或多份 CI 产物影响判断：
+
+```text
+D:\qwen3-tts-ov-clean-test\
+  runtime\                  # qwen3-tts-ov-server.exe 和 _internal/
+  model\openvino\
+    voice_design\manifest.json
+  ov-cache\                 # 首次运行时生成，可随时删除重建
+  logs\                     # 本地测试日志
+```
+
+Windows PowerShell 启动 GPU-only 路径：
+
+```powershell
+cd D:\qwen3-tts-ov-clean-test\runtime
+
+.\qwen3-tts-ov-server.exe `
+  --model-root D:\qwen3-tts-ov-clean-test\model\openvino `
+  --host 127.0.0.1 `
+  --port 17860 `
+  --device GPU `
+  --npu-offload off `
+  --ov-cache-dir D:\qwen3-tts-ov-clean-test\ov-cache
+```
+
+严格验证 NPU decoder 路径：
+
+```powershell
+.\qwen3-tts-ov-server.exe `
+  --model-root D:\qwen3-tts-ov-clean-test\model\openvino `
+  --host 127.0.0.1 `
+  --port 17860 `
+  --device GPU `
+  --npu-offload decoder `
+  --ov-cache-dir D:\qwen3-tts-ov-clean-test\ov-cache
+```
+
+打开 Web Demo：
+
+```text
+http://127.0.0.1:17860/
+```
+
+验收时重点看 `/health` 或 Web Demo 日志中的 metadata：
+
+```text
+decoder_device=NPU
+npu_offload_effective=decoder
+```
+
+如果要从空 cache 重新验证编译行为，先停止服务并删除：
+
+```powershell
+Remove-Item -Recurse -Force D:\qwen3-tts-ov-clean-test\ov-cache
+New-Item -ItemType Directory D:\qwen3-tts-ov-clean-test\ov-cache | Out-Null
+```
 
 ## 本地 PowerShell
 

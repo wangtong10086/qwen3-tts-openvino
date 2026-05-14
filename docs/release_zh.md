@@ -56,6 +56,8 @@ http://127.0.0.1:17860/
 
 ## Windows 启动
 
+GPU-only 路径：
+
 ```powershell
 Expand-Archive qwen3-tts-ov-server-windows-x64-0.1.3-runtime-minimal.zip -DestinationPath .
 
@@ -63,6 +65,16 @@ cd qwen3-tts-ov-server-windows-x64-0.1.3-runtime-minimal
 .\qwen3-tts-ov-server.exe `
   --device GPU
 ```
+
+Intel GPU+NPU 机器可以显式把 streaming decoder 放到 NPU：
+
+```powershell
+.\qwen3-tts-ov-server.exe `
+  --device GPU `
+  --npu-offload decoder
+```
+
+该模式要求 Windows 原生 OpenVINO 能看到 `NPU`，并且 IR 中的 streaming decoder 是固定 shape。缺少 NPU 或 NPU decoder 编译失败时，`--npu-offload decoder` 会报错；需要自动回退时使用 `--npu-offload auto`。完整验证流程见 [Windows GPU+NPU 测试路径](windows_gpu_npu_zh.md)。
 
 打开：
 
