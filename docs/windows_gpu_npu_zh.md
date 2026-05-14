@@ -41,6 +41,20 @@ uv run python scripts/compress_openvino_weights.py \
   --preset fastest
 ```
 
+导出器会把 `vocab.json`、`merges.txt`、`tokenizer_config.json` 复制到 IR 目录，并把 manifest 中的 `model_dir` 写为 `.`。这样从 WSL 导出的目录可以直接在 Windows runtime 中使用，不会依赖 `/home/...` 这类 Linux 绝对路径。
+
+如果要按 release 方式分发，建议再打包成 runtime-minimal IR：
+
+```bash
+uv run python scripts/package_ir.py \
+  --ir-dir /mnt/d/qwen3-tts-ov-win-build/npu-static/ir/openvino/voice_design \
+  --model-type voice_design \
+  --version npu-static \
+  --profile runtime-minimal \
+  --format zip \
+  --out-dir /mnt/d/qwen3-tts-ov-win-build/npu-static
+```
+
 导出的 streaming decoder 关键 shape 应为：
 
 ```text

@@ -275,6 +275,15 @@ def test_exporter_supports_static_stream_decoder_shapes_for_npu():
     assert '"input_shape": stream_decoder_input_shape' in source
 
 
+def test_exporter_writes_portable_tokenizer_files_for_cross_os_ir():
+    source = (REPO_ROOT / "qwen3_tts_ov" / "exporter.py").read_text(encoding="utf-8")
+
+    assert "TOKENIZER_PORTABLE_FILES" in source
+    assert "copy_portable_tokenizer_files(model_dir, out_dir)" in source
+    assert '"model_dir": "."' in source
+    assert "missing tokenizer files required for portable OpenVINO runtime" in source
+
+
 def test_windows_probe_reports_compiled_input_shapes():
     source = (REPO_ROOT / "scripts" / "probe_windows_gpu_npu.py").read_text(encoding="utf-8")
 

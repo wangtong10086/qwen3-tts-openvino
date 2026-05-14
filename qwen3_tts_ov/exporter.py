@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -30,6 +31,7 @@ NEG_INF = -3.4028234663852886e38
 RMS_EXPORT_MODES = ("default", "canonical", "inline")
 SUBCODE_EXPORT_MODES = ("recompute", "cached")
 ATTENTION_KERNELS = ("exact", "sdpa")
+TOKENIZER_PORTABLE_FILES = ("vocab.json", "merges.txt", "tokenizer_config.json")
 
 
 def normalize_rms_export_mode(value: str | None) -> str:
@@ -2559,6 +2561,23 @@ def update_codegen_variant_manifest(
         json.dump(manifest, f, ensure_ascii=False, indent=2)
 
 
+def copy_portable_tokenizer_files(model_dir: str, out_dir: Path) -> None:
+    source_root = Path(model_dir)
+    missing = []
+    for name in TOKENIZER_PORTABLE_FILES:
+        source = source_root / name
+        dest = out_dir / name
+        if not source.exists():
+            missing.append(name)
+            continue
+        if source.resolve() != dest.resolve():
+            shutil.copy2(source, dest)
+    if missing:
+        raise FileNotFoundError(
+            "missing tokenizer files required for portable OpenVINO runtime: " + ", ".join(missing)
+        )
+
+
 def write_manifest(
     model_dir: str,
     out_dir: Path,
@@ -2577,6 +2596,7 @@ def write_manifest(
     stream_decoder_input_shape: str,
 ) -> None:
     manifest_path = out_dir / "manifest.json"
+    copy_portable_tokenizer_files(model_dir, out_dir)
     previous_manifest = {}
     if manifest_path.exists():
         with open(manifest_path, "r", encoding="utf-8") as f:
@@ -2680,7 +2700,7 @@ def write_manifest(
         stream_decoder_contexts[str(stream_decoder_left_context)] = stream_decoder_graphs
     manifest = {
         "format": "qwen3_tts_openvino_v3",
-        "model_dir": str(Path(model_dir).resolve()),
+        "model_dir": ".",
         "tts_model_type": config.get("tts_model_type", "unknown"),
         "tokenizer_type": config.get("tokenizer_type"),
         "tts_model_size": config.get("tts_model_size"),
