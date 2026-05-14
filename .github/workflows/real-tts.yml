@@ -24,7 +24,7 @@ on:
         required: true
         default: "8"
       do_sample:
-        description: Request sampling mode: false, true, or auto to use server defaults
+        description: "Request sampling mode: false, true, or auto to use server defaults"
         required: true
         default: "false"
       text:
