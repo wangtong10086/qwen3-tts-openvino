@@ -96,6 +96,21 @@ jobs:
             --chunk-strategy "${{ inputs.chunk_strategy }}" \
             --summary-out "build/real-tts-${{ matrix.target }}/summary.json"
         shell: bash
+      - name: Real streaming TTS smoke from PowerShell
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: |
+          uv run python scripts/smoke_release_tts.py `
+            --archive "dist/release/qwen3-tts-ov-server-${{ matrix.target }}-${{ inputs.version }}-runtime-minimal.${{ matrix.archive_ext }}" `
+            --model-root build/hf-ir/openvino_realtime `
+            --work-dir "build/real-tts-${{ matrix.target }}-powershell" `
+            --port ${{ matrix.port }} `
+            --device "${{ inputs.device }}" `
+            --text "${{ inputs.text }}" `
+            --max-new-tokens "${{ inputs.max_new_tokens }}" `
+            --do-sample "${{ inputs.do_sample }}" `
+            --chunk-strategy "${{ inputs.chunk_strategy }}" `
+            --summary-out "build/real-tts-${{ matrix.target }}-powershell/summary.json"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -103,3 +118,5 @@ jobs:
           path: |
             build/real-tts-${{ matrix.target }}/server.log
             build/real-tts-${{ matrix.target }}/summary.json
+            build/real-tts-${{ matrix.target }}-powershell/server.log
+            build/real-tts-${{ matrix.target }}-powershell/summary.json
