@@ -4,10 +4,14 @@ Release 面向最终调用方，只提供本地 sidecar 服务。调用方通过
 
 ## 产物
 
-- App 包：`qwen3-tts-ov-server-linux-x64-<version>.tar.zst` 或 `qwen3-tts-ov-server-windows-x64-<version>.zip`
-- IR 包：`qwen3-tts-openvino-ir-voice_design-<version>.tar.zst`
+- Runtime-minimal App 包：`qwen3-tts-ov-server-linux-x64-<version>-runtime-minimal.tar.zst` 或 `qwen3-tts-ov-server-windows-x64-<version>-runtime-minimal.zip`
+- Full App 包：`qwen3-tts-ov-server-linux-x64-<version>.tar.zst` 或 `qwen3-tts-ov-server-windows-x64-<version>.zip`
+- Runtime-minimal IR 包：`qwen3-tts-openvino-ir-voice_design-<version>-runtime-minimal.tar.zst`
+- Full IR 包：`qwen3-tts-openvino-ir-voice_design-<version>.tar.zst`
 
 App 包包含可执行入口、Python runtime、OpenVINO runtime、OpenVINO GenAI/tokenizers 依赖和 native 加速库。IR 包单独包含 `openvino/voice_design/manifest.json` 及其引用的 `.xml/.bin`。
+
+默认推荐 `runtime-minimal`。它保留当前验证的 native paged-KV 长文本完整自回归路径，支持 VoiceDesign 和带 `base` IR 的 VoiceClone/ref audio，同时移除开发 fallback、实验图和 `librosa/scipy/numba/llvmlite/sklearn` 依赖。`runtime-minimal` 的 ref audio 支持 `soundfile/libsndfile` 可读格式，例如 WAV/FLAC/OGG；需要更宽格式兼容时使用 `full`。
 
 也可以从公开 Hugging Face model repo 下载已验证的 realtime IR：
 
@@ -23,12 +27,12 @@ uv run --with huggingface_hub python scripts/download_hf_ir.py \
 ## Linux
 
 ```bash
-tar --zstd -xf qwen3-tts-ov-server-linux-x64-<version>.tar.zst
-tar --zstd -xf qwen3-tts-openvino-ir-voice_design-<version>.tar.zst
+tar --zstd -xf qwen3-tts-ov-server-linux-x64-<version>-runtime-minimal.tar.zst
+tar --zstd -xf qwen3-tts-openvino-ir-voice_design-<version>-runtime-minimal.tar.zst
 
-cd qwen3-tts-ov-server-linux-x64-<version>
+cd qwen3-tts-ov-server-linux-x64-<version>-runtime-minimal
 ./qwen3-tts-ov-server \
-  --model-root ../qwen3-tts-openvino-ir-voice_design-<version>/openvino \
+  --model-root ../qwen3-tts-openvino-ir-voice_design-<version>-runtime-minimal/openvino \
   --device GPU
 ```
 
@@ -37,12 +41,12 @@ cd qwen3-tts-ov-server-linux-x64-<version>
 ## Windows
 
 ```powershell
-Expand-Archive qwen3-tts-ov-server-windows-x64-<version>.zip
-Expand-Archive qwen3-tts-openvino-ir-voice_design-<version>.zip
+Expand-Archive qwen3-tts-ov-server-windows-x64-<version>-runtime-minimal.zip
+Expand-Archive qwen3-tts-openvino-ir-voice_design-<version>-runtime-minimal.zip
 
-cd qwen3-tts-ov-server-windows-x64-<version>
+cd qwen3-tts-ov-server-windows-x64-<version>-runtime-minimal
 .\qwen3-tts-ov-server.exe `
-  --model-root ..\qwen3-tts-openvino-ir-voice_design-<version>\openvino `
+  --model-root ..\qwen3-tts-openvino-ir-voice_design-<version>-runtime-minimal\openvino `
   --device GPU
 ```
 

@@ -59,7 +59,8 @@ jobs:
         run: |
           uv run python scripts/package_release.py \
             --target ${{ matrix.target }} \
-            --version "${{ inputs.version }}"
+            --version "${{ inputs.version }}" \
+            --profile runtime-minimal
         shell: bash
       - name: Download OpenVINO IR from Hugging Face
         run: |
@@ -72,7 +73,7 @@ jobs:
       - name: Real streaming TTS smoke
         run: |
           uv run python scripts/smoke_release_tts.py \
-            --archive "dist/release/qwen3-tts-ov-server-${{ matrix.target }}-${{ inputs.version }}.${{ matrix.archive_ext }}" \
+            --archive "dist/release/qwen3-tts-ov-server-${{ matrix.target }}-${{ inputs.version }}-runtime-minimal.${{ matrix.archive_ext }}" \
             --model-root build/hf-ir/openvino_realtime \
             --work-dir "build/real-tts-${{ matrix.target }}" \
             --port ${{ matrix.port }} \

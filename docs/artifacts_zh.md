@@ -29,6 +29,11 @@ dist/release/    app/IR release 包
 
 最终用户 release 分成 app 包和 IR 包。app 包包含可执行 server、OpenVINO runtime 和 native 库；IR 包包含 `openvino/<model_type>/manifest.json` 及其引用的 `.xml/.bin`。OpenVINO compile cache 不进入任何 release 包。
 
+release 有两种 profile：
+
+- `runtime-minimal`: 推荐发布包，只保留 native paged-KV 长文本完整自回归路径，移除开发 fallback、实验图和重音频依赖。
+- `full`: 开发调试包，保留 manifest 引用的完整 IR 和更宽依赖空间。
+
 当前公开测试用 IR 位于 Hugging Face：`waston10086/qwen3-tts-openvino-voice-design`，推荐使用其中的 `openvino_realtime/voice_design` 目录进行 release smoke 和最终用户部署验证。
 
 ## 检查命令

@@ -12,7 +12,7 @@ dependencies = [
   "openvino",
   "regex",
   "soundfile",
-  "librosa",
+  "soxr",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +35,9 @@ quality = [
 native = [
   "openvino-genai",
   "openvino-tokenizers",
+]
+audio-full = [
+  "librosa",
 ]
 release = [
   "pyinstaller",

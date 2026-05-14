@@ -29,6 +29,8 @@ uv run python -m qwen3_tts_ov build-fastest --model models/Qwen3-TTS-12Hz-1.7B-V
 
 `build-fastest` 默认使用低内存 production 图集合。只有需要旧 fixed-bucket/unroll 诊断图时才加 `--graph-set compat`。
 
+release 打包默认使用 `--profile runtime-minimal`，只保留生产推荐路径；调试完整 manifest/fallback 时使用 `--profile full`。
+
 ## 诊断脚本
 
 - `verify_long_autoregressive_parity.py`: 对比 OpenVINO full-AR codec 生成和上游 PyTorch 链路。

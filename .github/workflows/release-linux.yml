@@ -29,11 +29,12 @@ jobs:
         run: |
           uv run python scripts/package_release.py \
             --target linux-x64 \
-            --version "${{ inputs.version }}"
+            --version "${{ inputs.version }}" \
+            --profile runtime-minimal
       - name: Smoke release package
         run: |
           uv run python scripts/smoke_release_package.py \
-            --archive "dist/release/qwen3-tts-ov-server-linux-x64-${{ inputs.version }}.tar.zst" \
+            --archive "dist/release/qwen3-tts-ov-server-linux-x64-${{ inputs.version }}-runtime-minimal.tar.zst" \
             --work-dir build/release-smoke-linux \
             --port 17960
       - uses: actions/upload-artifact@v4
@@ -43,5 +44,5 @@ jobs:
           path: build/release-smoke-linux/server.log
       - uses: actions/upload-artifact@v4
         with:
-          name: qwen3-tts-ov-server-linux-x64-${{ inputs.version }}
-          path: dist/release/qwen3-tts-ov-server-linux-x64-${{ inputs.version }}.*
+          name: qwen3-tts-ov-server-linux-x64-${{ inputs.version }}-runtime-minimal
+          path: dist/release/qwen3-tts-ov-server-linux-x64-${{ inputs.version }}-runtime-minimal.*

@@ -73,6 +73,9 @@ def test_package_ir_dry_run(tmp_path):
     (ir_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     (ir_dir / "text_embedding.xml").write_text("<xml/>", encoding="utf-8")
     (ir_dir / "text_embedding.bin").write_bytes(b"bin")
+    (ir_dir / "vocab.json").write_text("{}", encoding="utf-8")
+    (ir_dir / "merges.txt").write_text("#version: 0.2\n", encoding="utf-8")
+    (ir_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
 
     result = subprocess.run(
         [
@@ -88,6 +91,8 @@ def test_package_ir_dry_run(tmp_path):
             str(tmp_path / "dist"),
             "--format",
             "zip",
+            "--profile",
+            "full",
             "--dry-run",
         ],
         cwd=REPO_ROOT,
@@ -97,6 +102,112 @@ def test_package_ir_dry_run(tmp_path):
     )
 
     assert "qwen3-tts-openvino-ir-voice_design-test.zip" in result.stdout
+
+
+def test_package_ir_runtime_minimal_keeps_only_long_ar_graphs(tmp_path):
+    package_ir = load_script("scripts/package_ir.py")
+    ir_dir = tmp_path / "ir"
+    model_dir = tmp_path / "model"
+    ir_dir.mkdir()
+    model_dir.mkdir()
+    manifest = {
+        "tts_model_type": "voice_design",
+        "model_dir": str(model_dir),
+        "tokenizer_ir": {"tokenizer": "openvino_tokenizer.xml", "detokenizer": "openvino_detokenizer.xml"},
+        "graphs": {
+            "text_embedding": "text_embedding.xml",
+            "codec_embedding": "codec_embedding.xml",
+            "talker": "talker_no_cache.xml",
+            "paged_kv_seed": {"talker_stateful_gqa": "fp16_paged.xml"},
+            "subcode_greedy": "subcode_greedy.xml",
+            "subcode_greedy_cached": "subcode_greedy_cached.xml",
+            "speech_decoder": {"256": "speech_decoder_t256.xml"},
+            "streaming_decoder": {"12": "speech_decoder_stream_c25_t12.xml", "24": "speech_decoder_stream_c25_t24.xml"},
+        },
+        "graph_variants": {
+            "int8_sym_paged_talker_split": {
+                "precision": "int8_sym_weights",
+                "graphs": {"paged_kv_seed": {"talker_stateful_gqa": "talker_int8.xml"}},
+            }
+        },
+        "streaming_decoder": {
+            "contexts": {
+                "0": {"8": "speech_decoder_stream_c0_t8.xml", "12": "speech_decoder_stream_c0_t12.xml"},
+                "25": {"12": "speech_decoder_stream_c25_t12.xml", "24": "speech_decoder_stream_c25_t24.xml"},
+            },
+            "output_format": "pcm_f32",
+        },
+    }
+    (ir_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    for rel in (
+        "text_embedding.xml",
+        "text_embedding.bin",
+        "codec_embedding.xml",
+        "codec_embedding.bin",
+        "talker_int8.xml",
+        "talker_int8.bin",
+        "subcode_greedy_cached.xml",
+        "subcode_greedy_cached.bin",
+        "speech_decoder_stream_c0_t8.xml",
+        "speech_decoder_stream_c0_t8.bin",
+        "speech_decoder_stream_c25_t24.xml",
+        "speech_decoder_stream_c25_t24.bin",
+    ):
+        (ir_dir / rel).write_text(rel, encoding="utf-8")
+    for rel in ("vocab.json", "merges.txt", "tokenizer_config.json"):
+        (model_dir / rel).write_text(rel, encoding="utf-8")
+
+    minimal = package_ir.manifest_for_profile(manifest, "runtime-minimal", "voice_design")
+    files = {path.relative_to(ir_dir).as_posix() for path in package_ir.manifest_referenced_files(ir_dir, minimal)}
+    tokenizer_sources = package_ir.tokenizer_file_sources(ir_dir, manifest)
+
+    assert minimal["model_dir"] == "."
+    assert "tokenizer_ir" not in minimal
+    assert files == {
+        "manifest.json",
+        "text_embedding.xml",
+        "text_embedding.bin",
+        "codec_embedding.xml",
+        "codec_embedding.bin",
+        "talker_int8.xml",
+        "talker_int8.bin",
+        "subcode_greedy_cached.xml",
+        "subcode_greedy_cached.bin",
+        "speech_decoder_stream_c0_t8.xml",
+        "speech_decoder_stream_c0_t8.bin",
+        "speech_decoder_stream_c25_t24.xml",
+        "speech_decoder_stream_c25_t24.bin",
+    }
+    assert set(tokenizer_sources) == {"vocab.json", "merges.txt", "tokenizer_config.json"}
+    assert minimal["streaming_decoder"]["contexts"] == {
+        "0": {"8": "speech_decoder_stream_c0_t8.xml"},
+        "25": {"24": "speech_decoder_stream_c25_t24.xml"},
+    }
+
+
+def test_package_ir_runtime_minimal_base_requires_clone_graphs(tmp_path):
+    package_ir = load_script("scripts/package_ir.py")
+    manifest = {
+        "tts_model_type": "base",
+        "graphs": {
+            "text_embedding": "text_embedding.xml",
+            "codec_embedding": "codec_embedding.xml",
+            "subcode_greedy_cached": "subcode_greedy_cached.xml",
+        },
+        "graph_variants": {
+            "int8_sym_paged_talker_split": {
+                "graphs": {"paged_kv_seed": {"talker_stateful_gqa": "talker_int8.xml"}}
+            }
+        },
+        "streaming_decoder": {"contexts": {"0": {"8": "c0.xml"}, "25": {"24": "c25.xml"}}},
+    }
+
+    try:
+        package_ir.manifest_for_profile(manifest, "runtime-minimal", "base")
+    except ValueError as exc:
+        assert "code_frame_embedding" in str(exc)
+    else:
+        raise AssertionError("runtime-minimal base packaging should require clone prompt graphs")
 
 
 def test_package_release_dry_run_uses_server_entry_and_native_lib(tmp_path):
@@ -129,8 +240,48 @@ def test_package_release_dry_run_uses_server_entry_and_native_lib(tmp_path):
 
     payload = json.loads(result.stdout)
     assert payload["target"] == target
+    assert payload["profile"] == "runtime-minimal"
     assert payload["native_lib"] == str(native_lib)
     assert "qwen3_tts_ov_server_entry.py" in " ".join(payload["cmd"])
+    assert "librosa" in " ".join(payload["cmd"])
+    assert "scipy" in " ".join(payload["cmd"])
+
+
+def test_package_release_full_profile_does_not_exclude_audio_full_modules(tmp_path):
+    target = "windows-x64" if platform.system().lower() == "windows" else "linux-x64"
+    native_name = "qwen3_tts_ov_genai.dll" if target.startswith("windows") else "libqwen3_tts_ov_genai.so"
+    native_lib = tmp_path / native_name
+    native_lib.write_bytes(b"fake")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/package_release.py",
+            "--target",
+            target,
+            "--version",
+            "test",
+            "--profile",
+            "full",
+            "--native-lib",
+            str(native_lib),
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--out-dir",
+            str(tmp_path / "dist"),
+            "--dry-run",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    payload = json.loads(result.stdout)
+    cmd = " ".join(payload["cmd"])
+    assert payload["profile"] == "full"
+    assert "librosa" not in cmd
+    assert payload["output"].endswith(f"qwen3-tts-ov-server-{target}-test.{ 'zip' if target.startswith('windows') else 'tar.zst' }")
 
 
 def test_package_release_places_native_library_in_frozen_search_paths(tmp_path):

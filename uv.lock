@@ -1544,14 +1544,17 @@ name = "qwen3-tts-openvino"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "librosa" },
     { name = "numpy" },
     { name = "openvino" },
     { name = "regex" },
     { name = "soundfile" },
+    { name = "soxr" },
 ]
 
 [package.optional-dependencies]
+audio-full = [
+    { name = "librosa" },
+]
 dev = [
     { name = "pytest" },
 ]
@@ -1583,7 +1586,7 @@ server = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", marker = "extra == 'server'" },
-    { name = "librosa" },
+    { name = "librosa", marker = "extra == 'audio-full'" },
     { name = "modelscope", marker = "extra == 'export'" },
     { name = "nncf", marker = "extra == 'export'" },
     { name = "numpy" },
@@ -1597,13 +1600,14 @@ requires-dist = [
     { name = "python-dotenv", marker = "extra == 'quality'" },
     { name = "regex" },
     { name = "soundfile" },
+    { name = "soxr" },
     { name = "torch", marker = "extra == 'export'" },
     { name = "transformers", marker = "extra == 'export'" },
     { name = "uvicorn", marker = "extra == 'server'" },
     { name = "websockets", marker = "extra == 'server'" },
     { name = "zstandard", marker = "extra == 'release'" },
 ]
-provides-extras = ["export", "server", "quality", "native", "release", "dev"]
+provides-extras = ["export", "server", "quality", "native", "audio-full", "release", "dev"]
 
 [[package]]
 name = "regex"

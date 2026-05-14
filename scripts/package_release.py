@@ -35,6 +35,19 @@ EXCLUDED_DEV_MODULES = (
     "tensorflow",
     "tensorboard",
 )
+EXCLUDED_RUNTIME_MINIMAL_MODULES = (
+    "librosa",
+    "scipy",
+    "sklearn",
+    "scikit_learn",
+    "numba",
+    "llvmlite",
+    "joblib",
+    "audioread",
+    "pooch",
+    "resampy",
+)
+RELEASE_PROFILES = ("full", "runtime-minimal")
 
 
 def current_target() -> str:
@@ -75,10 +88,12 @@ def add_data_arg(source: Path, dest: str) -> str:
     return f"{source}{sep}{dest}"
 
 
-def write_release_readme(bundle_dir: Path, version: str) -> None:
+def write_release_readme(bundle_dir: Path, version: str, profile: str) -> None:
     text = f"""# Qwen3-TTS OpenVINO Server {version}
 
 This package contains the user-facing sidecar server only. It does not include OpenVINO IR models.
+
+Release profile: `{profile}`.
 
 1. Extract the matching IR package next to this directory so `openvino/voice_design/manifest.json` exists.
 2. Start the server:
@@ -96,6 +111,9 @@ Windows:
 ```
 
 Open the web demo at `http://127.0.0.1:17860/`.
+
+The `runtime-minimal` profile supports common libsndfile-readable reference audio formats such as WAV/FLAC/OGG.
+Use the `full` profile for broader optional codec support.
 """
     (bundle_dir / "README_RELEASE.md").write_text(text, encoding="utf-8")
 
@@ -168,6 +186,8 @@ def build_pyinstaller_command(args, target: str, native_lib: Path, entry_script:
         "openvino_tokenizers",
         "--collect-all",
         "soundfile",
+        "--collect-all",
+        "soxr",
         "--hidden-import",
         "uvicorn.logging",
         "--hidden-import",
@@ -180,7 +200,10 @@ def build_pyinstaller_command(args, target: str, native_lib: Path, entry_script:
         add_data_arg(native_lib, "native/build"),
         str(entry_script),
     ]
-    for module in EXCLUDED_DEV_MODULES:
+    excluded_modules = list(EXCLUDED_DEV_MODULES)
+    if args.profile == "runtime-minimal":
+        excluded_modules.extend(EXCLUDED_RUNTIME_MINIMAL_MODULES)
+    for module in excluded_modules:
         cmd[-1:-1] = ["--exclude-module", module]
     return cmd
 
@@ -193,6 +216,7 @@ def main() -> None:
     parser.add_argument("--work-dir", default="build/release")
     parser.add_argument("--native-lib", default=None)
     parser.add_argument("--format", default="auto", choices=["auto", "zip", "tar.gz", "tar.zst"])
+    parser.add_argument("--profile", default="runtime-minimal", choices=RELEASE_PROFILES)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -215,9 +239,17 @@ def main() -> None:
     if args.format != "auto":
         archive_format = args.format
     suffix = {"zip": ".zip", "tar.gz": ".tar.gz", "tar.zst": ".tar.zst"}[archive_format]
-    package_name = f"qwen3-tts-ov-server-{args.target}-{args.version}"
+    profile_suffix = "" if args.profile == "full" else f"-{args.profile}"
+    package_name = f"qwen3-tts-ov-server-{args.target}-{args.version}{profile_suffix}"
     output = Path(args.out_dir) / f"{package_name}{suffix}"
-    print(json.dumps({"target": args.target, "native_lib": str(native_lib), "output": str(output), "cmd": cmd}, ensure_ascii=False, indent=2), flush=True)
+    print(
+        json.dumps(
+            {"target": args.target, "profile": args.profile, "native_lib": str(native_lib), "output": str(output), "cmd": cmd},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        flush=True,
+    )
     if args.dry_run:
         return
     if shutil.which("pyinstaller") is None and importlib.util.find_spec("PyInstaller") is None:
@@ -232,7 +264,7 @@ def main() -> None:
         shutil.rmtree(release_bundle)
     shutil.copytree(bundle_dir, release_bundle)
     ensure_native_library_in_bundle(release_bundle, native_lib)
-    write_release_readme(release_bundle, args.version)
+    write_release_readme(release_bundle, args.version, args.profile)
     make_archive(release_bundle, output, archive_format)
     print(output, flush=True)
 

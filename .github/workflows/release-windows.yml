@@ -29,12 +29,13 @@ jobs:
         run: |
           uv run python scripts/package_release.py `
             --target windows-x64 `
-            --version "${{ inputs.version }}"
+            --version "${{ inputs.version }}" `
+            --profile runtime-minimal
       - name: Smoke release package from PowerShell
         shell: powershell
         run: |
           uv run python scripts/smoke_release_package.py `
-            --archive "dist/release/qwen3-tts-ov-server-windows-x64-${{ inputs.version }}.zip" `
+            --archive "dist/release/qwen3-tts-ov-server-windows-x64-${{ inputs.version }}-runtime-minimal.zip" `
             --work-dir build/release-smoke-windows `
             --port 17961 `
             --exe-path-out build/release-smoke-windows/exe_path.txt
@@ -50,5 +51,5 @@ jobs:
           path: build/release-smoke-windows/server.log
       - uses: actions/upload-artifact@v4
         with:
-          name: qwen3-tts-ov-server-windows-x64-${{ inputs.version }}
-          path: dist/release/qwen3-tts-ov-server-windows-x64-${{ inputs.version }}.*
+          name: qwen3-tts-ov-server-windows-x64-${{ inputs.version }}-runtime-minimal
+          path: dist/release/qwen3-tts-ov-server-windows-x64-${{ inputs.version }}-runtime-minimal.*

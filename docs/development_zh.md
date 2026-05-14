@@ -50,11 +50,13 @@ uv sync --extra native --extra server --extra release
 uv run python scripts/package_ir.py \
   --ir-dir openvino/voice_design \
   --model-type voice_design \
-  --version 0.1.0
+  --version 0.1.0 \
+  --profile runtime-minimal
 
 uv run python scripts/package_release.py \
   --target linux-x64 \
-  --version 0.1.0
+  --version 0.1.0 \
+  --profile runtime-minimal
 ```
 
 Windows release 必须在 Windows runner 上执行：
@@ -62,8 +64,10 @@ Windows release 必须在 Windows runner 上执行：
 ```powershell
 uv sync --extra native --extra server --extra release
 uv run python scripts/build_native_codegen.py --backend cmake
-uv run python scripts/package_release.py --target windows-x64 --version 0.1.0
+uv run python scripts/package_release.py --target windows-x64 --version 0.1.0 --profile runtime-minimal
 ```
+
+`runtime-minimal` 是最终用户推荐包，只保留当前最快稳定的 native paged-KV 长文本完整自回归路径。需要调试 fallback、实验图或更宽音频格式兼容时使用 `--profile full`，并按需安装 `audio-full` extra。
 
 ## 边界
 
