@@ -1556,6 +1556,7 @@ audio-full = [
     { name = "librosa" },
 ]
 dev = [
+    { name = "httpx" },
     { name = "pytest" },
 ]
 export = [
@@ -1586,6 +1587,7 @@ server = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", marker = "extra == 'server'" },
+    { name = "httpx", marker = "extra == 'dev'" },
     { name = "huggingface-hub", specifier = ">=0.34.0,<1.0" },
     { name = "librosa", marker = "extra == 'audio-full'" },
     { name = "modelscope", marker = "extra == 'export'" },

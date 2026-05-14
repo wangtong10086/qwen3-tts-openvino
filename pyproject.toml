@@ -45,6 +45,7 @@ release = [
   "zstandard",
 ]
 dev = [
+  "httpx",
   "pytest",
 ]
 
