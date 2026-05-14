@@ -14,8 +14,10 @@ from pathlib import Path
 
 from smoke_release_package import extract_archive, find_executable, read_health, tail, terminate_process
 from smoke_release_tts import (
+    exercised_runtime_stages,
     first_stream_or_health_value,
     missing_devices,
+    npu_offload_coverage,
     query_openvino_devices,
     run_stream_request,
     write_summary,
@@ -294,32 +296,6 @@ def expected_offload_for_scenario(name: str, npu_offload: str) -> str | None:
     if npu_offload == "all":
         return "all"
     return None
-
-
-def exercised_runtime_stages(mode: str, *, x_vector_only: bool = False) -> list[str]:
-    normalized = str(mode or "voice_design").strip().lower().replace("-", "_")
-    stages = ["prompt", "text_embedding", "stream_decoder"]
-    if normalized == "voice_clone":
-        stages.append("speaker_encoder")
-        if not x_vector_only:
-            stages.append("speech_encoder")
-    return stages
-
-
-def npu_offload_coverage(npu_offload: str, exercised_stages: list[str]) -> dict:
-    exercised = set(exercised_stages)
-    expected = ["stream_decoder"]
-    if npu_offload in {"audio", "all"}:
-        expected.extend(["speech_encoder", "speaker_encoder"])
-    if npu_offload == "all":
-        expected.extend(["prompt", "text_embedding"])
-    covered = [stage for stage in expected if stage in exercised]
-    missing = [stage for stage in expected if stage not in exercised]
-    return {
-        "expected_npu_stages": expected,
-        "exercised_npu_stages": covered,
-        "unexercised_npu_stages": missing,
-    }
 
 
 def compare_to_gpu_baseline(results: list[dict]) -> dict:

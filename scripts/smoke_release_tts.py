@@ -168,6 +168,44 @@ def first_stream_or_health_value(stream: dict, health: dict, key: str, default: 
     return default
 
 
+def exercised_runtime_stages(mode: str, *, x_vector_only: bool = False) -> list[str]:
+    normalized = str(mode or "voice_design").strip().lower().replace("-", "_")
+    stages = ["prompt", "text_embedding", "stream_decoder"]
+    if normalized == "voice_clone":
+        stages.append("speaker_encoder")
+        if not x_vector_only:
+            stages.append("speech_encoder")
+    return stages
+
+
+def npu_offload_coverage(npu_offload: str | None, exercised_stages: list[str]) -> dict:
+    normalized = str(npu_offload or "off").strip().lower().replace("_", "-")
+    if normalized in {"auto", "require"}:
+        normalized = "decoder"
+    exercised = set(exercised_stages)
+    expected = []
+    if normalized in {"decoder", "audio", "all"}:
+        expected.append("stream_decoder")
+    if normalized in {"audio", "all"}:
+        expected.extend(["speech_encoder", "speaker_encoder"])
+    if normalized == "all":
+        expected.extend(["prompt", "text_embedding"])
+    covered = [stage for stage in expected if stage in exercised]
+    missing = [stage for stage in expected if stage not in exercised]
+    return {
+        "expected_npu_stages": expected,
+        "exercised_npu_stages": covered,
+        "unexercised_npu_stages": missing,
+    }
+
+
+def manifest_path_for_mode(model_root: Path, mode: str) -> Path:
+    normalized = str(mode or "voice_design").strip().lower().replace("-", "_")
+    if normalized == "voice_clone":
+        return model_root / "base" / "manifest.json"
+    return model_root / "voice_design" / "manifest.json"
+
+
 def main() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -193,9 +231,13 @@ def main() -> None:
     parser.add_argument("--expect-speaker-encoder-device", default=None)
     parser.add_argument("--expect-npu-offload-effective", default=None)
     parser.add_argument("--timeout", type=float, default=900.0)
+    parser.add_argument("--mode", default="voice_design", choices=("voice_design", "voice_clone"))
     parser.add_argument("--text", default="你好。")
     parser.add_argument("--instruct", default="A calm young female voice.")
     parser.add_argument("--language", default="Chinese")
+    parser.add_argument("--ref-audio", default=None)
+    parser.add_argument("--ref-text", default=None)
+    parser.add_argument("--x-vector-only", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument(
         "--do-sample",
@@ -230,9 +272,11 @@ def main() -> None:
     bundle_root = extract_archive(Path(args.archive).resolve(), work_dir / "extracted")
     exe = find_executable(bundle_root)
     model_root = Path(args.model_root).resolve()
-    manifest = model_root / "voice_design" / "manifest.json"
+    if args.mode == "voice_clone" and not args.ref_audio:
+        raise ValueError("--mode voice_clone requires --ref-audio")
+    manifest = manifest_path_for_mode(model_root, args.mode)
     if not manifest.exists():
-        raise FileNotFoundError(f"voice_design manifest not found under model root: {manifest}")
+        raise FileNotFoundError(f"{args.mode} manifest not found under model root: {manifest}")
 
     log_path = work_dir / "server.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -268,16 +312,23 @@ def main() -> None:
             generation["do_sample"] = args.do_sample == "true"
 
         request_payload = {
-            "mode": "voice_design",
+            "mode": args.mode,
             "text": args.text,
             "language": args.language,
-            "instruct": args.instruct,
             "generation": generation,
             "stream": {
                 "chunk_strategy": args.chunk_strategy,
                 "format": "pcm_s16le",
             },
         }
+        if args.mode == "voice_design":
+            request_payload["instruct"] = args.instruct
+        else:
+            request_payload["ref_audio"] = args.ref_audio
+            request_payload["ref_text"] = args.ref_text
+            request_payload["x_vector_only"] = bool(args.x_vector_only)
+        exercised_stages = exercised_runtime_stages(args.mode, x_vector_only=bool(args.x_vector_only))
+        coverage = npu_offload_coverage(args.npu_offload, exercised_stages)
         stream = run_stream_request(
             f"http://{args.host}:{args.port}/v1/tts/stream",
             request_payload,
@@ -359,10 +410,15 @@ def main() -> None:
             "native_codegen_device": first_stream_or_health_value(stream, health, "native_codegen_device", None),
             "npu_offload": args.npu_offload,
             "npu_offload_effective": first_stream_or_health_value(stream, health, "npu_offload_effective", None),
+            "exercised_runtime_stages": exercised_stages,
+            "npu_offload_coverage": coverage,
             "required_devices": required_devices,
             "available_devices": available_devices,
             "request": {
+                "mode": args.mode,
                 "text": args.text,
+                "ref_audio": args.ref_audio,
+                "x_vector_only": bool(args.x_vector_only),
                 "max_new_tokens": args.max_new_tokens,
                 "do_sample": args.do_sample,
                 "chunk_strategy": args.chunk_strategy,

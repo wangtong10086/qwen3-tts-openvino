@@ -97,9 +97,26 @@ def test_smoke_script_supports_all_npu_offload_and_device_expectations():
     script = (REPO_ROOT / "scripts" / "smoke_release_tts.py").read_text(encoding="utf-8")
 
     assert '"all"' in script
+    assert '"voice_clone"' in script
+    assert "--ref-audio" in script
     assert "--expect-encoder-device" in script
     assert "--expect-prompt-device" in script
     assert "--expect-npu-offload-effective" in script
+
+
+def test_smoke_stage_coverage_distinguishes_voice_design_and_clone():
+    smoke = load_script("smoke_release_tts.py")
+
+    voice_design = smoke.npu_offload_coverage("audio", smoke.exercised_runtime_stages("voice_design"))
+    voice_clone = smoke.npu_offload_coverage("audio", smoke.exercised_runtime_stages("voice_clone"))
+    x_vector = smoke.npu_offload_coverage(
+        "audio",
+        smoke.exercised_runtime_stages("voice_clone", x_vector_only=True),
+    )
+
+    assert voice_design["unexercised_npu_stages"] == ["speech_encoder", "speaker_encoder"]
+    assert voice_clone["unexercised_npu_stages"] == []
+    assert x_vector["unexercised_npu_stages"] == ["speech_encoder"]
 
 
 def test_probe_selects_runtime_minimal_stream_decoders():
@@ -223,6 +240,8 @@ def test_windows_gpu_npu_smoke_powershell_asserts_audio_and_prompt_devices():
     assert "expect-encoder-device" in script
     assert "expect-prompt-device" in script
     assert "expectedNpuOffload" in script
+    assert "Mode voice_clone requires -RefAudio" in script
+    assert "$Mode -eq \"voice_clone\"" in script
 
 
 def test_windows_gpu_npu_powershell_entrypoints_check_native_exit_codes():

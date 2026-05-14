@@ -37,6 +37,18 @@ WSL 当前不作为 NPU 验证环境。测试需要 Windows 原生 Intel GPU/NPU
 
 `-NpuOffload audio` 会额外断言 `encoder_device`、`speech_encoder_device`、`speaker_encoder_device` 都为 NPU；`-NpuOffload all` 还会断言 `prompt_device` 和 `text_embedding_device` 为 NPU。这样 smoke 不只验证“能跑”，也验证实际 offload 范围。
 
+如果要让 smoke 真正执行 VoiceClone 参考音频 encoder，使用：
+
+```powershell
+.\scripts\windows_gpu_npu_smoke.ps1 `
+  -Mode voice_clone `
+  -NpuOffload audio `
+  -RefAudio C:\path\ref.wav `
+  -RefText "参考音频对应文本"
+```
+
+VoiceDesign 不会执行 `speech_encoder/speaker_encoder`，因此 audio encoder 的真实性能收益必须通过 VoiceClone smoke 或 `-Mode voice_clone` benchmark 判断。
+
 如果机器没有 NPU，默认会输出 skipped summary 并正常退出。需要强制失败时加：
 
 ```powershell

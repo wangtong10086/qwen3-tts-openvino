@@ -9,7 +9,12 @@ param(
   [string]$NpuOffload = "decoder",
   [string]$HfRepo = "waston10086/qwen3-tts-openvino-voice-design",
   [string]$HfRevision = "main",
+  [ValidateSet("voice_design", "voice_clone")]
+  [string]$Mode = "voice_design",
   [string]$Text = "你好，这是 Windows GPU 加 NPU 推理测试。",
+  [string]$RefAudio = "",
+  [string]$RefText = "",
+  [switch]$XVectorOnly,
   [int]$MaxNewTokens = 8,
   [int]$Port = 17981,
   [switch]$Strict,
@@ -95,18 +100,33 @@ $smokeArgs = @(
   "--expect-native-codegen-device", $Device,
   "--expect-decoder-device", $DecoderDevice,
   "--expect-npu-offload-effective", $expectedNpuOffload,
+  "--mode", $Mode,
   "--text", $Text,
   "--max-new-tokens", "$MaxNewTokens",
   "--do-sample", "false",
   "--chunk-strategy", "smooth",
   "--summary-out", "$WorkDir/summary.json"
 )
-if ($NpuOffload -eq "audio" -or $NpuOffload -eq "all") {
+if ($Mode -eq "voice_clone") {
+  if (-not $RefAudio) {
+    throw "-Mode voice_clone requires -RefAudio"
+  }
+  $smokeArgs += @("--ref-audio", $RefAudio)
+  if ($RefText) {
+    $smokeArgs += @("--ref-text", $RefText)
+  }
+  if ($XVectorOnly) {
+    $smokeArgs += "--x-vector-only"
+  }
+}
+if (($NpuOffload -eq "audio" -or $NpuOffload -eq "all") -and $Mode -eq "voice_clone") {
   $smokeArgs += @(
     "--expect-encoder-device", $DecoderDevice,
-    "--expect-speech-encoder-device", $DecoderDevice,
     "--expect-speaker-encoder-device", $DecoderDevice
   )
+  if (-not $XVectorOnly) {
+    $smokeArgs += @("--expect-speech-encoder-device", $DecoderDevice)
+  }
 }
 if ($NpuOffload -eq "all") {
   $smokeArgs += @(
