@@ -91,6 +91,7 @@ uv run python -m qwen3_tts_ov serve \
 - 长文本使用完整上下文全自回归生成；runtime 只把音频切块给播放器，不默认切分输入文本。
 - 长文本 prompt 预算默认 `auto`：GPU 路径会根据模型上下文、KV/cache-input 精度和 `--max-vram-ratio` 计算 token 上限；CPU-only 使用保守固定预算。超长输入可通过 `--max-continuous-prompt-tokens` 显式覆盖。
 - 当前公开 Hugging Face IR 已包含 `openvino_realtime/voice_design`、`openvino_realtime/custom_voice` 和 `openvino_realtime/base`。VoiceClone 使用 `base` IR；Web Demo 会通过 `/health` 显示缺失/已就绪，并可直接点击下载对应模式的 IR。
+- 公开 Hugging Face IR 只保留 `fastest` 生产路径需要的 runtime-minimal 图，避免下载旧 decoder chunk、legacy talker 或诊断图。
 - VoiceClone 默认使用 `ref_audio + ref_text` 的 ICL 克隆路径，会把参考音频 codec prompt 纳入生成；`x_vector_only` 默认关闭，只在需要 speaker embedding-only 对照实验时手动开启。
 
 ## 常用入口

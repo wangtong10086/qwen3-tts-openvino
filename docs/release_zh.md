@@ -101,6 +101,7 @@ curl -N http://127.0.0.1:17860/v1/audio/speech \
 
 - GitHub Release 只包含 runtime App 包，不包含模型权重或 OpenVINO IR。
 - Hugging Face model repo 存放已编译 OpenVINO IR，当前公开包含 VoiceDesign、CustomVoice 和 Base/VoiceClone realtime IR。release server 默认在缺少本地 IR 时自动下载 `openvino_realtime/`。
+- 公开 HF IR 使用 `runtime-minimal` profile，只保留 `fastest` 生产路径需要的图；额外 `speech_decoder_t*`、`c25_t12`、legacy `talker_stateful*`、`talker_no_cache`、unroll/fixed-bucket 诊断图不发布，避免下载体积和用户理解成本膨胀。
 - CustomVoice 需要 `custom_voice/manifest.json`，VoiceClone 需要 Base/VoiceClone IR 的 `base/manifest.json`。服务端 `/health` 会返回 `available_modes`，Web Demo 会显示缺失/已就绪，并可一键下载对应模式。
 - VoiceClone 默认走 `ref_audio + ref_text` ICL 克隆路径，`x_vector_only` 默认关闭。最终用户在 Web Demo 中上传参考音频时，应同时填写对应参考文本；只有做 speaker embedding-only 对照实验时才开启 `x_vector_only`。
 - OpenVINO compile cache 会在用户机器首次运行时生成，不随 release 分发。

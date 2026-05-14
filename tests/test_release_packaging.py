@@ -280,6 +280,126 @@ def test_package_ir_runtime_minimal_base_requires_clone_graphs(tmp_path):
         raise AssertionError("runtime-minimal base packaging should require clone prompt graphs")
 
 
+def test_upload_hf_ir_defaults_to_runtime_minimal_folder(tmp_path):
+    upload_hf_ir = load_script("scripts/upload_hf_ir.py")
+    ir_dir = tmp_path / "openvino" / "voice_design"
+    model_dir = tmp_path / "model"
+    ir_dir.mkdir(parents=True)
+    model_dir.mkdir()
+    manifest = {
+        "tts_model_type": "voice_design",
+        "model_dir": str(model_dir),
+        "graphs": {
+            "text_embedding": "text_embedding.xml",
+            "codec_embedding": "codec_embedding.xml",
+            "subcode_greedy": "subcode_greedy.xml",
+            "subcode_greedy_cached": "subcode_greedy_cached.xml",
+            "speech_decoder": {"256": "speech_decoder_t256.xml"},
+        },
+        "graph_variants": {
+            "int8_sym_paged_talker_split": {
+                "graphs": {"paged_kv_seed": {"talker_stateful_gqa": "talker_int8.xml"}}
+            }
+        },
+        "streaming_decoder": {
+            "contexts": {
+                "0": {"8": "speech_decoder_stream_c0_t8.xml", "12": "speech_decoder_stream_c0_t12.xml"},
+                "25": {"12": "speech_decoder_stream_c25_t12.xml", "24": "speech_decoder_stream_c25_t24.xml"},
+            }
+        },
+    }
+    (ir_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    for rel in (
+        "text_embedding.xml",
+        "text_embedding.bin",
+        "codec_embedding.xml",
+        "codec_embedding.bin",
+        "subcode_greedy.xml",
+        "subcode_greedy.bin",
+        "subcode_greedy_cached.xml",
+        "subcode_greedy_cached.bin",
+        "speech_decoder_t256.xml",
+        "speech_decoder_t256.bin",
+        "speech_decoder_stream_c0_t8.xml",
+        "speech_decoder_stream_c0_t8.bin",
+        "speech_decoder_stream_c0_t12.xml",
+        "speech_decoder_stream_c0_t12.bin",
+        "speech_decoder_stream_c25_t12.xml",
+        "speech_decoder_stream_c25_t12.bin",
+        "speech_decoder_stream_c25_t24.xml",
+        "speech_decoder_stream_c25_t24.bin",
+        "talker_int8.xml",
+        "talker_int8.bin",
+    ):
+        (ir_dir / rel).write_text(rel, encoding="utf-8")
+    for rel in ("vocab.json", "merges.txt", "tokenizer_config.json"):
+        (model_dir / rel).write_text(rel, encoding="utf-8")
+
+    folder, info = upload_hf_ir.prepare_upload_folder(
+        ir_dir=ir_dir,
+        mode="voice_design",
+        profile="runtime-minimal",
+        staging_root=tmp_path / "stage",
+    )
+
+    uploaded = {p.name for p in folder.iterdir() if p.is_file()}
+    assert info["profile"] == "runtime-minimal"
+    assert "speech_decoder_t256.xml" not in uploaded
+    assert "speech_decoder_stream_c0_t12.xml" not in uploaded
+    assert "speech_decoder_stream_c25_t12.xml" not in uploaded
+    assert "subcode_greedy.xml" not in uploaded
+    assert {
+        "text_embedding.xml",
+        "codec_embedding.xml",
+        "talker_int8.xml",
+        "subcode_greedy_cached.xml",
+        "speech_decoder_stream_c0_t8.xml",
+        "speech_decoder_stream_c25_t24.xml",
+        "manifest.json",
+        "vocab.json",
+        "merges.txt",
+        "tokenizer_config.json",
+    }.issubset(uploaded)
+    minimal_manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    assert minimal_manifest["streaming_decoder"]["contexts"] == {
+        "0": {"8": "speech_decoder_stream_c0_t8.xml"},
+        "25": {"24": "speech_decoder_stream_c25_t24.xml"},
+    }
+
+
+def test_upload_hf_ir_prunes_remote_files_not_in_minimal_folder(tmp_path):
+    upload_hf_ir = load_script("scripts/upload_hf_ir.py")
+    folder = tmp_path / "voice_design"
+    folder.mkdir()
+    (folder / "manifest.json").write_text("{}", encoding="utf-8")
+    (folder / "text_embedding.xml").write_text("xml", encoding="utf-8")
+    deleted_operations = []
+
+    class FakeApi:
+        def list_repo_files(self, repo_id, repo_type=None, token=None):
+            return [
+                "openvino_realtime/voice_design/manifest.json",
+                "openvino_realtime/voice_design/text_embedding.xml",
+                "openvino_realtime/voice_design/speech_decoder_t256.xml",
+                "openvino_realtime/custom_voice/speech_decoder_t256.xml",
+            ]
+
+        def create_commit(self, **kwargs):
+            deleted_operations.extend(kwargs["operations"])
+
+    deleted = upload_hf_ir.prune_remote_folder(
+        FakeApi(),
+        repo_id="owner/repo",
+        folder=folder,
+        path_in_repo="openvino_realtime/voice_design",
+        token=None,
+        commit_message="prune",
+    )
+
+    assert deleted == ["openvino_realtime/voice_design/speech_decoder_t256.xml"]
+    assert [op.path_in_repo for op in deleted_operations] == deleted
+
+
 def test_package_release_dry_run_uses_server_entry_and_native_lib(tmp_path):
     target = "windows-x64" if platform.system().lower() == "windows" else "linux-x64"
     native_name = "qwen3_tts_ov_genai.dll" if target.startswith("windows") else "libqwen3_tts_ov_genai.so"

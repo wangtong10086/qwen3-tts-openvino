@@ -87,6 +87,9 @@ guide.
 - VoiceClone defaults to ICL cloning with `ref_audio` + `ref_text`, so the
   reference audio codec prompt is used. `x_vector_only` is opt-in for
   speaker-embedding-only experiments.
+- The public Hugging Face IR is runtime-minimal: it keeps only the validated
+  `fastest` production graphs instead of legacy decoder chunks, talker variants,
+  or diagnostic graphs.
 - Native C++ codec generation pipeline with OpenVINO paged-KV attention.
 - Paged-KV cache defaults to U8 storage, roughly half the storage of FP16 KV
   cache; use `--kv-cache-profile fp16` for a conservative baseline.

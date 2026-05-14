@@ -18,6 +18,7 @@ uv run qwen3-tts-ov --help
 - `compress_openvino_weights.py`: 对已导出的 OpenVINO IR 做权重压缩，并更新 manifest variants。
 - `package_release.py`: 打包最终用户侧 Linux/Windows sidecar app 包。
 - `package_ir.py`: 打包独立 OpenVINO IR 模型包。
+- `upload_hf_ir.py`: 上传公开 Hugging Face IR。默认使用 `runtime-minimal` staging，并在上传前清理远端目标目录，避免遗留旧 `speech_decoder`、`talker_stateful` 或诊断图。
 - `benchmark_streaming_realtime.py`: 用子进程隔离验证 `fastest` profile 的短文本流式 RTF。
 - `evaluate_long_text_quality.py`: 对长文本 full-AR 候选 profile 做客观检查和可选 Omni 质量评测。
 
@@ -29,7 +30,7 @@ uv run python -m qwen3_tts_ov build-fastest --model models/Qwen3-TTS-12Hz-1.7B-V
 
 `build-fastest` 默认使用低内存 production 图集合。只有需要旧 fixed-bucket/unroll 诊断图时才加 `--graph-set compat`。
 
-release 打包默认使用 `--profile runtime-minimal`，只保留生产推荐路径；调试完整 manifest/fallback 时使用 `--profile full`。
+release 和 Hugging Face IR 上传默认使用 `--profile runtime-minimal`，只保留生产推荐路径；调试完整 manifest/fallback 时使用 `--profile full`。
 
 ## 诊断脚本
 
