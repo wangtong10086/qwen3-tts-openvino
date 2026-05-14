@@ -84,6 +84,8 @@ http://127.0.0.1:17860/
 
 运行方式、Python API 和 HTTP/WebSocket 协议见 [docs/runtime_zh.md](docs/runtime_zh.md)。
 
+正式 runtime 发布由 GitHub Actions 的 `release-runtime` 执行。推送 `v*` tag 会自动构建 Linux/Windows runtime-minimal 包并上传到 GitHub Releases。
+
 ## 文档
 
 - [Quick Start](docs/quick_start_zh.md): 从空仓库到 Web Demo。

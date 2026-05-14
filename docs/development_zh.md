@@ -43,6 +43,15 @@ uv run python -m qwen3_tts_ov serve \
 
 ## 构建 release 产物
 
+正式发布使用 GitHub Actions 的 `release-runtime`：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+该 workflow 会自动在 Linux/Windows runner 上构建 runtime-minimal App 包，完成 smoke 后上传到 GitHub Releases。Actions 页面也可以手动运行 `release-runtime`，用于重发指定版本。
+
 Linux 当前机器：
 
 ```bash

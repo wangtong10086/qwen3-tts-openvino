@@ -1,0 +1,204 @@
+name: release-runtime
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, for example 0.1.0
+        required: true
+        default: 0.1.0
+      publish_release:
+        description: Upload runtime packages to GitHub Releases
+        required: true
+        type: boolean
+        default: true
+      prerelease:
+        description: Mark the GitHub Release as prerelease
+        required: true
+        type: boolean
+        default: false
+      draft:
+        description: Create the GitHub Release as draft
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-runtime-${{ github.ref_name || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      publish_release: ${{ steps.release.outputs.publish_release }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      draft: ${{ steps.release.outputs.draft }}
+    steps:
+      - id: release
+        shell: bash
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            raw_version="${{ inputs.version }}"
+            publish_release="${{ inputs.publish_release }}"
+            prerelease="${{ inputs.prerelease }}"
+            draft="${{ inputs.draft }}"
+          else
+            raw_version="${GITHUB_REF_NAME}"
+            publish_release="true"
+            prerelease="false"
+            draft="false"
+          fi
+
+          version="${raw_version#v}"
+          release_tag="v${version}"
+          if [[ -z "${version}" || "${version}" == "${raw_version}" && "${raw_version}" == v ]]; then
+            echo "invalid release version: ${raw_version}" >&2
+            exit 1
+          fi
+
+          {
+            echo "version=${version}"
+            echo "release_tag=${release_tag}"
+            echo "publish_release=${publish_release}"
+            echo "prerelease=${prerelease}"
+            echo "draft=${draft}"
+          } >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            archive_ext: tar.zst
+            smoke_port: 17960
+            native_backend: direct
+            package_shell: bash
+          - os: windows-latest
+            target: windows-x64
+            archive_ext: zip
+            smoke_port: 17961
+            native_backend: cmake
+            package_shell: powershell
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra native --extra server --extra release
+      - name: Build native library
+        run: uv run python scripts/build_native_codegen.py --backend ${{ matrix.native_backend }}
+      - name: Package release
+        if: matrix.package_shell == 'bash'
+        shell: bash
+        run: |
+          uv run python scripts/package_release.py \
+            --target ${{ matrix.target }} \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --profile runtime-minimal
+      - name: Package release
+        if: matrix.package_shell == 'powershell'
+        shell: powershell
+        run: |
+          uv run python scripts/package_release.py `
+            --target ${{ matrix.target }} `
+            --version "${{ needs.prepare.outputs.version }}" `
+            --profile runtime-minimal
+      - name: Smoke release package
+        shell: bash
+        run: |
+          uv run python scripts/smoke_release_package.py \
+            --archive "dist/release/qwen3-tts-ov-server-${{ matrix.target }}-${{ needs.prepare.outputs.version }}-runtime-minimal.${{ matrix.archive_ext }}" \
+            --work-dir "build/release-smoke-${{ matrix.target }}" \
+            --port ${{ matrix.smoke_port }} \
+            --exe-path-out "build/release-smoke-${{ matrix.target }}/exe_path.txt"
+      - name: Verify Windows executable from cmd
+        if: matrix.os == 'windows-latest'
+        shell: cmd
+        run: |
+          set /p EXE=<build\release-smoke-${{ matrix.target }}\exe_path.txt
+          "%EXE%" --help
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qwen3-tts-ov-server-${{ matrix.target }}-${{ needs.prepare.outputs.version }}-smoke-logs
+          path: build/release-smoke-${{ matrix.target }}/server.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qwen3-tts-ov-server-${{ matrix.target }}-${{ needs.prepare.outputs.version }}-runtime-minimal
+          path: dist/release/qwen3-tts-ov-server-${{ matrix.target }}-${{ needs.prepare.outputs.version }}-runtime-minimal.*
+
+  publish:
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.publish_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: qwen3-tts-ov-server-*-${{ needs.prepare.outputs.version }}-runtime-minimal
+          path: dist/release
+      - name: Publish GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          DRAFT: ${{ needs.prepare.outputs.draft }}
+          TARGET_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          mapfile -t assets < <(find dist/release -type f \( -name "*.zip" -o -name "*.tar.zst" \) | sort)
+          if [[ "${#assets[@]}" -eq 0 ]]; then
+            echo "no release archives found" >&2
+            exit 1
+          fi
+
+          cat > release-notes.md <<EOF
+          Runtime-minimal sidecar release for Qwen3-TTS OpenVINO.
+
+          Assets:
+          - Linux x64 runtime package
+          - Windows x64 runtime package
+
+          This release contains runtime packages only. Model weights and OpenVINO IR packages are distributed separately.
+          EOF
+
+          flags=()
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            flags+=(--prerelease)
+          fi
+          if [[ "${DRAFT}" == "true" ]]; then
+            flags+=(--draft)
+          fi
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" \
+              --target "${TARGET_SHA}" \
+              --title "Qwen3-TTS OpenVINO Runtime ${VERSION}" \
+              --notes-file release-notes.md \
+              "${flags[@]}" \
+              "${assets[@]}"
+          fi

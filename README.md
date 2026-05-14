@@ -62,6 +62,10 @@ For end users, release packages expose only the sidecar executable:
 qwen3-tts-ov-server --model-root openvino --device GPU
 ```
 
+Runtime packages are built by the `release-runtime` GitHub Actions workflow.
+Pushing a `v*` tag builds Linux and Windows runtime-minimal packages and uploads
+them to GitHub Releases.
+
 ## Documentation
 
 - [Quick Start](docs/quick_start_zh.md): install, prepare model, build fastest IR, start web demo.

@@ -13,6 +13,19 @@ App 包包含可执行入口、Python runtime、OpenVINO runtime、OpenVINO GenA
 
 默认推荐 `runtime-minimal`。它保留当前验证的 native paged-KV 长文本完整自回归路径，支持 VoiceDesign 和带 `base` IR 的 VoiceClone/ref audio，同时移除开发 fallback、实验图和 `librosa/scipy/numba/llvmlite/sklearn` 依赖。`runtime-minimal` 的 ref audio 支持 `soundfile/libsndfile` 可读格式，例如 WAV/FLAC/OGG；需要更宽格式兼容时使用 `full`。
 
+## GitHub Releases
+
+正式 runtime 发布入口是 GitHub Actions 的 `release-runtime` workflow。
+
+推送 `v*` tag 会自动构建 Linux/Windows runtime-minimal App 包，完成基础 smoke 后上传到对应 GitHub Release：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+也可以在 Actions 页面手动运行 `release-runtime`，填写 `version`，默认会创建或更新 `v<version>` Release 并上传两个 runtime 包。分平台的 `release-linux` 和 `release-windows` 只作为手动诊断入口保留。
+
 也可以从公开 Hugging Face model repo 下载已验证的 realtime IR：
 
 ```bash
