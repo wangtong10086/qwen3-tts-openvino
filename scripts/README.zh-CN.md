@@ -21,6 +21,8 @@ uv run qwen3-tts-ov --help
 - `upload_hf_ir.py`: 上传公开 Hugging Face IR。默认使用 `runtime-minimal` staging，并在上传前清理远端目标目录，避免遗留旧 `speech_decoder`、`talker_stateful` 或诊断图。
 - `benchmark_streaming_realtime.py`: 用子进程隔离验证 `fastest` profile 的短文本流式 RTF。
 - `evaluate_long_text_quality.py`: 对长文本 full-AR 候选 profile 做客观检查和可选 Omni 质量评测。
+- `probe_windows_gpu_npu.py`: 检查 Windows OpenVINO `GPU`/`NPU` 可用性，并尝试把 streaming decoder 编译到 NPU。
+- `windows_gpu_npu_smoke.ps1`: Windows 本地 PowerShell 入口，串联 GPU+NPU probe 和真实 streaming TTS smoke。
 
 日常不需要手动串联这些脚本，优先使用正式 CLI：
 

@@ -1861,6 +1861,8 @@ def create_app(
         "warmup_strategy": warmup_strategy,
         "default_stream_strategy": default_stream_strategy,
         "forced_stream_strategy": forced_stream_strategy,
+        "device": device,
+        "decoder_device": decoder_device or device,
         "ov_cache_dir": None if disable_ov_cache else str(ov_cache_dir or "auto"),
         "ov_cache_mode": ov_cache_mode,
         "loaded_modes": [],
@@ -1899,6 +1901,8 @@ def create_app(
     }
     runtime_stream_metadata = {
         "realtime_profile": reported_realtime_profile,
+        "device": device,
+        "decoder_device": decoder_device or device,
         "mode": mode,
         "cache_kernel": cache_kernel,
         "cache_step": cache_step,
@@ -3296,6 +3300,8 @@ def create_app(
                 "preferred_cache_bucket": getattr(runtime, "preferred_cache_bucket", preferred_cache_bucket),
                 "native_codegen": getattr(runtime, "native_codegen_override", None) or os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN") or "off",
                 "native_pipeline": getattr(runtime, "native_pipeline_override", None) or os.environ.get("QWEN3_TTS_OV_NATIVE_PIPELINE") or "off",
+                "device": getattr(runtime, "device", device),
+                "decoder_device": getattr(runtime, "decoder_device", decoder_device or device),
                 "native_codegen_device": os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE") or device,
                 "native_paged_kv": getattr(runtime, "native_paged_kv_override", None)
                 or os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV")

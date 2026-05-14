@@ -10,6 +10,7 @@
 | 源码开发者 | [Quick Start](quick_start_zh.md) | 从 PyTorch 模型导出最快 OpenVINO IR，并启动 Web Demo |
 | 发布维护者 | [开发说明](development_zh.md) | 构建 native、打包 runtime、触发 `release-runtime` |
 | 性能/质量调试 | [流式与长文本](streaming_zh.md) | 理解 full-AR 长文本、流式输出和质量门禁 |
+| Windows 异构测试 | [Windows GPU+NPU 测试路径](windows_gpu_npu_zh.md) | 在自托管 Windows NPU 机器上验证 `GPU codegen + NPU decoder` |
 
 ## 入门与部署
 
@@ -23,6 +24,7 @@
 - [开发说明](development_zh.md): 源码开发、native 构建、release workflow、本地打包。
 - [导出与压缩](export_zh.md): 手动导出 OpenVINO IR、生成 `int8_sym_paged_talker_split`。
 - [大文件与产物策略](artifacts_zh.md): 模型权重、OpenVINO IR、outputs、native build 的处理规则。
+- [Windows GPU+NPU 测试路径](windows_gpu_npu_zh.md): 自托管 Windows runner 和本地 PowerShell 异构推理 smoke。
 
 ## 参考
 

@@ -1,0 +1,160 @@
+name: windows-gpu-npu
+
+on:
+  push:
+    branches:
+      - "test/windows-gpu-npu-*"
+      - "test/windows-gpu-npu-path"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Test package version suffix
+        required: true
+        default: gpu-npu-smoke
+      runner_labels:
+        description: JSON array of self-hosted runner labels
+        required: true
+        default: '["self-hosted","Windows","X64","npu"]'
+      hf_repo:
+        description: Public Hugging Face model repo with OpenVINO IR
+        required: true
+        default: waston10086/qwen3-tts-openvino-voice-design
+      hf_revision:
+        description: Optional Hugging Face revision
+        required: false
+        default: main
+      strict:
+        description: Fail instead of skip when GPU/NPU is unavailable or NPU decoder compile fails
+        required: true
+        type: boolean
+        default: false
+      require_zero_copy:
+        description: Require GPU/NPU remote-context probe to pass
+        required: true
+        type: boolean
+        default: false
+      max_new_tokens:
+        description: Max codec frames for the real smoke request
+        required: true
+        default: "8"
+      text:
+        description: Text used by the real smoke request
+        required: true
+        default: "你好，这是 Windows GPU 加 NPU 推理测试。"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra native --extra server --extra release --extra dev
+      - name: Compile Python modules
+        run: uv run python -m py_compile qwen3_tts_ov/*.py scripts/*.py
+      - name: Run Windows GPU+NPU path unit tests
+        run: uv run pytest -q tests/test_windows_gpu_npu_path.py
+
+  smoke:
+    if: github.event_name == 'workflow_dispatch'
+    needs: validate
+    runs-on: ${{ fromJSON(github.event.inputs.runner_labels || '["self-hosted","Windows","X64","npu"]') }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: powershell
+        run: uv sync --extra native --extra server --extra release
+
+      - name: Build native library
+        shell: powershell
+        run: uv run python scripts/build_native_codegen.py --backend cmake
+
+      - name: Package Windows release
+        shell: powershell
+        run: |
+          uv run python scripts/package_release.py `
+            --target windows-x64 `
+            --version "${{ github.event.inputs.version || 'gpu-npu-smoke' }}" `
+            --profile runtime-minimal
+
+      - name: Download OpenVINO IR from Hugging Face
+        shell: powershell
+        run: |
+          uv run --with huggingface_hub python scripts/download_hf_ir.py `
+            --repo-id "${{ github.event.inputs.hf_repo || 'waston10086/qwen3-tts-openvino-voice-design' }}" `
+            --revision "${{ github.event.inputs.hf_revision || 'main' }}" `
+            --local-dir build/hf-ir `
+            --allow-pattern "openvino_realtime/**"
+
+      - name: Probe GPU+NPU decoder path
+        id: probe
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $extra = @()
+          if ("${{ github.event.inputs.strict || 'false' }}" -ne "true") {
+            $extra += "--skip-if-missing-devices"
+          }
+          if ("${{ github.event.inputs.require_zero_copy || 'false' }}" -eq "true") {
+            $extra += "--require-zero-copy"
+          }
+          uv run python scripts/probe_windows_gpu_npu.py `
+            --model-root build/hf-ir/openvino_realtime `
+            --device GPU `
+            --decoder-device NPU `
+            --cache-dir build/gpu-npu-probe/ov-cache `
+            --output-json build/gpu-npu-probe/probe.json `
+            @extra
+          $probe = Get-Content build/gpu-npu-probe/probe.json -Raw | ConvertFrom-Json
+          "status=$($probe.status)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if ($probe.status -eq "failed") {
+            exit 1
+          }
+
+      - name: Real streaming TTS smoke with GPU+NPU
+        if: steps.probe.outputs.status == 'ok'
+        shell: powershell
+        env:
+          REAL_TTS_TEXT: ${{ github.event.inputs.text || '你好，这是 Windows GPU 加 NPU 推理测试。' }}
+        run: |
+          [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+          $env:PYTHONIOENCODING = "utf-8"
+          uv run python scripts/smoke_release_tts.py `
+            --archive "dist/release/qwen3-tts-ov-server-windows-x64-${{ github.event.inputs.version || 'gpu-npu-smoke' }}-runtime-minimal.zip" `
+            --model-root build/hf-ir/openvino_realtime `
+            --work-dir build/windows-gpu-npu-smoke `
+            --port 17981 `
+            --device GPU `
+            --decoder-device NPU `
+            --require-devices GPU,NPU `
+            --skip-if-missing-devices `
+            --expect-native-codegen-device GPU `
+            --expect-decoder-device NPU `
+            --text "$env:REAL_TTS_TEXT" `
+            --max-new-tokens "${{ github.event.inputs.max_new_tokens || '8' }}" `
+            --do-sample false `
+            --chunk-strategy smooth `
+            --summary-out build/windows-gpu-npu-smoke/summary.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-gpu-npu-smoke
+          path: |
+            build/gpu-npu-probe/probe.json
+            build/windows-gpu-npu-smoke/server.log
+            build/windows-gpu-npu-smoke/summary.json
