@@ -44,6 +44,7 @@ from .model_download import (
     DEFAULT_RELEASE_MODEL_REVISION,
     DEFAULT_RELEASE_MODEL_SUBDIR,
 )
+from .npu_offload_profile import NPU_OFFLOAD_POLICY_CHOICES, load_npu_offload_profile
 
 
 def add_runtime_args(
@@ -592,6 +593,7 @@ def run_stream_voice_clone(args):
 def run_serve(args):
     from .server import serve
 
+    apply_npu_offload_profile_summary(args)
     apply_profile_defaults(args)
     apply_native_env(args)
     serve(
@@ -637,6 +639,21 @@ def run_serve(args):
     )
 
 
+def apply_npu_offload_profile_summary(args):
+    summary_path = getattr(args, "npu_offload_summary", None)
+    if not summary_path:
+        return None
+    profile = load_npu_offload_profile(summary_path, policy=getattr(args, "npu_offload_policy", "balanced"))
+    args.npu_offload = profile["npu_offload"]
+    print(
+        "using Windows NPU benchmark recommendation: "
+        f"policy={profile['policy']} scenario={profile['scenario']} npu_offload={profile['npu_offload']}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return profile
+
+
 def apply_npu_offload(args):
     npu_offload = getattr(args, "npu_offload", "off")
     if npu_offload is None:
@@ -674,6 +691,7 @@ def run_cache_warmup_command(args):
 
     apply_profile_defaults(args)
     apply_native_env(args)
+    apply_npu_offload_profile_summary(args)
     apply_npu_offload(args)
     if args.single_task_json:
         result = run_single_task(args)
@@ -715,6 +733,17 @@ def add_cache_warmup_args(parser):
         default="off",
         choices=NPU_OFFLOAD_CHOICES,
         help="Warm cache for Windows GPU+NPU mode. all also warms prompt/text embedding on NPU.",
+    )
+    parser.add_argument(
+        "--npu-offload-summary",
+        default=None,
+        help="Path to benchmark-summary.json; selected recommendation is used as --npu-offload.",
+    )
+    parser.add_argument(
+        "--npu-offload-policy",
+        default="balanced",
+        choices=NPU_OFFLOAD_POLICY_CHOICES,
+        help="Recommendation policy used with --npu-offload-summary.",
     )
     parser.add_argument(
         "--realtime-profile",
@@ -896,6 +925,17 @@ def main(argv=None):
         default="off",
         choices=NPU_OFFLOAD_CHOICES,
         help="Windows heterogeneous mode: off, auto, decoder, audio, all, or require.",
+    )
+    serve_parser.add_argument(
+        "--npu-offload-summary",
+        default=None,
+        help="Path to benchmark-summary.json; selected recommendation is used as --npu-offload.",
+    )
+    serve_parser.add_argument(
+        "--npu-offload-policy",
+        default="balanced",
+        choices=NPU_OFFLOAD_POLICY_CHOICES,
+        help="Recommendation policy used with --npu-offload-summary.",
     )
     serve_parser.add_argument("--no-warmup", action="store_true")
     serve_parser.add_argument("--preload-modes", default="voice_design")

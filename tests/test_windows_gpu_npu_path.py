@@ -330,6 +330,39 @@ def test_release_server_loads_windows_npu_offload_summary(monkeypatch, tmp_path)
     assert captured["npu_offload"] == "all"
 
 
+def test_cli_applies_windows_npu_offload_summary(tmp_path):
+    from qwen3_tts_ov import cli
+
+    summary_path = tmp_path / "benchmark-summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "recommendation": {
+                    "recommended_scenario": "npu_audio",
+                    "recommended_npu_offload": "audio",
+                    "fastest": {"scenario": "npu_decoder", "npu_offload": "decoder"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = type(
+        "Args",
+        (),
+        {
+            "npu_offload": "off",
+            "npu_offload_summary": str(summary_path),
+            "npu_offload_policy": "fastest",
+        },
+    )()
+
+    profile = cli.apply_npu_offload_profile_summary(args)
+
+    assert args.npu_offload == "decoder"
+    assert profile["scenario"] == "npu_decoder"
+
+
 def test_windows_gpu_npu_benchmark_counter_sampler_targets_server_pid(tmp_path):
     benchmark = load_script("benchmark_windows_gpu_npu_release.py")
 

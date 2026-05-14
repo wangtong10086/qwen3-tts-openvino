@@ -34,7 +34,7 @@ uv run qwen3-tts-ov --help
 qwen3-tts-ov-server.exe --npu-offload-summary build\windows-gpu-npu-benchmark\benchmark-summary.json
 ```
 
-服务端会按 `recommendation` 自动设置 `--npu-offload`；默认策略是 `balanced`。
+服务端会按 `recommendation` 自动设置 `--npu-offload`；默认策略是 `balanced`。源码 CLI 的 `serve` 和 `cache-warmup` 也支持同样的 `--npu-offload-summary` / `--npu-offload-policy` 参数，方便先按 benchmark 结果预热缓存，再启动同配置服务。
 
 日常不需要手动串联这些脚本，优先使用正式 CLI：
 

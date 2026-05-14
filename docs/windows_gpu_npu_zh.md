@@ -127,6 +127,20 @@ qwen3-tts-ov-server.exe `
 
 `--npu-offload-policy` 可选 `balanced`、`fastest`、`lowest-gpu` 或 `recommended`。生产部署默认建议 `balanced`：在不明显牺牲 RTF 的前提下优先降低 GPU 负载。
 
+源码开发入口也支持同一份 summary：
+
+```powershell
+uv run python -m qwen3_tts_ov serve `
+  --model-root build\hf-ir\openvino_realtime `
+  --device GPU `
+  --npu-offload-summary build\windows-gpu-npu-benchmark\benchmark-summary.json
+
+uv run python -m qwen3_tts_ov cache-warmup `
+  --ir-dir build\hf-ir\openvino_realtime\voice_design `
+  --device GPU `
+  --npu-offload-summary build\windows-gpu-npu-benchmark\benchmark-summary.json
+```
+
 要额外测试 prompt/text embedding 是否适合放到 NPU，显式加入 `npu_all`：
 
 ```powershell
