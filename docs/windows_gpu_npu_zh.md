@@ -104,6 +104,17 @@ build/windows-gpu-npu-benchmark/npu_audio/server.log
 
 重点看 `comparison.npu_decoder.computed_rtf_speedup`、`comparison.npu_audio.computed_rtf_speedup`，以及每组 `decoder_device`、`speaker_encoder_device`、`npu_offload_effective` 和 `median_computed_rtf`。如果 `decoder_device=NPU` 但 RTF 没有改善，这说明当前瓶颈仍主要在 GPU codegen/paged-KV，而 NPU offload 主要价值是降低 GPU 音频侧负载。
 
+需要把性能收益变成硬性门禁时，增加阈值参数：
+
+```powershell
+.\scripts\windows_gpu_npu_benchmark.ps1 `
+  -Scenarios gpu_only,npu_decoder,npu_audio `
+  -MinSpeedup 1.02 `
+  -MaxRtfRegression 0.03
+```
+
+`-MinSpeedup` 要求每个 NPU 场景的 RTF speedup 不低于阈值；`-MaxRtfRegression` 允许 NPU 场景比 GPU-only 慢的最大 RTF 差值。失败会使脚本退出非零。
+
 要实际触发 VoiceClone 的参考音频 encoder，可在含 `base/` IR 的模型根目录上增加：
 
 ```powershell

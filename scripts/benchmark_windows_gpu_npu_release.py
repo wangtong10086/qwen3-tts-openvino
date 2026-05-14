@@ -164,6 +164,40 @@ def expected_offload_for_scenario(name: str, npu_offload: str) -> str | None:
     return None
 
 
+def compare_to_gpu_baseline(results: list[dict]) -> dict:
+    by_name = {item["name"]: item for item in results}
+    gpu_rtf = ((by_name.get("gpu_only") or {}).get("summary") or {}).get("median_computed_rtf")
+    comparison = {}
+    for name, result in by_name.items():
+        if name == "gpu_only":
+            continue
+        npu_rtf = (result.get("summary") or {}).get("median_computed_rtf")
+        comparison[name] = {
+            "computed_rtf_delta": None if gpu_rtf is None or npu_rtf is None else npu_rtf - gpu_rtf,
+            "computed_rtf_speedup": None if gpu_rtf is None or not npu_rtf else gpu_rtf / npu_rtf,
+        }
+    return comparison
+
+
+def check_acceptance(
+    comparison: dict,
+    *,
+    min_speedup: float | None,
+    max_rtf_regression: float | None,
+) -> list[str]:
+    failures = []
+    for name, metrics in comparison.items():
+        speedup = metrics.get("computed_rtf_speedup")
+        delta = metrics.get("computed_rtf_delta")
+        if min_speedup is not None and (speedup is None or float(speedup) < float(min_speedup)):
+            failures.append(f"{name}: computed_rtf_speedup={speedup} < {min_speedup}")
+        if max_rtf_regression is not None and (
+            delta is None or float(delta) > float(max_rtf_regression)
+        ):
+            failures.append(f"{name}: computed_rtf_delta={delta} > {max_rtf_regression}")
+    return failures
+
+
 def run_scenario(
     *,
     name: str,
@@ -270,6 +304,18 @@ def main() -> None:
     parser.add_argument("--x-vector-only", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--chunk-strategy", default="smooth")
+    parser.add_argument(
+        "--min-speedup",
+        type=float,
+        default=None,
+        help="Fail if any NPU scenario has computed_rtf_speedup below this value.",
+    )
+    parser.add_argument(
+        "--max-rtf-regression",
+        type=float,
+        default=None,
+        help="Fail if any NPU scenario has median computed RTF worse than GPU-only by more than this value.",
+    )
     parser.add_argument("--summary-out", default=None)
     args = parser.parse_args()
 
@@ -351,18 +397,15 @@ def main() -> None:
             )
         )
 
-    by_name = {item["name"]: item for item in results}
-    gpu_rtf = ((by_name.get("gpu_only") or {}).get("summary") or {}).get("median_computed_rtf")
-    comparison = {}
-    for name, result in by_name.items():
-        if name == "gpu_only":
-            continue
-        npu_rtf = (result.get("summary") or {}).get("median_computed_rtf")
-        comparison[name] = {
-            "computed_rtf_delta": None if gpu_rtf is None or npu_rtf is None else npu_rtf - gpu_rtf,
-            "computed_rtf_speedup": None if gpu_rtf is None or not npu_rtf else gpu_rtf / npu_rtf,
-        }
+    comparison = compare_to_gpu_baseline(results)
+    acceptance_failures = check_acceptance(
+        comparison,
+        min_speedup=args.min_speedup,
+        max_rtf_regression=args.max_rtf_regression,
+    )
     status = "ok" if all("error" not in item for item in results) else "failed"
+    if acceptance_failures:
+        status = "failed"
     summary = {
         "status": status,
         "executable": str(exe),
@@ -378,6 +421,11 @@ def main() -> None:
         },
         "results": results,
         "comparison": comparison,
+        "acceptance": {
+            "min_speedup": args.min_speedup,
+            "max_rtf_regression": args.max_rtf_regression,
+            "failures": acceptance_failures,
+        },
     }
     write_summary(summary, args.summary_out)
     if status != "ok":

@@ -14,6 +14,8 @@ param(
   [int]$MaxNewTokens = 48,
   [int]$Runs = 2,
   [int]$BasePort = 17990,
+  [double]$MinSpeedup = -1,
+  [double]$MaxRtfRegression = -1,
   [switch]$SkipBuild,
   [switch]$NoWarmup,
   [switch]$Strict
@@ -65,6 +67,12 @@ if ($RefAudio) {
 }
 if ($RefText) {
   $argsList += @("--ref-text", $RefText)
+}
+if ($MinSpeedup -ge 0) {
+  $argsList += @("--min-speedup", "$MinSpeedup")
+}
+if ($MaxRtfRegression -ge 0) {
+  $argsList += @("--max-rtf-regression", "$MaxRtfRegression")
 }
 if (-not $Strict) {
   $argsList += "--skip-if-missing-devices"

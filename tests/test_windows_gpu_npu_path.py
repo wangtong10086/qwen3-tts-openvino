@@ -155,6 +155,21 @@ def test_windows_gpu_npu_benchmark_expected_offload_by_scenario():
     assert benchmark.expected_offload_for_scenario("npu_audio", "audio") == "audio"
 
 
+def test_windows_gpu_npu_benchmark_acceptance_checks_speedup_and_regression():
+    benchmark = load_script("benchmark_windows_gpu_npu_release.py")
+    results = [
+        {"name": "gpu_only", "summary": {"median_computed_rtf": 1.0}},
+        {"name": "npu_decoder", "summary": {"median_computed_rtf": 0.8}},
+        {"name": "npu_audio", "summary": {"median_computed_rtf": 1.05}},
+    ]
+
+    comparison = benchmark.compare_to_gpu_baseline(results)
+
+    assert comparison["npu_decoder"]["computed_rtf_speedup"] == 1.25
+    failures = benchmark.check_acceptance(comparison, min_speedup=1.0, max_rtf_regression=0.03)
+    assert any("npu_audio" in item for item in failures)
+
+
 def test_windows_gpu_npu_benchmark_metric_uses_audio_duration():
     benchmark = load_script("benchmark_windows_gpu_npu_release.py")
     stream = {
