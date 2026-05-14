@@ -111,6 +111,8 @@ build/windows-gpu-npu-benchmark/npu_audio/server.log
 
 重点看 `recommendation.recommended_npu_offload`、`comparison.npu_decoder.computed_rtf_speedup`、`comparison.npu_audio.computed_rtf_speedup`，以及每组 `decoder_device`、`speaker_encoder_device`、`npu_offload_effective` 和 `median_computed_rtf`。如果 `decoder_device=NPU` 但 RTF 没有改善，这说明当前瓶颈仍主要在 GPU codegen/paged-KV，而 NPU offload 主要价值是降低 GPU 音频侧负载。
 
+`benchmark-summary.json` 的每个场景还会记录 `summary.exercised_runtime_stages` 和 `summary.npu_offload_coverage`。例如 VoiceDesign 请求不会实际执行 `speech_encoder/speaker_encoder`，所以 `npu_audio` 会显示这些 stage 位于 `unexercised_npu_stages`。要真实覆盖 audio encoder，需要用 `-Mode voice_clone -RefAudio ...` 跑 benchmark。
+
 `benchmark-summary.json` 会给出三类推荐：
 
 - `recommendation.fastest`: RTF 最低的 NPU 场景。

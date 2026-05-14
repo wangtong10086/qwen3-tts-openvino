@@ -242,6 +242,22 @@ def test_windows_gpu_npu_benchmark_expected_offload_by_scenario():
     assert benchmark.expected_offload_for_scenario("npu_all", "all") == "all"
 
 
+def test_windows_gpu_npu_benchmark_marks_exercised_runtime_stages():
+    benchmark = load_script("benchmark_windows_gpu_npu_release.py")
+
+    assert benchmark.exercised_runtime_stages("voice_design") == ["prompt", "text_embedding", "stream_decoder"]
+    assert benchmark.exercised_runtime_stages("voice_clone", x_vector_only=True) == [
+        "prompt",
+        "text_embedding",
+        "stream_decoder",
+        "speaker_encoder",
+    ]
+    coverage = benchmark.npu_offload_coverage("audio", benchmark.exercised_runtime_stages("voice_design"))
+
+    assert coverage["exercised_npu_stages"] == ["stream_decoder"]
+    assert coverage["unexercised_npu_stages"] == ["speech_encoder", "speaker_encoder"]
+
+
 def test_windows_gpu_npu_benchmark_acceptance_checks_speedup_and_regression():
     benchmark = load_script("benchmark_windows_gpu_npu_release.py")
     results = [
@@ -482,6 +498,11 @@ def test_windows_gpu_npu_result_analyzer_accepts_valid_artifacts(tmp_path):
                         "gpu": {"utilization_average": 60.0},
                         "npu": {"utilization_average": 25.0},
                     },
+                    "npu_offload_coverage": {
+                        "expected_npu_stages": ["stream_decoder"],
+                        "exercised_npu_stages": ["stream_decoder"],
+                        "unexercised_npu_stages": [],
+                    },
                 },
             },
         ],
@@ -561,6 +582,56 @@ def test_windows_gpu_npu_result_analyzer_rejects_missing_npu_device(tmp_path):
 
     assert report["status"] == "failed"
     assert any("decoder_device" in item for item in report["failures"])
+
+
+def test_windows_gpu_npu_result_analyzer_warns_unexercised_audio_stage(tmp_path):
+    analyzer = load_script("analyze_windows_gpu_npu_results.py")
+    benchmark_summary = {
+        "status": "ok",
+        "results": [
+            {
+                "name": "gpu_only",
+                "summary": {"median_computed_rtf": 1.0, "npu_offload_effective": "off", "decoder_device": "GPU"},
+            },
+            {
+                "name": "npu_audio",
+                "summary": {
+                    "median_computed_rtf": 0.9,
+                    "npu_offload_effective": "audio",
+                    "decoder_device": "NPU",
+                    "encoder_device": "NPU",
+                    "npu_offload_coverage": {
+                        "expected_npu_stages": ["stream_decoder", "speech_encoder", "speaker_encoder"],
+                        "exercised_npu_stages": ["stream_decoder"],
+                        "unexercised_npu_stages": ["speech_encoder", "speaker_encoder"],
+                    },
+                },
+            },
+        ],
+    }
+    benchmark_path = tmp_path / "benchmark.json"
+    benchmark_path.write_text(json.dumps(benchmark_summary), encoding="utf-8")
+    args = type(
+        "Args",
+        (),
+        {
+            "benchmark_summary": str(benchmark_path),
+            "probe_json": None,
+            "require_scenarios": "gpu_only,npu_audio",
+            "min_speedup": None,
+            "max_rtf_regression": None,
+            "min_gpu_utilization_reduction": None,
+            "require_counters": False,
+            "require_probe_ok": False,
+            "require_prompt_compile": False,
+            "require_audio_compile": False,
+        },
+    )()
+
+    report = analyzer.analyze(args)
+
+    assert report["status"] == "ok"
+    assert any("not exercised" in item for item in report["warnings"])
 
 
 def test_server_health_reports_device_and_decoder_device(monkeypatch, tmp_path):

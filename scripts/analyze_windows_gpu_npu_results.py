@@ -182,6 +182,14 @@ def validate_benchmark(
             if not is_npu(prompt_device):
                 failures.append(f"{scenario}: prompt/text_embedding device={prompt_device!r}, expected NPU")
         counters = (result.get("summary") or {}).get("accelerator_counters")
+        coverage = (result.get("summary") or {}).get("npu_offload_coverage")
+        if isinstance(coverage, dict):
+            missing_stages = coverage.get("unexercised_npu_stages") or []
+            if missing_stages:
+                warnings.append(
+                    f"{scenario}: requested NPU offload includes stages not exercised by this request: "
+                    f"{', '.join(str(item) for item in missing_stages)}"
+                )
         if require_counters:
             if not isinstance(counters, dict):
                 failures.append(f"{scenario}: accelerator counters missing")

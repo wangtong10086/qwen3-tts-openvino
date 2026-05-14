@@ -296,6 +296,32 @@ def expected_offload_for_scenario(name: str, npu_offload: str) -> str | None:
     return None
 
 
+def exercised_runtime_stages(mode: str, *, x_vector_only: bool = False) -> list[str]:
+    normalized = str(mode or "voice_design").strip().lower().replace("-", "_")
+    stages = ["prompt", "text_embedding", "stream_decoder"]
+    if normalized == "voice_clone":
+        stages.append("speaker_encoder")
+        if not x_vector_only:
+            stages.append("speech_encoder")
+    return stages
+
+
+def npu_offload_coverage(npu_offload: str, exercised_stages: list[str]) -> dict:
+    exercised = set(exercised_stages)
+    expected = ["stream_decoder"]
+    if npu_offload in {"audio", "all"}:
+        expected.extend(["speech_encoder", "speaker_encoder"])
+    if npu_offload == "all":
+        expected.extend(["prompt", "text_embedding"])
+    covered = [stage for stage in expected if stage in exercised]
+    missing = [stage for stage in expected if stage not in exercised]
+    return {
+        "expected_npu_stages": expected,
+        "exercised_npu_stages": covered,
+        "unexercised_npu_stages": missing,
+    }
+
+
 def compare_to_gpu_baseline(results: list[dict]) -> dict:
     by_name = {item["name"]: item for item in results}
     gpu_rtf = ((by_name.get("gpu_only") or {}).get("summary") or {}).get("median_computed_rtf")
@@ -466,6 +492,7 @@ def run_scenario(
     collect_accelerator_counters: bool,
     counter_interval_ms: int,
     counter_scope: str,
+    exercised_stages: list[str],
 ) -> dict:
     scenario_dir = work_dir / name
     scenario_dir.mkdir(parents=True, exist_ok=True)
@@ -506,6 +533,8 @@ def run_scenario(
         finally:
             counter_summary = stop_counter_sampler(counter_sampler)
         summary = aggregate_metrics(metrics)
+        summary["exercised_runtime_stages"] = exercised_stages
+        summary["npu_offload_coverage"] = npu_offload_coverage(npu_offload, exercised_stages)
         if counter_summary is not None:
             summary["accelerator_counters"] = counter_summary
         expected_offload = expected_offload_for_scenario(name, npu_offload)
@@ -636,6 +665,7 @@ def main() -> None:
     scenario_names = parse_scenarios(args.scenarios)
     if args.mode == "voice_clone" and not args.ref_audio:
         raise ValueError("--mode voice_clone requires --ref-audio")
+    exercised_stages = exercised_runtime_stages(args.mode, x_vector_only=bool(args.x_vector_only))
 
     request_payload = {
         "mode": args.mode,
@@ -688,6 +718,7 @@ def main() -> None:
                 collect_accelerator_counters=args.collect_accelerator_counters,
                 counter_interval_ms=args.counter_interval_ms,
                 counter_scope=args.counter_scope,
+                exercised_stages=exercised_stages,
             )
         )
 
@@ -717,6 +748,7 @@ def main() -> None:
             "collect_accelerator_counters": args.collect_accelerator_counters,
             "counter_interval_ms": args.counter_interval_ms,
             "counter_scope": args.counter_scope,
+            "exercised_runtime_stages": exercised_stages,
         },
         "results": results,
         "comparison": comparison,
