@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -254,6 +255,119 @@ def test_windows_gpu_npu_benchmark_metric_uses_audio_duration():
     assert metric["speaker_encoder_device"] is None
     assert metric["native_codegen_device"] == "GPU"
     assert metric["npu_offload_effective"] == "decoder"
+
+
+def test_windows_gpu_npu_result_analyzer_accepts_valid_artifacts(tmp_path):
+    analyzer = load_script("analyze_windows_gpu_npu_results.py")
+    benchmark_summary = {
+        "status": "ok",
+        "results": [
+            {
+                "name": "gpu_only",
+                "summary": {
+                    "median_computed_rtf": 1.0,
+                    "npu_offload_effective": "off",
+                    "decoder_device": "GPU",
+                    "accelerator_counters": {
+                        "status": "ok",
+                        "gpu": {"utilization_average": 80.0},
+                        "npu": {"utilization_average": 0.0},
+                    },
+                },
+            },
+            {
+                "name": "npu_all",
+                "summary": {
+                    "median_computed_rtf": 0.8,
+                    "npu_offload_effective": "all",
+                    "decoder_device": "NPU",
+                    "encoder_device": "NPU",
+                    "prompt_device": "NPU",
+                    "text_embedding_device": "NPU",
+                    "accelerator_counters": {
+                        "status": "ok",
+                        "gpu": {"utilization_average": 60.0},
+                        "npu": {"utilization_average": 25.0},
+                    },
+                },
+            },
+        ],
+    }
+    probe = {
+        "status": "ok",
+        "decoder_compile": [{"label": "stream_decoder:c0_t8", "device": "NPU"}],
+        "prompt_compile": {"status": "ok", "graphs": [{"label": "text_embedding", "device": "NPU"}]},
+        "audio_encoder_compile": {"status": "ok", "graphs": [{"label": "speech_encoder", "device": "NPU"}]},
+    }
+    benchmark_path = tmp_path / "benchmark.json"
+    probe_path = tmp_path / "probe.json"
+    benchmark_path.write_text(json.dumps(benchmark_summary), encoding="utf-8")
+    probe_path.write_text(json.dumps(probe), encoding="utf-8")
+    args = type(
+        "Args",
+        (),
+        {
+            "benchmark_summary": str(benchmark_path),
+            "probe_json": str(probe_path),
+            "require_scenarios": "gpu_only,npu_all",
+            "min_speedup": 1.0,
+            "max_rtf_regression": 0.0,
+            "min_gpu_utilization_reduction": 0.05,
+            "require_counters": True,
+            "require_probe_ok": True,
+            "require_prompt_compile": True,
+            "require_audio_compile": True,
+        },
+    )()
+
+    report = analyzer.analyze(args)
+
+    assert report["status"] == "ok"
+    assert report["failures"] == []
+
+
+def test_windows_gpu_npu_result_analyzer_rejects_missing_npu_device(tmp_path):
+    analyzer = load_script("analyze_windows_gpu_npu_results.py")
+    benchmark_summary = {
+        "status": "ok",
+        "results": [
+            {
+                "name": "gpu_only",
+                "summary": {"median_computed_rtf": 1.0, "npu_offload_effective": "off", "decoder_device": "GPU"},
+            },
+            {
+                "name": "npu_decoder",
+                "summary": {
+                    "median_computed_rtf": 0.9,
+                    "npu_offload_effective": "decoder",
+                    "decoder_device": "GPU",
+                },
+            },
+        ],
+    }
+    benchmark_path = tmp_path / "benchmark.json"
+    benchmark_path.write_text(json.dumps(benchmark_summary), encoding="utf-8")
+    args = type(
+        "Args",
+        (),
+        {
+            "benchmark_summary": str(benchmark_path),
+            "probe_json": None,
+            "require_scenarios": "gpu_only,npu_decoder",
+            "min_speedup": None,
+            "max_rtf_regression": None,
+            "min_gpu_utilization_reduction": None,
+            "require_counters": False,
+            "require_probe_ok": False,
+            "require_prompt_compile": False,
+            "require_audio_compile": False,
+        },
+    )()
+
+    report = analyzer.analyze(args)
+
+    assert report["status"] == "failed"
+    assert any("decoder_device" in item for item in report["failures"])
 
 
 def test_server_health_reports_device_and_decoder_device(monkeypatch, tmp_path):

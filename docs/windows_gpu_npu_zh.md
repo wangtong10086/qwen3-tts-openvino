@@ -100,6 +100,7 @@ npu_all:     --device GPU --npu-offload all
 
 ```text
 build/windows-gpu-npu-benchmark/benchmark-summary.json
+build/windows-gpu-npu-benchmark/analysis.json
 build/windows-gpu-npu-benchmark/gpu_only/server.log
 build/windows-gpu-npu-benchmark/npu_decoder/server.log
 build/windows-gpu-npu-benchmark/npu_audio/server.log
@@ -156,6 +157,23 @@ build/windows-gpu-npu-benchmark/<scenario>/accelerator-counters.log
 ```
 
 `-MinSpeedup` 要求每个 NPU 场景的 RTF speedup 不低于阈值；`-MaxRtfRegression` 允许 NPU 场景比 GPU-only 慢的最大 RTF 差值；`-MinGpuUtilizationReduction` 要求平均 GPU utilization 相对 GPU-only 至少下降指定比例。失败会使脚本退出非零。
+
+如果已经有 workflow artifact 或本地 benchmark 结果，可以离线审计：
+
+```powershell
+uv run python scripts/analyze_windows_gpu_npu_results.py `
+  --benchmark-summary build/windows-gpu-npu-benchmark/benchmark-summary.json `
+  --probe-json build/gpu-npu-probe/probe.json `
+  --require-scenarios gpu_only,npu_decoder,npu_audio,npu_all `
+  --require-probe-ok `
+  --require-counters `
+  --min-speedup 1.02 `
+  --max-rtf-regression 0.03 `
+  --min-gpu-utilization-reduction 0.05 `
+  --output-json build/windows-gpu-npu-benchmark/analysis.json
+```
+
+该报告会检查实际 `npu_offload_effective`、`decoder_device`、`encoder_device`、`prompt_device/text_embedding_device`、NPU probe 编译结果、RTF 和 GPU utilization 降幅。失败时脚本退出非零，适合做发布前验收。
 
 要实际触发 VoiceClone 的参考音频 encoder，可在含 `base/` IR 的模型根目录上增加：
 
