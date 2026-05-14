@@ -1541,7 +1541,7 @@ wheels = [
 
 [[package]]
 name = "qwen3-tts-openvino"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "huggingface-hub" },

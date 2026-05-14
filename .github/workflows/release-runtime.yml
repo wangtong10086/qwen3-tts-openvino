@@ -2,14 +2,19 @@ name: release-runtime
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       version:
-        description: Release version, for example 0.1.0
+        description: Release version, for example 0.1.1
         required: true
-        default: 0.1.0
+        default: 0.1.1
       publish_release:
         description: Upload runtime packages to GitHub Releases
         required: true
@@ -27,7 +32,7 @@ on:
         default: false
 
 concurrency:
-  group: release-runtime-${{ github.ref_name || github.run_id }}
+  group: release-runtime-${{ github.event.pull_request.number || github.ref_name || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -50,9 +55,17 @@ jobs:
             publish_release="${{ inputs.publish_release }}"
             prerelease="${{ inputs.prerelease }}"
             draft="${{ inputs.draft }}"
-          else
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" =~ ^v[0-9] ]]; then
             raw_version="${GITHUB_REF_NAME}"
             publish_release="true"
+            prerelease="false"
+            draft="false"
+          else
+            raw_ref="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-ci}}"
+            safe_ref="$(echo "${raw_ref}" | tr -c 'A-Za-z0-9._-' '-' | sed -E 's/^-+|-+$//g' | cut -c1-40)"
+            short_sha="${GITHUB_SHA:0:7}"
+            raw_version="ci-${safe_ref:-branch}-${short_sha}"
+            publish_release="false"
             prerelease="false"
             draft="false"
           fi
@@ -77,8 +90,30 @@ jobs:
             echo "draft=${draft}"
           } >> "${GITHUB_OUTPUT}"
 
-  build:
+  check:
     needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra native --extra server --extra release --extra dev
+      - name: Compile Python modules
+        run: uv run python -m py_compile qwen3_tts_ov/*.py scripts/*.py
+      - name: Run unit tests
+        run: uv run pytest -q
+
+  build:
+    needs:
+      - prepare
+      - check
     strategy:
       fail-fast: false
       matrix:

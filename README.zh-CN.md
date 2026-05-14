@@ -10,7 +10,7 @@ OpenVINO-only 的 Qwen3-TTS 12Hz 推理、导出、流式 sidecar 和 native 加
 
 | 目标 | 推荐路径 |
 | --- | --- |
-| 直接在 Linux/Windows 上运行 TTS 服务 | 下载 [GitHub Release runtime](https://github.com/wangtong10086/qwen3-tts-openvino/releases/tag/v0.1.0)，首次启动会自动下载公开的 [Hugging Face OpenVINO IR](https://huggingface.co/waston10086/qwen3-tts-openvino-voice-design) |
+| 直接在 Linux/Windows 上运行 TTS 服务 | 下载 [GitHub Release runtime](https://github.com/wangtong10086/qwen3-tts-openvino/releases/tag/v0.1.1)，首次启动会自动下载公开的 [Hugging Face OpenVINO IR](https://huggingface.co/waston10086/qwen3-tts-openvino-voice-design) |
 | 从 PyTorch 模型重新导出、压缩、调试 | 使用 `uv run python -m qwen3_tts_ov build-fastest ...` |
 | 维护发布包 | 推送 `v*` tag，自动运行 `release-runtime` 构建 Linux/Windows 包并上传 GitHub Releases |
 
@@ -19,8 +19,8 @@ OpenVINO-only 的 Qwen3-TTS 12Hz 推理、导出、流式 sidecar 和 native 加
 1. 从 GitHub Release 下载 runtime 包：
 
 ```text
-qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal.tar.zst
-qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal.zip
+qwen3-tts-ov-server-linux-x64-0.1.1-runtime-minimal.tar.zst
+qwen3-tts-ov-server-windows-x64-0.1.1-runtime-minimal.zip
 ```
 
 2. 启动 sidecar。若本地没有 OpenVINO IR，release server 会自动下载默认公开 IR 到用户缓存目录，然后继续启动。
@@ -28,8 +28,8 @@ qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal.zip
 Linux：
 
 ```bash
-tar --zstd -xf qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal.tar.zst
-cd qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal
+tar --zstd -xf qwen3-tts-ov-server-linux-x64-0.1.1-runtime-minimal.tar.zst
+cd qwen3-tts-ov-server-linux-x64-0.1.1-runtime-minimal
 ./qwen3-tts-ov-server \
   --device GPU
 ```
@@ -37,8 +37,8 @@ cd qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal
 Windows：
 
 ```powershell
-Expand-Archive qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal.zip -DestinationPath .
-cd qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal
+Expand-Archive qwen3-tts-ov-server-windows-x64-0.1.1-runtime-minimal.zip -DestinationPath .
+cd qwen3-tts-ov-server-windows-x64-0.1.1-runtime-minimal
 .\qwen3-tts-ov-server.exe `
   --device GPU
 ```
