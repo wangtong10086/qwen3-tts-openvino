@@ -12,7 +12,7 @@ from .model_download import (
     ensure_release_model_root,
 )
 from .native_codegen import native_library_candidates
-from .profiles import FASTEST_CHUNK_STRATEGY, FASTEST_PROFILE_NAME, KV_CACHE_PROFILE_CHOICES
+from .profiles import FASTEST_CHUNK_STRATEGY, FASTEST_PROFILE_NAME, KV_CACHE_PROFILE_CHOICES, NPU_OFFLOAD_CHOICES
 from .server import serve
 
 
@@ -74,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-cache-dir", default=None, help="Directory for downloaded OpenVINO IR. Defaults to the user cache directory.")
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
+    parser.add_argument(
+        "--npu-offload",
+        default="off",
+        choices=NPU_OFFLOAD_CHOICES,
+        help="Windows heterogeneous mode: off, auto, decoder, or require. auto selects NPU for decoder when GPU+NPU are available.",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=17860)
     parser.add_argument("--realtime-profile", default=FASTEST_PROFILE_NAME, choices=[FASTEST_PROFILE_NAME, "auto"])
@@ -149,6 +155,7 @@ def main(argv: list[str] | None = None) -> None:
         port=args.port,
         device=args.device,
         decoder_device=args.decoder_device,
+        npu_offload=args.npu_offload,
         allow_cpu_fallback=args.allow_cpu_fallback,
         realtime_profile=args.realtime_profile,
         ov_cache_dir=args.ov_cache_dir,

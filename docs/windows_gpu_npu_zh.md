@@ -31,6 +31,7 @@ WSL 当前不作为 NPU 验证环境。测试需要 Windows 原生 Intel GPU/NPU
 .\scripts\windows_gpu_npu_smoke.ps1 `
   -Device GPU `
   -DecoderDevice NPU `
+  -NpuOffload decoder `
   -MaxNewTokens 8
 ```
 
@@ -47,6 +48,28 @@ build/windows-gpu-npu-smoke/probe.json
 build/windows-gpu-npu-smoke/summary.json
 build/windows-gpu-npu-smoke/server.log
 ```
+
+## 服务端 NPU Offload 参数
+
+release server 和源码 CLI 都支持同一组参数：
+
+```powershell
+qwen3-tts-ov-server.exe --device GPU --npu-offload auto
+qwen3-tts-ov-server.exe --device GPU --npu-offload decoder
+```
+
+```bash
+uv run python -m qwen3_tts_ov serve --device GPU --npu-offload auto
+```
+
+含义：
+
+- `off`: 默认兼容模式，不自动使用 NPU；如果显式传入 `--decoder-device NPU`，仍按显式设备运行。
+- `auto`: 主设备是 GPU、且 OpenVINO 能看到 `NPU` 时，自动把 streaming decoder 放到 NPU；没有 NPU 时退回 GPU。
+- `decoder`: 强制把 streaming decoder 放到 NPU；缺少 NPU 或同时传入非 NPU 的 `--decoder-device` 会启动失败。
+- `require`: 当前等价于 `decoder` 的严格模式，用于 CI 或部署验收。
+
+`/health` 和流式 metadata 会返回 `decoder_device`、`npu_offload_requested`、`npu_offload_effective`、`npu_offload_reason`，用于确认实际是否命中 GPU codegen + NPU decoder。
 
 ## GitHub Actions
 

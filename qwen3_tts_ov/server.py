@@ -50,6 +50,7 @@ from .profiles import (
     FASTEST_PROFILE_NAME,
     FASTEST_REPETITION_PENALTY,
     KV_CACHE_PROFILE_CHOICES,
+    NPU_OFFLOAD_CHOICES,
     REALTIME_BENCHMARK_PROFILE_OPTIONS,
     REALTIME_PROFILE_CHOICES,
     effective_codegen_unroll,
@@ -118,6 +119,7 @@ AUTO_CONTINUOUS_PROMPT_TOKENS_GPU = 2048
 AUTO_CONTINUOUS_PROMPT_TOKENS_CPU = 4096
 DEFAULT_MAX_VRAM_RATIO_GPU = 0.80
 DEFAULT_MAX_VRAM_RATIO_CPU = 1.00
+DEFAULT_NPU_OFFLOAD = "off"
 MIN_AUTO_CONTINUOUS_PROMPT_TOKENS = 256
 DEFAULT_KV_CACHE_RESERVE_MIN_MB = 1024
 DEFAULT_KV_CACHE_RESERVE_MAX_MB = 4096
@@ -266,6 +268,103 @@ def openvino_device_total_memory_bytes(device: str | None) -> int | None:
     except Exception:
         return None
     return None
+
+
+def normalize_npu_offload(value: str | None) -> str:
+    mode = str(value or DEFAULT_NPU_OFFLOAD).strip().lower().replace("_", "-")
+    if mode not in NPU_OFFLOAD_CHOICES:
+        raise ValueError(f"npu_offload must be one of {', '.join(NPU_OFFLOAD_CHOICES)}")
+    return mode
+
+
+def openvino_available_devices() -> tuple[list[str], str | None]:
+    try:
+        import openvino as ov
+
+        return [str(item) for item in ov.Core().available_devices], None
+    except Exception as exc:  # pragma: no cover - depends on local OpenVINO install
+        return [], str(exc)
+
+
+def device_matches(available_devices: list[str], required: str | None) -> bool:
+    required_name = str(required or "").strip().upper()
+    if not required_name:
+        return True
+    for item in available_devices:
+        name = str(item or "").strip().upper()
+        if name == required_name or name.startswith(f"{required_name}."):
+            return True
+    return False
+
+
+def is_npu_device(device: str | None) -> bool:
+    return str(device or "").strip().upper().startswith("NPU")
+
+
+def resolve_npu_offload(
+    *,
+    device: str | None,
+    decoder_device: str | None,
+    npu_offload: str | None,
+) -> dict:
+    requested = normalize_npu_offload(npu_offload)
+    main_device = str(device or "GPU")
+    explicit_decoder = decoder_device is not None and str(decoder_device).strip() != ""
+    effective_decoder = str(decoder_device or main_device)
+    decision = {
+        "requested_npu_offload": requested,
+        "effective_npu_offload": "off",
+        "npu_offload_reason": "disabled",
+        "device": main_device,
+        "decoder_device": effective_decoder,
+        "openvino_available_devices": [],
+        "openvino_available_devices_error": None,
+    }
+    if requested == "off":
+        if explicit_decoder and is_npu_device(effective_decoder):
+            decision["effective_npu_offload"] = "decoder"
+            decision["npu_offload_reason"] = "explicit_decoder_device"
+        return decision
+
+    if requested == "auto" and explicit_decoder:
+        decision["effective_npu_offload"] = "decoder" if is_npu_device(effective_decoder) else "off"
+        decision["npu_offload_reason"] = "explicit_decoder_device"
+        return decision
+
+    available_devices, error = openvino_available_devices()
+    decision["openvino_available_devices"] = available_devices
+    decision["openvino_available_devices_error"] = error
+    has_npu = device_matches(available_devices, "NPU")
+
+    if requested == "auto":
+        if error:
+            decision["npu_offload_reason"] = "device_query_failed"
+        elif "GPU" not in main_device.upper():
+            decision["npu_offload_reason"] = "non_gpu_device"
+        elif has_npu:
+            decision["decoder_device"] = "NPU"
+            decision["effective_npu_offload"] = "decoder"
+            decision["npu_offload_reason"] = "auto_selected_npu_decoder"
+        else:
+            decision["npu_offload_reason"] = "missing_npu"
+        return decision
+
+    if explicit_decoder and not is_npu_device(effective_decoder):
+        raise ValueError(
+            "npu offload requested but --decoder-device is not NPU. "
+            "Use --decoder-device NPU, omit --decoder-device, or set --npu-offload off."
+        )
+    if error:
+        raise ValueError(f"npu offload requires OpenVINO NPU device, but device query failed: {error}")
+    if not has_npu:
+        raise ValueError(
+            "npu offload requires OpenVINO NPU device. "
+            f"Available devices: {available_devices or 'none'}"
+        )
+    decision["decoder_device"] = effective_decoder if explicit_decoder else "NPU"
+    decision["effective_npu_offload"] = "decoder"
+    decision["npu_offload_reason"] = "requested_npu_decoder"
+    return decision
 
 
 def manifest_model_dir(ir_dir: Path, manifest: dict) -> Path | None:
@@ -1538,6 +1637,7 @@ def create_app(
     model_root: str | Path = "openvino",
     device: str = "GPU",
     decoder_device: str | None = None,
+    npu_offload: str = DEFAULT_NPU_OFFLOAD,
     allow_cpu_fallback: bool = False,
     mode: str = "cache",
     cache_kernel: str = "exact",
@@ -1576,6 +1676,19 @@ def create_app(
 
     app = FastAPI(title="Qwen3-TTS OpenVINO Engine")
     model_root = Path(model_root)
+    npu_offload_decision = resolve_npu_offload(
+        device=device,
+        decoder_device=decoder_device,
+        npu_offload=npu_offload,
+    )
+    decoder_device = npu_offload_decision["decoder_device"]
+    npu_offload_metadata = {
+        "npu_offload_requested": npu_offload_decision["requested_npu_offload"],
+        "npu_offload_effective": npu_offload_decision["effective_npu_offload"],
+        "npu_offload_reason": npu_offload_decision["npu_offload_reason"],
+        "openvino_available_devices": npu_offload_decision["openvino_available_devices"],
+        "openvino_available_devices_error": npu_offload_decision["openvino_available_devices_error"],
+    }
     requested_devices = [str(device or "")]
     if decoder_device:
         requested_devices.append(str(decoder_device))
@@ -1863,6 +1976,7 @@ def create_app(
         "forced_stream_strategy": forced_stream_strategy,
         "device": device,
         "decoder_device": decoder_device or device,
+        **npu_offload_metadata,
         "ov_cache_dir": None if disable_ov_cache else str(ov_cache_dir or "auto"),
         "ov_cache_mode": ov_cache_mode,
         "loaded_modes": [],
@@ -1903,6 +2017,7 @@ def create_app(
         "realtime_profile": reported_realtime_profile,
         "device": device,
         "decoder_device": decoder_device or device,
+        **npu_offload_metadata,
         "mode": mode,
         "cache_kernel": cache_kernel,
         "cache_step": cache_step,
@@ -3302,6 +3417,7 @@ def create_app(
                 "native_pipeline": getattr(runtime, "native_pipeline_override", None) or os.environ.get("QWEN3_TTS_OV_NATIVE_PIPELINE") or "off",
                 "device": getattr(runtime, "device", device),
                 "decoder_device": getattr(runtime, "decoder_device", decoder_device or device),
+                **npu_offload_metadata,
                 "native_codegen_device": os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE") or device,
                 "native_paged_kv": getattr(runtime, "native_paged_kv_override", None)
                 or os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV")
@@ -3674,6 +3790,7 @@ def serve(
     port: int = 17860,
     device: str = "GPU",
     decoder_device: str | None = None,
+    npu_offload: str = DEFAULT_NPU_OFFLOAD,
     allow_cpu_fallback: bool = False,
     mode: str = "cache",
     cache_kernel: str = "exact",
@@ -3712,6 +3829,7 @@ def serve(
         model_root=model_root,
         device=device,
         decoder_device=decoder_device,
+        npu_offload=npu_offload,
         allow_cpu_fallback=allow_cpu_fallback,
         mode=mode,
         cache_kernel=cache_kernel,

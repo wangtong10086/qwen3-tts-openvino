@@ -5,6 +5,7 @@ param(
   [string]$WorkDir = "build/windows-gpu-npu-smoke",
   [string]$Device = "GPU",
   [string]$DecoderDevice = "NPU",
+  [string]$NpuOffload = "decoder",
   [string]$HfRepo = "waston10086/qwen3-tts-openvino-voice-design",
   [string]$HfRevision = "main",
   [string]$Text = "你好，这是 Windows GPU 加 NPU 推理测试。",
@@ -68,7 +69,7 @@ uv run python scripts/smoke_release_tts.py `
   --work-dir $WorkDir `
   --port $Port `
   --device $Device `
-  --decoder-device $DecoderDevice `
+  --npu-offload $NpuOffload `
   --require-devices "$Device,$DecoderDevice" `
   --skip-if-missing-devices `
   --expect-native-codegen-device $Device `

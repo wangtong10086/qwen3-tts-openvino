@@ -111,3 +111,74 @@ def test_server_health_reports_device_and_decoder_device(monkeypatch, tmp_path):
 
     assert health["warmup"]["device"] == "GPU"
     assert health["warmup"]["decoder_device"] == "NPU"
+
+
+def test_server_auto_npu_offload_selects_npu_decoder(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+
+    monkeypatch.delenv("QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE", raising=False)
+    monkeypatch.setattr(server, "openvino_available_devices", lambda: (["CPU", "GPU.0", "NPU"], None))
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        realtime_profile="fastest",
+        device="GPU",
+        npu_offload="auto",
+    )
+    client = fastapi_testclient.TestClient(app)
+
+    health = client.get("/health").json()
+
+    assert health["warmup"]["decoder_device"] == "NPU"
+    assert health["warmup"]["npu_offload_requested"] == "auto"
+    assert health["warmup"]["npu_offload_effective"] == "decoder"
+    assert health["warmup"]["npu_offload_reason"] == "auto_selected_npu_decoder"
+
+
+def test_server_auto_npu_offload_falls_back_without_npu(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+
+    monkeypatch.setattr(server, "openvino_available_devices", lambda: (["CPU", "GPU.0"], None))
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        realtime_profile="fastest",
+        device="GPU",
+        npu_offload="auto",
+    )
+    client = fastapi_testclient.TestClient(app)
+
+    health = client.get("/health").json()
+
+    assert health["warmup"]["decoder_device"] == "GPU"
+    assert health["warmup"]["npu_offload_effective"] == "off"
+    assert health["warmup"]["npu_offload_reason"] == "missing_npu"
+
+
+def test_server_strict_npu_offload_requires_npu(monkeypatch, tmp_path):
+    pytest.importorskip("fastapi.testclient")
+
+    monkeypatch.setattr(server, "openvino_available_devices", lambda: (["CPU", "GPU.0"], None))
+    with pytest.raises(ValueError, match="requires OpenVINO NPU device"):
+        server.create_app(
+            model_root=tmp_path / "openvino",
+            warmup=False,
+            realtime_profile="fastest",
+            device="GPU",
+            npu_offload="decoder",
+        )
+
+
+def test_server_npu_offload_rejects_conflicting_decoder_device(monkeypatch, tmp_path):
+    pytest.importorskip("fastapi.testclient")
+
+    monkeypatch.setattr(server, "openvino_available_devices", lambda: (["CPU", "GPU.0", "NPU"], None))
+    with pytest.raises(ValueError, match="decoder-device is not NPU"):
+        server.create_app(
+            model_root=tmp_path / "openvino",
+            warmup=False,
+            realtime_profile="fastest",
+            device="GPU",
+            decoder_device="GPU",
+            npu_offload="decoder",
+        )

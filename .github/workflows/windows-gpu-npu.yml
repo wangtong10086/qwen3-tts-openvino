@@ -139,7 +139,7 @@ jobs:
             --work-dir build/windows-gpu-npu-smoke `
             --port 17981 `
             --device GPU `
-            --decoder-device NPU `
+            --npu-offload decoder `
             --require-devices GPU,NPU `
             --skip-if-missing-devices `
             --expect-native-codegen-device GPU `

@@ -137,6 +137,16 @@ def assert_expected_device(
         raise RuntimeError(f"expected {label}={expected_name}, got candidates={candidates!r}")
 
 
+def first_stream_or_health_value(stream: dict, health: dict, key: str, default: str | None = None) -> str | None:
+    metadata = stream.get("metadata") if isinstance(stream, dict) else None
+    if isinstance(metadata, dict) and metadata.get(key) is not None:
+        return str(metadata[key])
+    values = health_runtime_values(health, key)
+    if values:
+        return values[0]
+    return default
+
+
 def main() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -150,6 +160,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=17970)
     parser.add_argument("--device", default="CPU")
     parser.add_argument("--decoder-device", default=None)
+    parser.add_argument("--npu-offload", default=None, choices=("off", "auto", "decoder", "require"))
     parser.add_argument("--require-devices", default="")
     parser.add_argument("--skip-if-missing-devices", action="store_true")
     parser.add_argument("--expect-native-codegen-device", default=None)
@@ -181,6 +192,7 @@ def main() -> None:
             "openvino_error": device_error,
             "device": args.device,
             "decoder_device": args.decoder_device or args.device,
+            "npu_offload": args.npu_offload,
         }
         write_summary(summary, args.summary_out)
         if args.skip_if_missing_devices:
@@ -215,6 +227,8 @@ def main() -> None:
     ]
     if args.decoder_device:
         cmd.extend(["--decoder-device", args.decoder_device])
+    if args.npu_offload:
+        cmd.extend(["--npu-offload", args.npu_offload])
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
     try:
@@ -256,12 +270,20 @@ def main() -> None:
             health=health,
             metadata_key="decoder_device",
         )
+        effective_decoder_device = first_stream_or_health_value(
+            stream,
+            health,
+            "decoder_device",
+            args.decoder_device or args.device,
+        )
         summary = {
             "status": "ok",
             "executable": str(exe),
             "model_root": str(model_root),
             "device": args.device,
-            "decoder_device": args.decoder_device or args.device,
+            "decoder_device": effective_decoder_device,
+            "npu_offload": args.npu_offload,
+            "npu_offload_effective": first_stream_or_health_value(stream, health, "npu_offload_effective", None),
             "required_devices": required_devices,
             "available_devices": available_devices,
             "request": {

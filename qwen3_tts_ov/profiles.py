@@ -19,6 +19,7 @@ FASTEST_NATIVE_PAGED_KV_SPLIT_SUBCODE = "on"
 FASTEST_NATIVE_PAGED_KV_SCORE_AGGREGATION = "on"
 FASTEST_NATIVE_CODEGEN_DEVICE = "GPU"
 KV_CACHE_PROFILE_CHOICES = ("auto", "fp16", "bf16", "u8", "u8-input", "u8-all")
+NPU_OFFLOAD_CHOICES = ("off", "auto", "decoder", "require")
 KV_CACHE_PROFILE_OPTIONS = {
     "fp16": {
         "native_paged_kv_precision": "f16",

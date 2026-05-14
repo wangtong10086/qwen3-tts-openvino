@@ -31,6 +31,7 @@ from .profiles import (
     FASTEST_PREFERRED_CACHE_BUCKET,
     FASTEST_PROFILE_NAME,
     KV_CACHE_PROFILE_CHOICES,
+    NPU_OFFLOAD_CHOICES,
     PUBLIC_REALTIME_PROFILE_CHOICES,
     REALTIME_PROFILE_CHOICES,
     RUNTIME_MODE_CHOICES,
@@ -595,6 +596,7 @@ def run_serve(args):
         port=args.port,
         device=args.device,
         decoder_device=args.decoder_device,
+        npu_offload=args.npu_offload,
         allow_cpu_fallback=args.allow_cpu_fallback,
         mode=args.mode,
         cache_kernel=args.cache_kernel,
@@ -839,6 +841,12 @@ def main(argv=None):
     serve_parser.add_argument("--model-cache-dir", default=None)
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=17860)
+    serve_parser.add_argument(
+        "--npu-offload",
+        default="off",
+        choices=NPU_OFFLOAD_CHOICES,
+        help="Windows heterogeneous mode: off, auto, decoder, or require. auto selects NPU for the streaming decoder when GPU+NPU are available.",
+    )
     serve_parser.add_argument("--no-warmup", action="store_true")
     serve_parser.add_argument("--preload-modes", default="voice_design")
     serve_parser.add_argument("--preload-buckets", default="warmup")
