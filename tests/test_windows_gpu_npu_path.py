@@ -838,6 +838,38 @@ def test_server_auto_npu_offload_falls_back_without_npu(monkeypatch, tmp_path):
     assert health["warmup"]["npu_offload_reason"] == "missing_npu"
 
 
+def test_server_auto_npu_offload_falls_back_when_npu_decoder_probe_fails(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    ir_dir = tmp_path / "voice_design"
+    ir_dir.mkdir()
+
+    monkeypatch.setattr(server, "openvino_available_devices", lambda: (["CPU", "GPU.0", "NPU"], None))
+    monkeypatch.setattr(server, "resolve_budget_ir_dir", lambda model_root, mode_name: ir_dir)
+    monkeypatch.setattr(
+        server,
+        "load_manifest",
+        lambda path: {
+            "tts_model_type": "voice_design",
+            "streaming_decoder": {"contexts": {"0": {"8": "speech_decoder_stream_c0_t8.xml"}, "25": {"24": "speech_decoder_stream_c25_t24.xml"}}},
+        },
+    )
+    monkeypatch.setattr(server, "probe_stream_decoders_on_npu", lambda *args, **kwargs: (False, "negative shape bound"))
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        realtime_profile="fastest",
+        device="GPU",
+        npu_offload="auto",
+    )
+    client = fastapi_testclient.TestClient(app)
+
+    health = client.get("/health").json()
+
+    assert health["warmup"]["decoder_device"] == "GPU"
+    assert health["warmup"]["npu_offload_effective"] == "off"
+    assert health["warmup"]["npu_offload_reason"].startswith("auto_npu_decoder_compile_failed")
+
+
 def test_server_strict_npu_offload_requires_npu(monkeypatch, tmp_path):
     pytest.importorskip("fastapi.testclient")
 

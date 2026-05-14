@@ -454,6 +454,56 @@ def resolve_budget_ir_dir(model_root: Path, mode_name: str) -> Path | None:
     return None
 
 
+def select_probe_stream_decoder_graphs(manifest: dict) -> list[str]:
+    contexts = (manifest.get("streaming_decoder") or {}).get("contexts") or {}
+    first_context = contexts.get("0") or contexts.get(0) or {}
+    steady_context = contexts.get("25") or contexts.get(25) or {}
+    selected = [
+        first_context.get("8") or first_context.get(8) or first_context.get("12") or first_context.get(12),
+        steady_context.get("24") or steady_context.get(24) or steady_context.get("12") or steady_context.get(12),
+    ]
+    return [str(item) for item in selected if item]
+
+
+def probe_stream_decoders_on_npu(
+    ir_dir: Path,
+    manifest: dict,
+    *,
+    cache_dir: str | Path | None,
+    ov_cache_mode: str | None,
+    disable_ov_cache: bool,
+) -> tuple[bool, str]:
+    graphs = select_probe_stream_decoder_graphs(manifest)
+    if not graphs:
+        return False, "streaming_decoder_graphs_missing"
+    try:
+        import openvino as ov
+
+        from .runtime import compile_model
+
+        core = ov.Core()
+        compiled = []
+        for graph in dict.fromkeys(graphs):
+            compiled.append(
+                compile_model(
+                    core,
+                    ir_dir / graph,
+                    "NPU",
+                    Path(cache_dir) if cache_dir else None,
+                    allow_cpu_fallback=False,
+                    ov_profile=False,
+                    precision_hint="f16",
+                    ov_cache_mode=ov_cache_mode,
+                    disable_ov_cache=disable_ov_cache,
+                )
+            )
+        compiled.clear()
+        return True, ""
+    except Exception as exc:
+        reason = next((line.strip() for line in str(exc).splitlines() if line.strip()), repr(exc))
+        return False, reason
+
+
 def kv_cache_budget_context(
     *,
     ir_dir: Path | None,
@@ -1850,6 +1900,36 @@ def create_app(
             default_budget_manifest = load_manifest(default_budget_ir_dir)
         except Exception:
             default_budget_manifest = None
+    if (
+        npu_offload_decision.get("requested_npu_offload") == "auto"
+        and npu_offload_decision.get("effective_npu_offload") == "decoder"
+        and is_npu_device(decoder_device)
+        and default_budget_ir_dir is not None
+        and default_budget_manifest is not None
+    ):
+        npu_decoder_ok, npu_decoder_reason = probe_stream_decoders_on_npu(
+            default_budget_ir_dir,
+            default_budget_manifest,
+            cache_dir=ov_cache_dir,
+            ov_cache_mode=ov_cache_mode,
+            disable_ov_cache=disable_ov_cache,
+        )
+        if not npu_decoder_ok:
+            print(
+                "warning: auto NPU decoder probe failed; falling back streaming decoder to GPU: "
+                f"{npu_decoder_reason}",
+                flush=True,
+            )
+            decoder_device = device
+            npu_offload_decision["decoder_device"] = device
+            npu_offload_decision["effective_npu_offload"] = "off"
+            npu_offload_decision["npu_offload_reason"] = f"auto_npu_decoder_compile_failed: {npu_decoder_reason}"
+            npu_offload_metadata.update(
+                {
+                    "npu_offload_effective": npu_offload_decision["effective_npu_offload"],
+                    "npu_offload_reason": npu_offload_decision["npu_offload_reason"],
+                }
+            )
     default_kv_budget_context = kv_cache_budget_context(
         ir_dir=default_budget_ir_dir,
         manifest=default_budget_manifest,
