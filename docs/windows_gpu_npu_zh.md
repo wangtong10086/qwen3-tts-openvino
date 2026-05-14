@@ -80,16 +80,17 @@ uv run python -m qwen3_tts_ov serve --device GPU --npu-offload auto
 ```powershell
 .\scripts\windows_gpu_npu_benchmark.ps1 `
   -Device GPU `
-  -NpuOffload audio `
+  -Scenarios gpu_only,npu_decoder,npu_audio `
   -Runs 2 `
   -MaxNewTokens 48
 ```
 
-该脚本会使用同一个 release 包和同一份 IR 依次启动两组服务：
+该脚本会使用同一个 release 包和同一份 IR 依次启动三组服务：
 
 ```text
-gpu_only:       --device GPU --npu-offload off
-gpu_npu_audio:  --device GPU --npu-offload audio
+gpu_only:    --device GPU --npu-offload off
+npu_decoder: --device GPU --npu-offload decoder
+npu_audio:   --device GPU --npu-offload audio
 ```
 
 输出文件：
@@ -97,10 +98,21 @@ gpu_npu_audio:  --device GPU --npu-offload audio
 ```text
 build/windows-gpu-npu-benchmark/benchmark-summary.json
 build/windows-gpu-npu-benchmark/gpu_only/server.log
-build/windows-gpu-npu-benchmark/gpu_npu_audio/server.log
+build/windows-gpu-npu-benchmark/npu_decoder/server.log
+build/windows-gpu-npu-benchmark/npu_audio/server.log
 ```
 
-重点看 `comparison.computed_rtf_speedup`、每组 `decoder_device`、`speaker_encoder_device`、`npu_offload_effective` 和 `median_computed_rtf`。如果 `decoder_device=NPU` 但 RTF 没有改善，这说明当前瓶颈仍主要在 GPU codegen/paged-KV，而 NPU offload 主要价值是降低 GPU 音频侧负载。
+重点看 `comparison.npu_decoder.computed_rtf_speedup`、`comparison.npu_audio.computed_rtf_speedup`，以及每组 `decoder_device`、`speaker_encoder_device`、`npu_offload_effective` 和 `median_computed_rtf`。如果 `decoder_device=NPU` 但 RTF 没有改善，这说明当前瓶颈仍主要在 GPU codegen/paged-KV，而 NPU offload 主要价值是降低 GPU 音频侧负载。
+
+要实际触发 VoiceClone 的参考音频 encoder，可在含 `base/` IR 的模型根目录上增加：
+
+```powershell
+.\scripts\windows_gpu_npu_benchmark.ps1 `
+  -Mode voice_clone `
+  -RefAudio C:\path\ref.wav `
+  -RefText "参考音频对应文本" `
+  -Scenarios gpu_only,npu_decoder,npu_audio
+```
 
 ## GitHub Actions
 

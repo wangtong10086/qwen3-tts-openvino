@@ -138,6 +138,23 @@ def test_windows_gpu_npu_benchmark_builds_scenario_commands(tmp_path):
     assert "--decoder-device" not in npu_cmd
 
 
+def test_windows_gpu_npu_benchmark_parses_default_scenarios():
+    benchmark = load_script("benchmark_windows_gpu_npu_release.py")
+
+    assert benchmark.parse_scenarios(None) == ["gpu_only", "npu_decoder", "npu_audio"]
+    assert benchmark.parse_scenarios("npu_audio") == ["gpu_only", "npu_audio"]
+    with pytest.raises(ValueError, match="unknown scenarios"):
+        benchmark.parse_scenarios("gpu_only,invalid")
+
+
+def test_windows_gpu_npu_benchmark_expected_offload_by_scenario():
+    benchmark = load_script("benchmark_windows_gpu_npu_release.py")
+
+    assert benchmark.expected_offload_for_scenario("gpu_only", "off") == "off"
+    assert benchmark.expected_offload_for_scenario("npu_decoder", "decoder") == "decoder"
+    assert benchmark.expected_offload_for_scenario("npu_audio", "audio") == "audio"
+
+
 def test_windows_gpu_npu_benchmark_metric_uses_audio_duration():
     benchmark = load_script("benchmark_windows_gpu_npu_release.py")
     stream = {

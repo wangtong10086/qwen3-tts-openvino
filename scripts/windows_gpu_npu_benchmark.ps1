@@ -4,10 +4,13 @@ param(
   [string]$Version = "gpu-npu-smoke",
   [string]$WorkDir = "build/windows-gpu-npu-benchmark",
   [string]$Device = "GPU",
-  [string]$NpuOffload = "audio",
+  [string]$Scenarios = "gpu_only,npu_decoder,npu_audio",
   [string]$HfRepo = "waston10086/qwen3-tts-openvino-voice-design",
   [string]$HfRevision = "main",
+  [string]$Mode = "voice_design",
   [string]$Text = "你好，这是 Windows GPU 加 NPU 推理性能对比测试。",
+  [string]$RefAudio = "",
+  [string]$RefText = "",
   [int]$MaxNewTokens = 48,
   [int]$Runs = 2,
   [int]$BasePort = 17990,
@@ -48,14 +51,21 @@ $argsList = @(
   "--work-dir", $WorkDir,
   "--base-port", "$BasePort",
   "--device", $Device,
-  "--npu-offload", $NpuOffload,
+  "--scenarios", $Scenarios,
   "--require-devices", "$Device,NPU",
+  "--mode", $Mode,
   "--text", $Text,
   "--max-new-tokens", "$MaxNewTokens",
   "--runs", "$Runs",
   "--chunk-strategy", "smooth",
   "--summary-out", "$WorkDir/benchmark-summary.json"
 )
+if ($RefAudio) {
+  $argsList += @("--ref-audio", $RefAudio)
+}
+if ($RefText) {
+  $argsList += @("--ref-text", $RefText)
+}
 if (-not $Strict) {
   $argsList += "--skip-if-missing-devices"
 }

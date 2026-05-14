@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare packaged Windows release performance with GPU-only and GPU+NPU decoder paths."""
+"""Compare packaged Windows release performance across GPU-only and GPU+NPU paths."""
 
 from __future__ import annotations
 
@@ -19,6 +19,24 @@ from smoke_release_tts import (
     run_stream_request,
     write_summary,
 )
+
+
+SCENARIOS = {
+    "gpu_only": {"npu_offload": "off"},
+    "npu_decoder": {"npu_offload": "decoder"},
+    "npu_audio": {"npu_offload": "audio"},
+}
+
+
+def parse_scenarios(value: str | None) -> list[str]:
+    raw = value or "gpu_only,npu_decoder,npu_audio"
+    result = [item.strip() for item in str(raw).split(",") if item.strip()]
+    unknown = [item for item in result if item not in SCENARIOS]
+    if unknown:
+        raise ValueError(f"unknown scenarios: {', '.join(unknown)}; available: {', '.join(SCENARIOS)}")
+    if "gpu_only" not in result:
+        result.insert(0, "gpu_only")
+    return result
 
 
 def build_server_command(
@@ -136,6 +154,16 @@ def aggregate_metrics(metrics: list[dict]) -> dict:
     }
 
 
+def expected_offload_for_scenario(name: str, npu_offload: str) -> str | None:
+    if name == "gpu_only":
+        return "off"
+    if npu_offload in {"decoder", "require", "auto"}:
+        return "decoder"
+    if npu_offload == "audio":
+        return "audio"
+    return None
+
+
 def run_scenario(
     *,
     name: str,
@@ -181,13 +209,7 @@ def run_scenario(
                 }
             )
         summary = aggregate_metrics(metrics)
-        expected_offload = {
-            "off": "off",
-            "auto": "decoder",
-            "decoder": "decoder",
-            "require": "decoder",
-            "audio": "audio",
-        }.get(npu_offload)
+        expected_offload = expected_offload_for_scenario(name, npu_offload)
         if expected_offload and summary.get("npu_offload_effective") != expected_offload:
             return {
                 "name": name,
@@ -229,15 +251,23 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--base-port", type=int, default=17990)
     parser.add_argument("--device", default="GPU")
-    parser.add_argument("--npu-offload", default="audio", choices=("auto", "decoder", "audio", "require"))
+    parser.add_argument(
+        "--scenarios",
+        default="gpu_only,npu_decoder,npu_audio",
+        help="Comma-separated benchmark scenarios: gpu_only,npu_decoder,npu_audio.",
+    )
     parser.add_argument("--require-devices", default="GPU,NPU")
     parser.add_argument("--skip-if-missing-devices", action="store_true")
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--runs", type=int, default=2)
     parser.add_argument("--no-warmup", action="store_true")
+    parser.add_argument("--mode", default="voice_design", choices=("voice_design", "voice_clone"))
     parser.add_argument("--text", default="你好，这是 Windows GPU 加 NPU 推理性能对比测试。")
     parser.add_argument("--instruct", default="A calm young female voice.")
     parser.add_argument("--language", default="Chinese")
+    parser.add_argument("--ref-audio", default=None)
+    parser.add_argument("--ref-text", default=None)
+    parser.add_argument("--x-vector-only", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--chunk-strategy", default="smooth")
     parser.add_argument("--summary-out", default=None)
@@ -266,12 +296,14 @@ def main() -> None:
     manifest = model_root / "voice_design" / "manifest.json"
     if not manifest.exists():
         raise FileNotFoundError(f"voice_design manifest not found under model root: {manifest}")
+    scenario_names = parse_scenarios(args.scenarios)
+    if args.mode == "voice_clone" and not args.ref_audio:
+        raise ValueError("--mode voice_clone requires --ref-audio")
 
     request_payload = {
-        "mode": "voice_design",
+        "mode": args.mode,
         "text": args.text,
         "language": args.language,
-        "instruct": args.instruct,
         "generation": {
             "max_new_tokens": args.max_new_tokens,
             "min_new_tokens": 1,
@@ -282,20 +314,23 @@ def main() -> None:
             "format": "pcm_s16le",
         },
     }
-    scenarios = [
-        {
-            "name": "gpu_only",
-            "port": args.base_port,
-            "npu_offload": "off",
-            "decoder_device": None,
-        },
-        {
-            "name": "gpu_npu_audio" if args.npu_offload == "audio" else "gpu_npu_decoder",
-            "port": args.base_port + 1,
-            "npu_offload": args.npu_offload,
-            "decoder_device": None,
-        },
-    ]
+    if args.mode == "voice_design":
+        request_payload["instruct"] = args.instruct
+    else:
+        request_payload["ref_audio"] = args.ref_audio
+        request_payload["ref_text"] = args.ref_text
+        request_payload["x_vector_only"] = bool(args.x_vector_only)
+    scenarios = []
+    for offset, scenario_name in enumerate(scenario_names):
+        scenario = SCENARIOS[scenario_name]
+        scenarios.append(
+            {
+                "name": scenario_name,
+                "port": args.base_port + offset,
+                "npu_offload": scenario["npu_offload"],
+                "decoder_device": None,
+            }
+        )
     results = []
     for scenario in scenarios:
         results.append(
@@ -318,12 +353,15 @@ def main() -> None:
 
     by_name = {item["name"]: item for item in results}
     gpu_rtf = ((by_name.get("gpu_only") or {}).get("summary") or {}).get("median_computed_rtf")
-    npu_result = by_name.get("gpu_npu_audio") or by_name.get("gpu_npu_decoder") or {}
-    npu_rtf = (npu_result.get("summary") or {}).get("median_computed_rtf")
-    comparison = {
-        "computed_rtf_delta": None if gpu_rtf is None or npu_rtf is None else npu_rtf - gpu_rtf,
-        "computed_rtf_speedup": None if gpu_rtf is None or not npu_rtf else gpu_rtf / npu_rtf,
-    }
+    comparison = {}
+    for name, result in by_name.items():
+        if name == "gpu_only":
+            continue
+        npu_rtf = (result.get("summary") or {}).get("median_computed_rtf")
+        comparison[name] = {
+            "computed_rtf_delta": None if gpu_rtf is None or npu_rtf is None else npu_rtf - gpu_rtf,
+            "computed_rtf_speedup": None if gpu_rtf is None or not npu_rtf else gpu_rtf / npu_rtf,
+        }
     status = "ok" if all("error" not in item for item in results) else "failed"
     summary = {
         "status": status,
@@ -332,9 +370,11 @@ def main() -> None:
         "available_devices": available_devices,
         "request": {
             "text": args.text,
+            "mode": args.mode,
             "max_new_tokens": args.max_new_tokens,
             "chunk_strategy": args.chunk_strategy,
             "runs": args.runs,
+            "scenarios": scenario_names,
         },
         "results": results,
         "comparison": comparison,

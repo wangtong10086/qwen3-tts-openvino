@@ -154,7 +154,7 @@ jobs:
             --chunk-strategy smooth `
             --summary-out build/windows-gpu-npu-smoke/summary.json
 
-      - name: Benchmark GPU-only vs GPU+NPU decoder
+      - name: Benchmark GPU-only vs GPU+NPU paths
         if: steps.probe.outputs.status == 'ok'
         shell: powershell
         env:
@@ -168,7 +168,7 @@ jobs:
             --work-dir build/windows-gpu-npu-benchmark `
             --base-port 17990 `
             --device GPU `
-            --npu-offload decoder `
+            --scenarios gpu_only,npu_decoder,npu_audio `
             --require-devices GPU,NPU `
             --skip-if-missing-devices `
             --text "$env:REAL_TTS_TEXT" `
@@ -187,4 +187,5 @@ jobs:
             build/windows-gpu-npu-smoke/summary.json
             build/windows-gpu-npu-benchmark/benchmark-summary.json
             build/windows-gpu-npu-benchmark/gpu_only/server.log
-            build/windows-gpu-npu-benchmark/gpu_npu_audio/server.log
+            build/windows-gpu-npu-benchmark/npu_decoder/server.log
+            build/windows-gpu-npu-benchmark/npu_audio/server.log
