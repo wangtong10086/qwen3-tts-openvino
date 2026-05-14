@@ -257,24 +257,30 @@ uv run python scripts/analyze_windows_gpu_npu_results.py `
 
 ## GitHub Actions
 
-测试 workflow 位于：
+该分支的 GitHub workflow 位于：
 
 ```text
 .github/workflows/windows-gpu-npu.yml
 ```
 
-默认面向自托管 Windows runner：
+它只负责在 hosted runner 上构建 runtime 包：
 
 ```text
-self-hosted, Windows, X64, npu
+ubuntu-latest  -> linux-x64 runtime-minimal
+windows-latest -> windows-x64 runtime-minimal
 ```
 
-触发方式：
+触发后会执行：
 
 - push 到 `test/windows-gpu-npu-path` 或 `test/windows-gpu-npu-*`
 - 手动运行 `windows-gpu-npu`
+- Python 编译和单元测试
+- Linux/Windows native runtime 构建
+- `runtime-minimal` 打包
+- `smoke_release_package.py` 基础启动检查
+- 上传 runtime archive 和 smoke log artifact
 
-无 NPU 或 NPU decoder 编译失败时，默认标记为 skipped 并上传 artifact；手动运行时可设置 `strict=true`，使缺设备或编译失败直接失败。
+GitHub Actions 不下载模型 IR、不探测 NPU、不运行真实 TTS、不做 GPU-only/GPU+NPU benchmark。Windows NPU 的正确性和性能必须在本地 Windows 原生机器上通过 `windows_gpu_npu_smoke.ps1` 和 `windows_gpu_npu_benchmark.ps1` 验证。
 
 ## 零拷贝 Probe
 

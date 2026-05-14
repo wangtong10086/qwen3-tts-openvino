@@ -234,15 +234,22 @@ def test_windows_gpu_npu_benchmark_powershell_runs_probe_and_analyzer():
     assert "RequireAudioCompile" in script
 
 
-def test_windows_gpu_npu_workflow_exposes_voice_clone_dispatch_inputs():
+def test_windows_gpu_npu_workflow_builds_runtime_without_npu_validation():
     workflow = (REPO_ROOT / ".github" / "workflows" / "windows-gpu-npu.yml").read_text(encoding="utf-8")
 
-    assert "mode:" in workflow
-    assert "ref_audio:" in workflow
-    assert "x_vector_only:" in workflow
-    assert "benchmark_scenarios:" in workflow
-    assert "--require-exercised-npu-stages" in workflow
-    assert "workflow_dispatch input ref_audio is required when mode=voice_clone" in workflow
+    assert "windows-gpu-npu-runtime" in workflow
+    assert "linux-x64" in workflow
+    assert "windows-x64" in workflow
+    assert "--profile runtime-minimal" in workflow
+    assert "scripts/smoke_release_package.py" in workflow
+    assert "actions/upload-artifact" in workflow
+    assert "self-hosted" not in workflow
+    assert "runner_labels" not in workflow
+    assert "scripts/probe_windows_gpu_npu.py" not in workflow
+    assert "scripts/smoke_release_tts.py" not in workflow
+    assert "scripts/benchmark_windows_gpu_npu_release.py" not in workflow
+    assert "scripts/analyze_windows_gpu_npu_results.py" not in workflow
+    assert "--require-exercised-npu-stages" not in workflow
 
 
 def test_windows_gpu_npu_smoke_powershell_asserts_audio_and_prompt_devices():
