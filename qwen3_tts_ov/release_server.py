@@ -91,7 +91,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-cpu-fallback", action="store_true")
     parser.add_argument("--max-concurrent-tts", type=int, default=1)
     parser.add_argument("--long-output-memory-policy", default="stable", choices=["stable", "fast"])
-    parser.add_argument("--max-continuous-prompt-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--max-continuous-prompt-tokens",
+        default="auto",
+        help="Long full-AR prompt budget: auto, 0 to disable, or a positive token limit.",
+    )
     parser.add_argument("--usm-retry-count", type=int, default=1)
     return parser
 

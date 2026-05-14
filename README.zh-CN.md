@@ -88,6 +88,7 @@ uv run python -m qwen3_tts_ov serve \
 - cached subcode 图保持 FP16，优先保证音质稳定。
 - 流式输出 mono 24 kHz `pcm_s16le`。
 - 长文本使用完整上下文全自回归生成；runtime 只把音频切块给播放器，不默认切分输入文本。
+- 长文本 prompt 预算默认 `auto`：GPU 路径为 `2048` tokens，CPU-only 为 `4096` tokens；超长输入可通过 `--max-continuous-prompt-tokens` 调整。
 
 ## 常用入口
 

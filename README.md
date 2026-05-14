@@ -86,6 +86,9 @@ guide.
 - Streaming sidecar with WebSocket, HTTP NDJSON, and OpenAI-compatible Speech API.
 - Long VoiceDesign requests are generated as one continuous autoregressive
   sequence; audio is chunked only for playback.
+- Long prompt budget defaults to `auto`: 2048 tokens on GPU paths and 4096
+  tokens on CPU-only paths; use `--max-continuous-prompt-tokens` for longer
+  requests.
 - Production runtime profile: `fastest`, `pcm_s16le`, mono 24 kHz output.
 
 ## Documentation

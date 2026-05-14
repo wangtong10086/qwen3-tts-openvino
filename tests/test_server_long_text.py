@@ -251,3 +251,149 @@ def test_explicit_do_sample_false_is_respected_for_long_text():
     }
 
     assert server.generation_kwargs(request)["do_sample"] is False
+
+
+def test_continuous_prompt_budget_auto_limits_by_device():
+    assert server.resolve_continuous_prompt_budget("auto", uses_gpu_device=True) == (
+        "auto",
+        2048,
+        "auto_gpu",
+    )
+    assert server.resolve_continuous_prompt_budget(None, uses_gpu_device=False) == (
+        "auto",
+        4096,
+        "auto_cpu",
+    )
+    assert server.resolve_continuous_prompt_budget("0", uses_gpu_device=True) == (
+        "0",
+        0,
+        "disabled",
+    )
+    assert server.resolve_continuous_prompt_budget(1536, uses_gpu_device=True) == (
+        "1536",
+        1536,
+        "explicit",
+    )
+
+
+def test_continuous_prompt_budget_rejects_invalid_values():
+    with pytest.raises(ValueError, match="max-continuous-prompt-tokens"):
+        server.resolve_continuous_prompt_budget("many", uses_gpu_device=True)
+    with pytest.raises(ValueError, match="max-continuous-prompt-tokens"):
+        server.resolve_continuous_prompt_budget("-1", uses_gpu_device=True)
+
+
+def test_health_reports_effective_continuous_prompt_budget(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    monkeypatch.delenv("QWEN3_TTS_OV_NATIVE_PAGED_KV", raising=False)
+
+    gpu_app = server.create_app(model_root=tmp_path / "openvino", warmup=False, device="GPU")
+    gpu_health = fastapi_testclient.TestClient(gpu_app).get("/health").json()
+
+    assert gpu_health["memory"]["max_continuous_prompt_tokens_config"] == "auto"
+    assert gpu_health["memory"]["effective_max_continuous_prompt_tokens"] == 2048
+    assert gpu_health["memory"]["long_text_budget_policy"] == "auto_gpu"
+
+    cpu_app = server.create_app(model_root=tmp_path / "openvino", warmup=False, device="CPU")
+    cpu_health = fastapi_testclient.TestClient(cpu_app).get("/health").json()
+
+    assert cpu_health["memory"]["max_continuous_prompt_tokens_config"] == "auto"
+    assert cpu_health["memory"]["effective_max_continuous_prompt_tokens"] == 4096
+    assert cpu_health["memory"]["long_text_budget_policy"] == "auto_cpu"
+
+
+def test_default_auto_budget_allows_prompt_above_old_1024_limit(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+
+    monkeypatch.chdir(tmp_path)
+    ir_dir = tmp_path / "openvino" / "voice_design"
+    ir_dir.mkdir(parents=True)
+    manifest = {
+        "tts_model_type": "voice_design",
+        "graphs": {
+            "subcode_greedy_cached": "subcode_greedy_cached.xml",
+            "paged_kv_seed": {"talker_stateful_gqa": "talker_stateful_sdpa_paged_gqa_seed.xml"},
+        },
+        "graph_variants": {
+            "int8_sym_paged_talker_split": {
+                "graphs": {
+                    "paged_kv_seed": {
+                        "talker_stateful_gqa": "talker_stateful_sdpa_paged_gqa_seed_int8_sym_paged_talker_split.xml"
+                    }
+                }
+            }
+        },
+    }
+    (ir_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    class FakeRuntime:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def stream_voice_design(self, **kwargs):
+            yield SimpleNamespace(
+                audio=np.zeros(16, dtype=np.float32),
+                sample_rate=24000,
+                codes=np.zeros((1, 16), dtype=np.int64),
+                is_final=True,
+                timings={"stream_rtf": 0.9},
+                index=0,
+            )
+
+    monkeypatch.setattr(server, "OpenVINOQwen3TTS", FakeRuntime)
+    app = server.create_app(model_root=tmp_path / "openvino", warmup=False, device="GPU")
+    client = fastapi_testclient.TestClient(app)
+
+    with client.websocket_connect("/v1/tts/stream") as websocket:
+        websocket.send_json(
+            {
+                "mode": "voice_design",
+                "text": "长" * 1100,
+                "generation": {"max_new_tokens": 2048},
+                "stream": {"include_chunk_metadata": True},
+            }
+        )
+        metadata = websocket.receive_json()
+        assert metadata["type"] == "metadata"
+        assert metadata["effective_max_continuous_prompt_tokens"] == 2048
+        assert websocket.receive_json()["type"] == "audio"
+        websocket.receive_bytes()
+        assert websocket.receive_json()["type"] == "final"
+
+
+def test_explicit_1024_budget_still_blocks_oversized_prompt(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+
+    monkeypatch.chdir(tmp_path)
+    ir_dir = tmp_path / "openvino" / "voice_design"
+    ir_dir.mkdir(parents=True)
+    (ir_dir / "manifest.json").write_text(
+        json.dumps({"tts_model_type": "voice_design", "graphs": {}, "graph_variants": {}}),
+        encoding="utf-8",
+    )
+
+    class FakeRuntime:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(server, "OpenVINOQwen3TTS", FakeRuntime)
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        device="GPU",
+        max_continuous_prompt_tokens=1024,
+    )
+    client = fastapi_testclient.TestClient(app)
+
+    with client.websocket_connect("/v1/tts/stream") as websocket:
+        websocket.send_json(
+            {
+                "mode": "voice_design",
+                "text": "长" * 1100,
+                "generation": {"max_new_tokens": 2048},
+            }
+        )
+        assert websocket.receive_json()["type"] == "metadata"
+        error = websocket.receive_json()
+        assert error["type"] == "error"
+        assert "effective_max_continuous_prompt_tokens=1024" in error["message"]

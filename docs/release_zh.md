@@ -114,8 +114,29 @@ curl -N http://127.0.0.1:17860/v1/audio/speech \
 - `--model-root <path>`: 使用本地已下载或私有分发的 IR。
 - `--model-cache-dir <path>`: 指定自动下载缓存目录。
 - `--model-repo <repo>`、`--model-revision <rev>`、`--model-subdir <dir>`: 指定下载来源。
+- `--max-continuous-prompt-tokens auto|0|N`: 长文本 full-AR prompt token 预算。默认 `auto`，GPU 路径为 `2048`，CPU-only 路径为 `4096`；`0` 表示关闭该预算保护。
 
 缓存目录也可以用环境变量 `QWEN3_TTS_OV_MODEL_CACHE_DIR` 指定。
+
+## 长文本预算
+
+长文本默认不切分输入文本，而是使用同一条 full-AR 自回归链路。为了避免过长 prompt 在部分 GPU/驱动上触发 OpenVINO USM 分配失败，server 会在推理前做 prompt token 预算检查。
+
+默认 `--max-continuous-prompt-tokens auto` 已覆盖常见长文本：
+
+- GPU 或默认 release 路径：`2048`
+- CPU-only：`4096`
+
+如果请求仍然超出预算，可以按机器显存/内存情况提高或关闭限制：
+
+```bash
+./qwen3-tts-ov-server --device GPU --max-continuous-prompt-tokens 4096
+
+# 或关闭 prompt 预算保护，仅保留 OpenVINO/USM 运行时错误与重试
+./qwen3-tts-ov-server --device GPU --max-continuous-prompt-tokens 0
+```
+
+服务端 `/health` 和流式 metadata 会返回 `max_continuous_prompt_tokens_config`、`effective_max_continuous_prompt_tokens` 和 `long_text_budget_policy`，用于确认实际生效值。
 
 ## 系统要求
 

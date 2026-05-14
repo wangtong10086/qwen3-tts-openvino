@@ -22,7 +22,7 @@
 2. 多个 binary `pcm_s16le` 音频块
 3. final JSON
 
-metadata 会包含 `realtime_profile`、`chunk_strategy`、`recommended_playback_buffer_ms`、`graph_variant`、`paged_kv`、`continuous_long_output` 等运行状态。前端必须以 final JSON 作为本次合成结束信号，不要用连接关闭或最后一个音频块判断结束。
+metadata 会包含 `realtime_profile`、`chunk_strategy`、`recommended_playback_buffer_ms`、`graph_variant`、`paged_kv`、`continuous_long_output`、`effective_max_continuous_prompt_tokens` 等运行状态。前端必须以 final JSON 作为本次合成结束信号，不要用连接关闭或最后一个音频块判断结束。
 
 ## 播放缓冲
 
@@ -46,6 +46,21 @@ metadata 会包含 `realtime_profile`、`chunk_strategy`、`recommended_playback
 - decoder 可以按 chunk 输出音频，但不能把文本拆成多个独立 prompt
 
 这样可以避免分段生成导致的音色、语气和韵律不连续。
+
+## 长文本 prompt 预算
+
+服务端默认使用 `--max-continuous-prompt-tokens auto` 做推理前保护，避免极长 prompt 在部分 GPU/驱动上触发 OpenVINO USM 分配失败。`auto` 的生效值为：
+
+- GPU 或默认 release 路径：`2048`
+- CPU-only：`4096`
+
+如果 metadata 或错误信息显示文本超过预算，可以启动时提高上限：
+
+```bash
+qwen3-tts-ov-server --device GPU --max-continuous-prompt-tokens 4096
+```
+
+也可以设置为 `0` 关闭 prompt 预算保护。关闭后仍不会自动分段，后续如果显存不足会由 OpenVINO/USM 错误和 retry 机制处理。
 
 ## 长文本采样参数
 

@@ -83,6 +83,7 @@ uv run python -m qwen3_tts_ov serve \
   --model-root openvino \
   --device GPU \
   --realtime-profile fastest \
+  --max-continuous-prompt-tokens auto \
   --host 127.0.0.1 \
   --port 17860
 ```
@@ -164,3 +165,5 @@ curl http://127.0.0.1:17860/v1/audio/speech \
 ## 长文本
 
 长文本仍使用同一个 prompt 做完整自回归。服务端可以分块发送音频，但不会默认把文本切成多段独立生成。详细策略见 [streaming_zh.md](streaming_zh.md)。
+
+`--max-continuous-prompt-tokens` 默认值为 `auto`：GPU 路径生效为 `2048`，CPU-only 生效为 `4096`。更长输入可启动时改为具体数值，或设为 `0` 关闭推理前 prompt 预算保护。

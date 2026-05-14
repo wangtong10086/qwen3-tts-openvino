@@ -87,6 +87,8 @@ WEB_AUTO_SEGMENT_UNITS = 64
 WEB_AUTO_SEGMENT_MAX_NEW_TOKENS = 240
 WEB_AUTO_SEGMENT_PREFIX_FRAMES = 24
 WEB_AUTO_SEGMENT_FADE_MS = 18
+AUTO_CONTINUOUS_PROMPT_TOKENS_GPU = 2048
+AUTO_CONTINUOUS_PROMPT_TOKENS_CPU = 4096
 LONG_AR_REFERENCE_MODE_ENV = "QWEN3_TTS_OV_LONG_AR_REFERENCE_MODE"
 LONG_AR_PROFILE_ENV = "QWEN3_TTS_OV_LONG_AR_PROFILE"
 ENABLE_AUTO_SEGMENT_ENV = "QWEN3_TTS_OV_ENABLE_AUTO_SEGMENT"
@@ -111,6 +113,27 @@ def native_paged_kv_requested() -> bool:
 
 def paged_long_ar_enabled() -> bool:
     return native_paged_kv_requested() and env_enabled(ENABLE_PAGED_LONG_AR_ENV, False)
+
+
+def resolve_continuous_prompt_budget(
+    config: str | int | None = "auto",
+    *,
+    uses_gpu_device: bool = True,
+) -> tuple[str, int, str]:
+    """Return reported config, effective token limit, and policy name."""
+    raw = "auto" if config is None else str(config).strip().lower()
+    if raw in {"", "auto"}:
+        limit = AUTO_CONTINUOUS_PROMPT_TOKENS_GPU if uses_gpu_device else AUTO_CONTINUOUS_PROMPT_TOKENS_CPU
+        device_name = "gpu" if uses_gpu_device else "cpu"
+        return "auto", int(limit), f"auto_{device_name}"
+    try:
+        limit = int(raw)
+    except ValueError as exc:
+        raise ValueError("--max-continuous-prompt-tokens must be auto, 0, or a positive integer") from exc
+    if limit < 0:
+        raise ValueError("--max-continuous-prompt-tokens must be auto, 0, or a positive integer")
+    policy = "disabled" if limit == 0 else "explicit"
+    return str(limit), int(limit), policy
 
 
 def speech_text_units(token: str) -> int:
@@ -1076,7 +1099,7 @@ def create_app(
     realtime_profile: str = FASTEST_PROFILE_NAME,
     max_concurrent_tts: int = 1,
     long_output_memory_policy: str = "stable",
-    max_continuous_prompt_tokens: int = 1024,
+    max_continuous_prompt_tokens: str | int = "auto",
     usm_retry_count: int = 1,
 ):
     from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -1094,7 +1117,11 @@ def create_app(
     if long_output_memory_policy not in {"stable", "fast"}:
         raise ValueError("long_output_memory_policy must be stable or fast")
     max_concurrent_tts = max(1, int(max_concurrent_tts))
-    max_continuous_prompt_tokens = int(max_continuous_prompt_tokens)
+    (
+        max_continuous_prompt_tokens_config,
+        effective_max_continuous_prompt_tokens,
+        long_text_budget_policy,
+    ) = resolve_continuous_prompt_budget(max_continuous_prompt_tokens, uses_gpu_device=uses_gpu_device)
     usm_retry_count = max(0, int(usm_retry_count))
     auto_profile = select_auto_realtime_profile() if realtime_profile == "auto" else None
     if auto_profile:
@@ -1228,7 +1255,10 @@ def create_app(
         "long_output_memory_policy": long_output_memory_policy,
         "max_concurrent_tts": max_concurrent_tts,
         "active_tts_requests": 0,
-        "max_continuous_prompt_tokens": max_continuous_prompt_tokens,
+        "max_continuous_prompt_tokens": effective_max_continuous_prompt_tokens,
+        "max_continuous_prompt_tokens_config": max_continuous_prompt_tokens_config,
+        "effective_max_continuous_prompt_tokens": effective_max_continuous_prompt_tokens,
+        "long_text_budget_policy": long_text_budget_policy,
         "usm_retry_count": usm_retry_count,
         "last_usm_error": None,
         "last_usm_retry_at": None,
@@ -1277,7 +1307,10 @@ def create_app(
         "long_output_bucket": None if native_paged_kv_requested() else CONTINUOUS_LONG_OUTPUT_BUCKET,
         "long_output_memory_policy": long_output_memory_policy,
         "max_concurrent_tts": max_concurrent_tts,
-        "max_continuous_prompt_tokens": max_continuous_prompt_tokens,
+        "max_continuous_prompt_tokens": effective_max_continuous_prompt_tokens,
+        "max_continuous_prompt_tokens_config": max_continuous_prompt_tokens_config,
+        "effective_max_continuous_prompt_tokens": effective_max_continuous_prompt_tokens,
+        "long_text_budget_policy": long_text_budget_policy,
         "paged_kv": native_paged_kv_requested(),
         "paged_kv_backend": "native_paged_attention" if native_paged_kv_requested() else "unavailable",
         "paged_kv_unavailable_reason": "" if native_paged_kv_requested() else PAGED_KV_UNAVAILABLE_REASON,
@@ -1609,11 +1642,16 @@ def create_app(
             prompt_len = int(exact.get("prompt_len") or estimate["prompt_tokens_estimate"])
         else:
             prompt_len = int(estimate["prompt_tokens_estimate"])
-        if max_continuous_prompt_tokens > 0 and prompt_len > max_continuous_prompt_tokens:
+        if (
+            effective_max_continuous_prompt_tokens > 0
+            and prompt_len > effective_max_continuous_prompt_tokens
+        ):
             raise ValueError(
                 f"continuous long-output prompt has {prompt_len} tokens, "
-                f"max_continuous_prompt_tokens={max_continuous_prompt_tokens}. "
-                "Increase --max-continuous-prompt-tokens or shorten the request."
+                f"effective_max_continuous_prompt_tokens={effective_max_continuous_prompt_tokens} "
+                f"(config={max_continuous_prompt_tokens_config}, policy={long_text_budget_policy}). "
+                "Increase --max-continuous-prompt-tokens, set it to 0 to disable the prompt budget, "
+                "or shorten the request."
             )
         return estimate
 
@@ -1769,9 +1807,9 @@ def create_app(
             max_units = int(request.get("auto_segment_units") or os.environ.get("QWEN3_TTS_OV_WEB_SEGMENT_UNITS") or WEB_AUTO_SEGMENT_UNITS)
         except Exception:
             max_units = WEB_AUTO_SEGMENT_UNITS
-        if max_continuous_prompt_tokens > 0:
+        if effective_max_continuous_prompt_tokens > 0:
             instruct_units = speech_text_unit_count(str(request.get("instruct") or ""))
-            budget_units = max(8, max_continuous_prompt_tokens - instruct_units - 96)
+            budget_units = max(8, effective_max_continuous_prompt_tokens - instruct_units - 96)
             max_units = min(max_units, budget_units)
         segments = split_text_for_streaming(text, max_units=max_units)
         if len(segments) <= 1:
@@ -2437,7 +2475,7 @@ def serve(
     realtime_profile: str = FASTEST_PROFILE_NAME,
     max_concurrent_tts: int = 1,
     long_output_memory_policy: str = "stable",
-    max_continuous_prompt_tokens: int = 1024,
+    max_continuous_prompt_tokens: str | int = "auto",
     usm_retry_count: int = 1,
 ):
     import uvicorn

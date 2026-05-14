@@ -802,7 +802,11 @@ def main(argv=None):
     serve_parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["realtime", "low_latency", "smooth", "balanced", "stable"])
     serve_parser.add_argument("--max-concurrent-tts", type=int, default=1)
     serve_parser.add_argument("--long-output-memory-policy", default="stable", choices=["stable", "fast"])
-    serve_parser.add_argument("--max-continuous-prompt-tokens", type=int, default=1024)
+    serve_parser.add_argument(
+        "--max-continuous-prompt-tokens",
+        default="auto",
+        help="Long full-AR prompt budget: auto, 0 to disable, or a positive token limit.",
+    )
     serve_parser.add_argument("--usm-retry-count", type=int, default=1)
     serve_parser.set_defaults(func=run_serve)
 
