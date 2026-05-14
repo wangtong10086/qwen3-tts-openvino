@@ -119,7 +119,16 @@ build/windows-gpu-npu-benchmark/<scenario>/accelerator-counters.json
 build/windows-gpu-npu-benchmark/<scenario>/accelerator-counters.log
 ```
 
-`benchmark-summary.json` 中的 `summary.accelerator_counters.gpu.utilization_average` 和 `summary.accelerator_counters.npu.utilization_average` 来自 Windows `Get-Counter` 自动发现的 GPU/NPU utilization/usage/busy/load 计数器。计数器名称会因驱动和 Windows 版本不同而变化；如果机器没有暴露相关计数器，结果会标记为 `no_counters`，不会影响普通 benchmark。
+`benchmark-summary.json` 中的 `summary.accelerator_counters.gpu.utilization_average` 和 `summary.accelerator_counters.npu.utilization_average` 来自 Windows `Get-Counter` 自动发现的 GPU/NPU utilization/usage/busy/load 计数器。默认 `-CounterScope server` 会优先按 release server PID 过滤进程级 GPU/NPU engine counter，拿不到进程级路径时回退到系统级并标记 `selected_scope=system_fallback`。需要观察整机负载时使用：
+
+```powershell
+.\scripts\windows_gpu_npu_benchmark.ps1 `
+  -Scenarios gpu_only,npu_decoder,npu_audio `
+  -CollectCounters `
+  -CounterScope system
+```
+
+计数器名称会因驱动和 Windows 版本不同而变化；如果机器没有暴露相关计数器，结果会标记为 `no_counters`，不会影响普通 benchmark。
 
 需要把性能收益变成硬性门禁时，增加阈值参数：
 

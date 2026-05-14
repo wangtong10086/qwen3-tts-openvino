@@ -184,7 +184,7 @@ jobs:
             "--summary-out", "build/windows-gpu-npu-benchmark/benchmark-summary.json"
           )
           if ("${{ github.event.inputs.collect_counters || 'true' }}" -eq "true") {
-            $argsList += "--collect-accelerator-counters"
+            $argsList += @("--collect-accelerator-counters", "--counter-scope", "server")
           }
           uv run python @argsList
 

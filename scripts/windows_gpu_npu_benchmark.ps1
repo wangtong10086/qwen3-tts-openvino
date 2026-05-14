@@ -14,6 +14,8 @@ param(
   [int]$MaxNewTokens = 48,
   [int]$Runs = 2,
   [int]$BasePort = 17990,
+  [ValidateSet("server", "system")]
+  [string]$CounterScope = "server",
   [double]$MinSpeedup = -1,
   [double]$MaxRtfRegression = -1,
   [double]$MinGpuUtilizationReduction = -1,
@@ -80,7 +82,7 @@ if ($MinGpuUtilizationReduction -ge 0) {
   $argsList += @("--min-gpu-utilization-reduction", "$MinGpuUtilizationReduction")
 }
 if ($CollectCounters) {
-  $argsList += "--collect-accelerator-counters"
+  $argsList += @("--collect-accelerator-counters", "--counter-scope", $CounterScope)
 }
 if (-not $Strict) {
   $argsList += "--skip-if-missing-devices"

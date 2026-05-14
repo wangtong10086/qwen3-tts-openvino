@@ -198,6 +198,25 @@ def test_windows_gpu_npu_benchmark_acceptance_checks_speedup_and_regression():
     assert any("npu_audio" in item for item in failures)
 
 
+def test_windows_gpu_npu_benchmark_counter_sampler_targets_server_pid(tmp_path):
+    benchmark = load_script("benchmark_windows_gpu_npu_release.py")
+
+    cmd = benchmark.build_counter_sampler_command(
+        powershell="pwsh",
+        output_json=tmp_path / "counters.json",
+        stop_file=tmp_path / "stop",
+        interval_ms=50,
+        process_id=1234,
+        counter_scope="server",
+    )
+
+    assert "-ProcessId" in cmd
+    assert cmd[cmd.index("-ProcessId") + 1] == "1234"
+    assert "-CounterScope" in cmd
+    assert cmd[cmd.index("-CounterScope") + 1] == "server"
+    assert cmd[cmd.index("-IntervalMs") + 1] == "100"
+
+
 def test_windows_gpu_npu_benchmark_metric_uses_audio_duration():
     benchmark = load_script("benchmark_windows_gpu_npu_release.py")
     stream = {

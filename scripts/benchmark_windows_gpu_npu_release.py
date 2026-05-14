@@ -174,9 +174,11 @@ def build_counter_sampler_command(
     output_json: Path,
     stop_file: Path,
     interval_ms: int,
+    process_id: int | None = None,
+    counter_scope: str = "server",
 ) -> list[str]:
     script = Path(__file__).resolve().with_name("collect_windows_accelerator_counters.ps1")
-    return [
+    cmd = [
         powershell,
         "-NoProfile",
         "-ExecutionPolicy",
@@ -190,6 +192,11 @@ def build_counter_sampler_command(
         "-IntervalMs",
         str(max(100, int(interval_ms))),
     ]
+    if process_id:
+        cmd.extend(["-ProcessId", str(int(process_id))])
+    if counter_scope:
+        cmd.extend(["-CounterScope", str(counter_scope)])
+    return cmd
 
 
 def start_counter_sampler(
@@ -197,6 +204,8 @@ def start_counter_sampler(
     enabled: bool,
     scenario_dir: Path,
     interval_ms: int,
+    process_id: int | None,
+    counter_scope: str,
 ) -> dict | None:
     if not enabled:
         return None
@@ -216,6 +225,8 @@ def start_counter_sampler(
         output_json=output_json,
         stop_file=stop_file,
         interval_ms=interval_ms,
+        process_id=process_id,
+        counter_scope=counter_scope,
     )
     try:
         log = log_path.open("w", encoding="utf-8")
@@ -363,6 +374,7 @@ def run_scenario(
     runs: int,
     collect_accelerator_counters: bool,
     counter_interval_ms: int,
+    counter_scope: str,
 ) -> dict:
     scenario_dir = work_dir / name
     scenario_dir.mkdir(parents=True, exist_ok=True)
@@ -387,6 +399,8 @@ def run_scenario(
             enabled=collect_accelerator_counters,
             scenario_dir=scenario_dir,
             interval_ms=counter_interval_ms,
+            process_id=process.pid,
+            counter_scope=counter_scope,
         )
         try:
             for run_index in range(max(1, int(runs))):
@@ -488,6 +502,15 @@ def main() -> None:
         help="Sampling interval for --collect-accelerator-counters.",
     )
     parser.add_argument(
+        "--counter-scope",
+        default="server",
+        choices=("server", "system"),
+        help=(
+            "Counter scope for --collect-accelerator-counters. "
+            "server filters GPU/NPU engine counters to the release server PID when available."
+        ),
+    )
+    parser.add_argument(
         "--min-gpu-utilization-reduction",
         type=float,
         default=None,
@@ -573,6 +596,7 @@ def main() -> None:
                 runs=args.runs,
                 collect_accelerator_counters=args.collect_accelerator_counters,
                 counter_interval_ms=args.counter_interval_ms,
+                counter_scope=args.counter_scope,
             )
         )
 
@@ -600,6 +624,7 @@ def main() -> None:
             "scenarios": scenario_names,
             "collect_accelerator_counters": args.collect_accelerator_counters,
             "counter_interval_ms": args.counter_interval_ms,
+            "counter_scope": args.counter_scope,
         },
         "results": results,
         "comparison": comparison,

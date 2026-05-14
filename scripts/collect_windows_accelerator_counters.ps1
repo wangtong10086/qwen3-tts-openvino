@@ -3,7 +3,11 @@ param(
   [string]$OutputJson,
   [string]$StopFile = "",
   [int]$IntervalMs = 500,
-  [int]$MaxSamples = 0
+  [int]$MaxSamples = 0,
+  [int]$ProcessId = 0,
+  [ValidateSet("server", "system")]
+  [string]$CounterScope = "server",
+  [switch]$NoFallbackToSystem
 )
 
 $ErrorActionPreference = "Continue"
@@ -63,6 +67,56 @@ function Select-UtilizationPaths {
   return @($pathsByName.Keys | Sort-Object)
 }
 
+function Select-CounterScope {
+  param(
+    [array]$Paths,
+    [int]$TargetProcessId,
+    [string]$Scope,
+    [bool]$FallbackToSystem
+  )
+
+  $allPaths = @($Paths)
+  if ($Scope -ne "server" -or $TargetProcessId -le 0) {
+    return @{
+      paths = $allPaths
+      selected_scope = "system"
+      requested_process_id = $TargetProcessId
+      system_path_count = $allPaths.Count
+      process_path_count = 0
+    }
+  }
+
+  $pidPattern = "(?i)(pid[_ -]*$TargetProcessId|processid[_ -]*$TargetProcessId)"
+  $processPaths = @($allPaths | Where-Object { $_ -match $pidPattern })
+  if ($processPaths.Count -gt 0) {
+    return @{
+      paths = $processPaths
+      selected_scope = "server"
+      requested_process_id = $TargetProcessId
+      system_path_count = $allPaths.Count
+      process_path_count = $processPaths.Count
+    }
+  }
+
+  if ($FallbackToSystem) {
+    return @{
+      paths = $allPaths
+      selected_scope = "system_fallback"
+      requested_process_id = $TargetProcessId
+      system_path_count = $allPaths.Count
+      process_path_count = 0
+    }
+  }
+
+  return @{
+    paths = @()
+    selected_scope = "server_unavailable"
+    requested_process_id = $TargetProcessId
+    system_path_count = $allPaths.Count
+    process_path_count = 0
+  }
+}
+
 function Get-Category {
   param([string]$Path)
   if ($Path -match "(?i)npu") {
@@ -106,7 +160,13 @@ $startedAt = Get-Date
 $rows = @()
 $errors = @()
 $counterSets = Get-UniqueCounterSets
-$paths = Select-UtilizationPaths -CounterSets $counterSets
+$allPaths = Select-UtilizationPaths -CounterSets $counterSets
+$selection = Select-CounterScope `
+  -Paths $allPaths `
+  -TargetProcessId $ProcessId `
+  -Scope $CounterScope `
+  -FallbackToSystem (-not $NoFallbackToSystem)
+$paths = @($selection.paths)
 
 try {
   $sampleIndex = 0
@@ -152,8 +212,13 @@ try {
     ended_at = $endedAt.ToString("o")
     duration_seconds = ($endedAt - $startedAt).TotalSeconds
     interval_ms = $IntervalMs
+    requested_scope = $CounterScope
+    selected_scope = $selection.selected_scope
+    requested_process_id = $ProcessId
     sample_count = @($rows | Select-Object -ExpandProperty sample_index -Unique).Count
     selected_path_count = $paths.Count
+    system_path_count = $selection.system_path_count
+    process_path_count = $selection.process_path_count
     selected_paths = $paths
     counter_sets = @($counterSets | ForEach-Object { $_.CounterSetName } | Sort-Object -Unique)
     gpu = Summarize-Category -Rows $rows -Category "gpu"
@@ -169,8 +234,13 @@ try {
     ended_at = $endedAt.ToString("o")
     duration_seconds = ($endedAt - $startedAt).TotalSeconds
     interval_ms = $IntervalMs
+    requested_scope = $CounterScope
+    selected_scope = $selection.selected_scope
+    requested_process_id = $ProcessId
     sample_count = 0
     selected_path_count = $paths.Count
+    system_path_count = $selection.system_path_count
+    process_path_count = $selection.process_path_count
     selected_paths = $paths
     counter_sets = @($counterSets | ForEach-Object { $_.CounterSetName } | Sort-Object -Unique)
     gpu = $null

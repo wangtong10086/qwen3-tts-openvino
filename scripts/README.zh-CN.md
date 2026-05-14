@@ -23,7 +23,7 @@ uv run qwen3-tts-ov --help
 - `evaluate_long_text_quality.py`: 对长文本 full-AR 候选 profile 做客观检查和可选 Omni 质量评测。
 - `probe_windows_gpu_npu.py`: 检查 Windows OpenVINO `GPU`/`NPU` 可用性，并尝试把 streaming decoder 和可选 Base/VoiceClone audio encoders 编译到 NPU。
 - `windows_gpu_npu_smoke.ps1`: Windows 本地 PowerShell 入口，串联 GPU+NPU probe 和真实 streaming TTS smoke。
-- `collect_windows_accelerator_counters.ps1`: Windows 性能计数器采集器，自动发现 GPU/NPU utilization/usage/busy/load counter，用于验证 NPU offload 是否降低 GPU 负载。
+- `collect_windows_accelerator_counters.ps1`: Windows 性能计数器采集器，自动发现 GPU/NPU utilization/usage/busy/load counter，优先按 release server PID 过滤进程级 counter，用于验证 NPU offload 是否降低 GPU 负载。
 - `benchmark_windows_gpu_npu_release.py`: 对同一个 release 包分别运行 GPU-only、NPU decoder 和 NPU audio，输出首包、RTF、总耗时、实际设备和可选 GPU/NPU 计数器；可选 `--mode voice_clone` 触发参考音频 encoder。
 - `windows_gpu_npu_benchmark.ps1`: Windows 本地 PowerShell benchmark 入口，会构建/下载模型后调用上面的 Python benchmark；传入 `-CollectCounters` 可同时记录 GPU/NPU 利用率。
 
