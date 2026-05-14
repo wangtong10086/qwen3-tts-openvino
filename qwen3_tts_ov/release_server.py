@@ -12,7 +12,7 @@ from .model_download import (
     ensure_release_model_root,
 )
 from .native_codegen import native_library_candidates
-from .profiles import FASTEST_CHUNK_STRATEGY, FASTEST_PROFILE_NAME
+from .profiles import FASTEST_CHUNK_STRATEGY, FASTEST_PROFILE_NAME, KV_CACHE_PROFILE_CHOICES
 from .server import serve
 
 
@@ -89,12 +89,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ov-cache-dir", default=None)
     parser.add_argument("--disable-ov-cache", action="store_true")
     parser.add_argument("--allow-cpu-fallback", action="store_true")
+    parser.add_argument(
+        "--kv-cache-profile",
+        default="auto",
+        choices=KV_CACHE_PROFILE_CHOICES,
+        help="Paged-KV cache memory profile. Default auto uses the fastest default, currently u8.",
+    )
     parser.add_argument("--max-concurrent-tts", type=int, default=1)
     parser.add_argument("--long-output-memory-policy", default="stable", choices=["stable", "fast"])
     parser.add_argument(
         "--max-continuous-prompt-tokens",
         default="auto",
         help="Long full-AR prompt budget: auto, 0 to disable, or a positive token limit.",
+    )
+    parser.add_argument(
+        "--max-vram-ratio",
+        default=None,
+        help="Memory budget ratio used when prompt tokens are auto: 0.8 or 80 means 80%%.",
     )
     parser.add_argument("--usm-retry-count", type=int, default=1)
     return parser
@@ -134,6 +145,8 @@ def main(argv: list[str] | None = None) -> None:
         max_concurrent_tts=args.max_concurrent_tts,
         long_output_memory_policy=args.long_output_memory_policy,
         max_continuous_prompt_tokens=args.max_continuous_prompt_tokens,
+        max_vram_ratio=args.max_vram_ratio,
+        kv_cache_profile=args.kv_cache_profile,
         usm_retry_count=args.usm_retry_count,
     )
 

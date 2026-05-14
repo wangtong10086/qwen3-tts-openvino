@@ -41,14 +41,27 @@ from .profiles import (
     FASTEST_PREFERRED_CACHE_BUCKET,
     FASTEST_PROFILE_NAME,
     FASTEST_REPETITION_PENALTY,
+    KV_CACHE_PROFILE_CHOICES,
     REALTIME_BENCHMARK_PROFILE_OPTIONS,
     REALTIME_PROFILE_CHOICES,
     effective_codegen_unroll,
     apply_realtime_profile,
     is_fastest_or_norepeat_mode,
+    kv_cache_profile_from_options,
+    kv_cache_profile_options,
+    kv_cache_precision_bytes,
+    normalize_kv_cache_profile,
     normalize_codegen_schedule,
 )
-from .runtime import DEFAULT_STREAM_CHUNK_STRATEGIES, OpenVINOQwen3TTS, StreamChunk, build_assistant_text, build_instruct_text
+from .runtime import (
+    DEFAULT_STREAM_CHUNK_STRATEGIES,
+    OpenVINOQwen3TTS,
+    Qwen2BPETokenizer,
+    StreamChunk,
+    build_assistant_text,
+    build_instruct_text,
+    build_ref_text,
+)
 from .web_client import WEB_CLIENT_HTML
 
 
@@ -89,6 +102,9 @@ WEB_AUTO_SEGMENT_PREFIX_FRAMES = 24
 WEB_AUTO_SEGMENT_FADE_MS = 18
 AUTO_CONTINUOUS_PROMPT_TOKENS_GPU = 2048
 AUTO_CONTINUOUS_PROMPT_TOKENS_CPU = 4096
+DEFAULT_MAX_VRAM_RATIO_GPU = 0.80
+DEFAULT_MAX_VRAM_RATIO_CPU = 1.00
+MIN_AUTO_CONTINUOUS_PROMPT_TOKENS = 256
 LONG_AR_REFERENCE_MODE_ENV = "QWEN3_TTS_OV_LONG_AR_REFERENCE_MODE"
 LONG_AR_PROFILE_ENV = "QWEN3_TTS_OV_LONG_AR_PROFILE"
 ENABLE_AUTO_SEGMENT_ENV = "QWEN3_TTS_OV_ENABLE_AUTO_SEGMENT"
@@ -115,25 +131,88 @@ def paged_long_ar_enabled() -> bool:
     return native_paged_kv_requested() and env_enabled(ENABLE_PAGED_LONG_AR_ENV, False)
 
 
+def parse_max_vram_ratio(
+    value: str | int | float | None = None,
+    *,
+    uses_gpu_device: bool = True,
+) -> tuple[float, float]:
+    """Return (fraction, percent) for a memory budget ratio.
+
+    Values in (0, 1] are treated as fractions. Values in (1, 100] are treated
+    as percentages so CLI and web users can type either "0.8" or "80".
+    """
+    default_fraction = DEFAULT_MAX_VRAM_RATIO_GPU if uses_gpu_device else DEFAULT_MAX_VRAM_RATIO_CPU
+    if value is None or str(value).strip().lower() in {"", "auto", "default"}:
+        fraction = default_fraction
+    else:
+        raw = str(value).strip().lower().rstrip("%")
+        try:
+            parsed = float(raw)
+        except ValueError as exc:
+            raise ValueError("--max-vram-ratio must be auto, a fraction in (0, 1], or a percent in (0, 100]") from exc
+        fraction = parsed / 100.0 if parsed > 1.0 else parsed
+    if not (0.0 < fraction <= 1.0):
+        raise ValueError("--max-vram-ratio must be auto, a fraction in (0, 1], or a percent in (0, 100]")
+    return float(fraction), float(round(fraction * 100.0, 4))
+
+
+def continuous_prompt_budget_metadata(
+    config: str | int | None = "auto",
+    *,
+    uses_gpu_device: bool = True,
+    max_vram_ratio: str | int | float | None = None,
+) -> dict:
+    raw = "auto" if config is None else str(config).strip().lower()
+    fraction, percent = parse_max_vram_ratio(max_vram_ratio, uses_gpu_device=uses_gpu_device)
+    base_limit = AUTO_CONTINUOUS_PROMPT_TOKENS_GPU if uses_gpu_device else AUTO_CONTINUOUS_PROMPT_TOKENS_CPU
+    default_fraction = DEFAULT_MAX_VRAM_RATIO_GPU if uses_gpu_device else DEFAULT_MAX_VRAM_RATIO_CPU
+    if raw in {"", "auto"}:
+        limit = int(round(float(base_limit) * fraction / default_fraction))
+        limit = max(MIN_AUTO_CONTINUOUS_PROMPT_TOKENS, limit)
+        device_name = "gpu" if uses_gpu_device else "cpu"
+        policy = f"auto_{device_name}_{percent:g}pct"
+        reported_config = "auto"
+        budget_source = "vram_ratio"
+    else:
+        try:
+            limit = int(raw)
+        except ValueError as exc:
+            raise ValueError("--max-continuous-prompt-tokens must be auto, 0, or a positive integer") from exc
+        if limit < 0:
+            raise ValueError("--max-continuous-prompt-tokens must be auto, 0, or a positive integer")
+        policy = "disabled" if limit == 0 else "explicit"
+        reported_config = str(limit)
+        budget_source = "explicit"
+    return {
+        "max_continuous_prompt_tokens": int(limit),
+        "max_continuous_prompt_tokens_config": reported_config,
+        "effective_max_continuous_prompt_tokens": int(limit),
+        "long_text_budget_policy": policy,
+        "max_vram_ratio": float(fraction),
+        "max_vram_percent": float(percent),
+        "continuous_prompt_budget_base_tokens": int(base_limit),
+        "continuous_prompt_budget_default_vram_ratio": float(default_fraction),
+        "continuous_prompt_budget_source": budget_source,
+    }
+
+
 def resolve_continuous_prompt_budget(
     config: str | int | None = "auto",
     *,
     uses_gpu_device: bool = True,
+    max_vram_ratio: str | int | float | None = None,
 ) -> tuple[str, int, str]:
     """Return reported config, effective token limit, and policy name."""
-    raw = "auto" if config is None else str(config).strip().lower()
-    if raw in {"", "auto"}:
-        limit = AUTO_CONTINUOUS_PROMPT_TOKENS_GPU if uses_gpu_device else AUTO_CONTINUOUS_PROMPT_TOKENS_CPU
-        device_name = "gpu" if uses_gpu_device else "cpu"
-        return "auto", int(limit), f"auto_{device_name}"
-    try:
-        limit = int(raw)
-    except ValueError as exc:
-        raise ValueError("--max-continuous-prompt-tokens must be auto, 0, or a positive integer") from exc
-    if limit < 0:
-        raise ValueError("--max-continuous-prompt-tokens must be auto, 0, or a positive integer")
-    policy = "disabled" if limit == 0 else "explicit"
-    return str(limit), int(limit), policy
+    metadata = continuous_prompt_budget_metadata(
+        config,
+        uses_gpu_device=uses_gpu_device,
+        max_vram_ratio=max_vram_ratio,
+    )
+    return (
+        str(metadata["max_continuous_prompt_tokens_config"]),
+        int(metadata["effective_max_continuous_prompt_tokens"]),
+        str(metadata["long_text_budget_policy"]),
+    )
 
 
 def speech_text_units(token: str) -> int:
@@ -675,7 +754,7 @@ def explicit_long_text_profile(name: str | None) -> dict | None:
         },
         "profile_env": {
             "native_codegen_device": "GPU",
-            "native_paged_kv_precision": "f16",
+            "native_paged_kv_precision": FASTEST_NATIVE_PAGED_KV_PRECISION,
             "native_paged_kv_block_size": "16",
             "native_paged_kv_gqa": "1",
             "native_paged_kv_split_subcode": "1",
@@ -1100,6 +1179,8 @@ def create_app(
     max_concurrent_tts: int = 1,
     long_output_memory_policy: str = "stable",
     max_continuous_prompt_tokens: str | int = "auto",
+    max_vram_ratio: str | int | float | None = None,
+    kv_cache_profile: str = "auto",
     usm_retry_count: int = 1,
 ):
     from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -1113,15 +1194,20 @@ def create_app(
     uses_gpu_device = any("GPU" in item.upper() for item in requested_devices)
     if realtime_profile not in REALTIME_PROFILE_CHOICES:
         raise ValueError(f"realtime_profile must be one of {', '.join(REALTIME_PROFILE_CHOICES)}")
+    kv_cache_profile = normalize_kv_cache_profile(kv_cache_profile)
+    kv_cache_options = kv_cache_profile_options(kv_cache_profile)
     long_output_memory_policy = str(long_output_memory_policy or "stable").strip().lower()
     if long_output_memory_policy not in {"stable", "fast"}:
         raise ValueError("long_output_memory_policy must be stable or fast")
     max_concurrent_tts = max(1, int(max_concurrent_tts))
-    (
-        max_continuous_prompt_tokens_config,
-        effective_max_continuous_prompt_tokens,
-        long_text_budget_policy,
-    ) = resolve_continuous_prompt_budget(max_continuous_prompt_tokens, uses_gpu_device=uses_gpu_device)
+    default_budget_metadata = continuous_prompt_budget_metadata(
+        max_continuous_prompt_tokens,
+        uses_gpu_device=uses_gpu_device,
+        max_vram_ratio=max_vram_ratio,
+    )
+    max_continuous_prompt_tokens_config = str(default_budget_metadata["max_continuous_prompt_tokens_config"])
+    effective_max_continuous_prompt_tokens = int(default_budget_metadata["effective_max_continuous_prompt_tokens"])
+    long_text_budget_policy = str(default_budget_metadata["long_text_budget_policy"])
     usm_retry_count = max(0, int(usm_retry_count))
     auto_profile = select_auto_realtime_profile() if realtime_profile == "auto" else None
     if auto_profile:
@@ -1132,6 +1218,40 @@ def create_app(
         preferred_cache_bucket = auto_profile.get("preferred_cache_bucket", preferred_cache_bucket)
     elif realtime_profile == "auto":
         realtime_profile = FASTEST_PROFILE_NAME
+
+    locked_kv_cache_env: dict[str, str] = {}
+
+    def apply_kv_cache_env() -> None:
+        precision = kv_cache_options.get(
+            "native_paged_kv_precision",
+            locked_kv_cache_env.get("native_paged_kv_precision")
+            or os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION")
+            or FASTEST_NATIVE_PAGED_KV_PRECISION,
+        )
+        cache_input_precision = kv_cache_options.get(
+            "native_paged_kv_cache_input_precision",
+            locked_kv_cache_env.get("native_paged_kv_cache_input_precision")
+            or os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_INPUT_PRECISION")
+            or "f32",
+        )
+        block_size = kv_cache_options.get(
+            "native_paged_kv_block_size",
+            locked_kv_cache_env.get("native_paged_kv_block_size")
+            or os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE")
+            or FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE,
+        )
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION"] = str(precision)
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_INPUT_PRECISION"] = str(cache_input_precision)
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE"] = str(block_size)
+        if not locked_kv_cache_env:
+            locked_kv_cache_env.update(
+                {
+                    "native_paged_kv_precision": str(precision),
+                    "native_paged_kv_cache_input_precision": str(cache_input_precision),
+                    "native_paged_kv_block_size": str(block_size),
+                }
+            )
+
     if realtime_profile in {FASTEST_PROFILE_NAME, "auto"}:
         codegen_unroll = str(FASTEST_CODEGEN_UNROLL)
         codegen_schedule = FASTEST_CODEGEN_SCHEDULE
@@ -1142,8 +1262,24 @@ def create_app(
         os.environ["QWEN3_TTS_OV_NATIVE_BUFFER_REUSE"] = "1" if FASTEST_NATIVE_BUFFER_REUSE == "on" else "0"
         os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV"] = FASTEST_NATIVE_PAGED_KV
         os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA"] = "1" if FASTEST_NATIVE_PAGED_KV_GQA == "on" else "0"
-        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION"] = FASTEST_NATIVE_PAGED_KV_PRECISION
-        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE"] = str(FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE)
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION"] = str(
+            kv_cache_options.get(
+                "native_paged_kv_precision",
+                os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION") or FASTEST_NATIVE_PAGED_KV_PRECISION,
+            )
+        )
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_INPUT_PRECISION"] = str(
+            kv_cache_options.get(
+                "native_paged_kv_cache_input_precision",
+                os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_INPUT_PRECISION") or "f32",
+            )
+        )
+        os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE"] = str(
+            kv_cache_options.get(
+                "native_paged_kv_block_size",
+                os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE") or FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE,
+            )
+        )
         os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE"] = (
             "1" if FASTEST_NATIVE_PAGED_KV_SPLIT_SUBCODE == "on" else "0"
         )
@@ -1153,6 +1289,21 @@ def create_app(
         os.environ["QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE"] = (
             FASTEST_NATIVE_CODEGEN_DEVICE if uses_gpu_device else str(device or "CPU")
         )
+    apply_kv_cache_env()
+    effective_kv_cache_precision = os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION") or FASTEST_NATIVE_PAGED_KV_PRECISION
+    effective_kv_cache_input_precision = os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_INPUT_PRECISION") or "f32"
+    effective_kv_cache_block_size = os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE") or str(FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE)
+    effective_kv_cache_profile = (
+        kv_cache_profile
+        if kv_cache_profile != "auto"
+        else kv_cache_profile_from_options(
+            effective_kv_cache_precision,
+            effective_kv_cache_input_precision,
+            effective_kv_cache_block_size,
+        )
+    )
+    effective_kv_cache_bytes_per_element = kv_cache_precision_bytes(effective_kv_cache_precision)
+    effective_kv_cache_relative_to_fp16 = float(effective_kv_cache_bytes_per_element) / 2.0
     if long_output_memory_policy == "stable":
         if uses_gpu_device:
             os.environ["QWEN3_TTS_OV_NATIVE_GPU_LARGE_ALLOCATIONS"] = "1"
@@ -1226,11 +1377,13 @@ def create_app(
         "native_prompt_device": os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE") or "CPU",
         "native_paged_kv": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV") or "off",
         "native_paged_kv_gqa": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA") or "on",
-        "native_paged_kv_precision": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION") or "f16",
-        "native_paged_kv_cache_input_precision": (
-            os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_INPUT_PRECISION") or "f32"
-        ),
-        "native_paged_kv_block_size": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE") or "8",
+        "kv_cache_profile": effective_kv_cache_profile,
+        "requested_kv_cache_profile": kv_cache_profile,
+        "native_paged_kv_precision": effective_kv_cache_precision,
+        "native_paged_kv_cache_input_precision": effective_kv_cache_input_precision,
+        "native_paged_kv_block_size": effective_kv_cache_block_size,
+        "kv_cache_bytes_per_element": effective_kv_cache_bytes_per_element,
+        "kv_cache_relative_to_fp16": effective_kv_cache_relative_to_fp16,
         "native_paged_kv_unroll": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_UNROLL") or "1",
         "native_paged_kv_experimental_unroll": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_EXPERIMENTAL_UNROLL") or "0",
         "native_paged_kv_subcode_attention": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SUBCODE_ATTENTION") or "auto",
@@ -1253,12 +1406,24 @@ def create_app(
     }
     app.state.memory = {
         "long_output_memory_policy": long_output_memory_policy,
+        "kv_cache_profile": effective_kv_cache_profile,
+        "requested_kv_cache_profile": kv_cache_profile,
+        "native_paged_kv_precision": effective_kv_cache_precision,
+        "native_paged_kv_cache_input_precision": effective_kv_cache_input_precision,
+        "native_paged_kv_block_size": effective_kv_cache_block_size,
+        "kv_cache_bytes_per_element": effective_kv_cache_bytes_per_element,
+        "kv_cache_relative_to_fp16": effective_kv_cache_relative_to_fp16,
         "max_concurrent_tts": max_concurrent_tts,
         "active_tts_requests": 0,
         "max_continuous_prompt_tokens": effective_max_continuous_prompt_tokens,
         "max_continuous_prompt_tokens_config": max_continuous_prompt_tokens_config,
         "effective_max_continuous_prompt_tokens": effective_max_continuous_prompt_tokens,
         "long_text_budget_policy": long_text_budget_policy,
+        "max_vram_ratio": default_budget_metadata["max_vram_ratio"],
+        "max_vram_percent": default_budget_metadata["max_vram_percent"],
+        "continuous_prompt_budget_base_tokens": default_budget_metadata["continuous_prompt_budget_base_tokens"],
+        "continuous_prompt_budget_default_vram_ratio": default_budget_metadata["continuous_prompt_budget_default_vram_ratio"],
+        "continuous_prompt_budget_source": default_budget_metadata["continuous_prompt_budget_source"],
         "usm_retry_count": usm_retry_count,
         "last_usm_error": None,
         "last_usm_retry_at": None,
@@ -1285,11 +1450,13 @@ def create_app(
         "native_prompt_device": os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE") or "CPU",
         "native_paged_kv": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV") or "off",
         "native_paged_kv_gqa": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA") or "on",
-        "native_paged_kv_precision": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION") or "f16",
-        "native_paged_kv_cache_input_precision": (
-            os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_INPUT_PRECISION") or "f32"
-        ),
-        "native_paged_kv_block_size": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE") or "8",
+        "kv_cache_profile": effective_kv_cache_profile,
+        "requested_kv_cache_profile": kv_cache_profile,
+        "native_paged_kv_precision": effective_kv_cache_precision,
+        "native_paged_kv_cache_input_precision": effective_kv_cache_input_precision,
+        "native_paged_kv_block_size": effective_kv_cache_block_size,
+        "kv_cache_bytes_per_element": effective_kv_cache_bytes_per_element,
+        "kv_cache_relative_to_fp16": effective_kv_cache_relative_to_fp16,
         "native_paged_kv_unroll": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_UNROLL") or "1",
         "native_paged_kv_experimental_unroll": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_EXPERIMENTAL_UNROLL") or "0",
         "native_paged_kv_subcode_attention": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SUBCODE_ATTENTION") or "auto",
@@ -1311,6 +1478,11 @@ def create_app(
         "max_continuous_prompt_tokens_config": max_continuous_prompt_tokens_config,
         "effective_max_continuous_prompt_tokens": effective_max_continuous_prompt_tokens,
         "long_text_budget_policy": long_text_budget_policy,
+        "max_vram_ratio": default_budget_metadata["max_vram_ratio"],
+        "max_vram_percent": default_budget_metadata["max_vram_percent"],
+        "continuous_prompt_budget_base_tokens": default_budget_metadata["continuous_prompt_budget_base_tokens"],
+        "continuous_prompt_budget_default_vram_ratio": default_budget_metadata["continuous_prompt_budget_default_vram_ratio"],
+        "continuous_prompt_budget_source": default_budget_metadata["continuous_prompt_budget_source"],
         "paged_kv": native_paged_kv_requested(),
         "paged_kv_backend": "native_paged_attention" if native_paged_kv_requested() else "unavailable",
         "paged_kv_unavailable_reason": "" if native_paged_kv_requested() else PAGED_KV_UNAVAILABLE_REASON,
@@ -1402,6 +1574,7 @@ def create_app(
             )
             if selected_quality_profile:
                 apply_long_text_profile_env(selected_quality_profile)
+                apply_kv_cache_env()
                 profile_runtime = selected_quality_profile.get("runtime") or {}
                 runtime_mode = profile_runtime.get("mode", runtime_mode)
                 runtime_cache_kernel = profile_runtime.get("cache_kernel", runtime_cache_kernel)
@@ -1557,6 +1730,138 @@ def create_app(
             prefer_paged_kv=prefer_paged_kv,
         )
 
+    tokenizer_cache: dict[str, Qwen2BPETokenizer] = {}
+
+    def model_dir_from_manifest(ir_dir: Path, manifest: dict) -> Path:
+        model_dir_value = manifest.get("model_dir")
+        if not model_dir_value:
+            raise ValueError(f"manifest missing model_dir: {ir_dir / 'manifest.json'}")
+        model_dir_path = Path(model_dir_value)
+        if not model_dir_path.is_absolute():
+            model_dir_path = ir_dir / model_dir_path
+        return model_dir_path
+
+    def tokenizer_for_ir_dir(ir_dir: Path, manifest: dict) -> Qwen2BPETokenizer:
+        model_dir_path = model_dir_from_manifest(ir_dir, manifest)
+        key = str(model_dir_path.resolve())
+        tokenizer = tokenizer_cache.get(key)
+        if tokenizer is None:
+            tokenizer = Qwen2BPETokenizer(str(model_dir_path))
+            tokenizer_cache[key] = tokenizer
+        return tokenizer
+
+    def ids_from_manifest(manifest: dict) -> dict:
+        ids = manifest.get("ids")
+        if not isinstance(ids, dict):
+            raise ValueError("manifest missing ids")
+        return ids
+
+    def language_codec_prefill_from_ids(ids: dict, language: str, speaker: str | None = None) -> list[int]:
+        language_key = str(language or "Auto").lower()
+        speaker_key = str(speaker).lower() if speaker else None
+        dialect_map = ids.get("spk_is_dialect") or {}
+        if (
+            language_key in {"chinese", "auto"}
+            and speaker_key
+            and isinstance(dialect_map, dict)
+            and dialect_map.get(speaker_key) not in (None, False, "")
+        ):
+            language_key = str(dialect_map[speaker_key]).lower()
+        if language_key == "auto":
+            return [
+                int(ids["codec_nothink_id"]),
+                int(ids["codec_think_bos_id"]),
+                int(ids["codec_think_eos_id"]),
+            ]
+        language_ids = ids.get("codec_language_id") or {}
+        if language_key not in language_ids:
+            raise ValueError(f"unknown language={language!r}; available languages: {sorted(language_ids.keys())}")
+        return [
+            int(ids["codec_think_id"]),
+            int(ids["codec_think_bos_id"]),
+            int(language_ids[language_key]),
+            int(ids["codec_think_eos_id"]),
+        ]
+
+    def request_budget_metadata(request: dict | None = None) -> dict:
+        request = request or {}
+        request_config = request.get("max_continuous_prompt_tokens", max_continuous_prompt_tokens)
+        request_ratio = request.get("max_vram_ratio", request.get("max_vram_percent", max_vram_ratio))
+        return continuous_prompt_budget_metadata(
+            request_config,
+            uses_gpu_device=uses_gpu_device,
+            max_vram_ratio=request_ratio,
+        )
+
+    def exact_request_prompt_metadata(request: dict, gen_kwargs: dict | None = None) -> dict:
+        mode_name = normalize_mode(request.get("mode"))
+        ir_dir = resolve_mode_ir_dir(mode_name)
+        manifest = load_manifest(ir_dir)
+        tokenizer = tokenizer_for_ir_dir(ir_dir, manifest)
+        ids = ids_from_manifest(manifest)
+        hidden_size = int(os.environ.get("QWEN3_TTS_OV_PROMPT_HIDDEN_SIZE_ESTIMATE") or 2048)
+        text = str(request.get("text") or request.get("input") or "")
+        instruct = str(request.get("instruct") or request.get("instructions") or "")
+        language = str(request.get("language") or "Auto")
+        speaker = str(request.get("speaker") or "") or None
+        generation = gen_kwargs or generation_kwargs(request, default_repetition_penalty=default_repetition_penalty)
+        try:
+            max_new_tokens = int(generation.get("max_new_tokens", FASTEST_SHORT_OUTPUT_MAX_NEW_TOKENS))
+        except Exception:
+            max_new_tokens = FASTEST_SHORT_OUTPUT_MAX_NEW_TOKENS
+
+        text_ids = tokenizer.encode(build_assistant_text(text))
+        instruct_ids: list[int] = []
+        ref_text_ids: list[int] = []
+        codec_prefill: list[int] = []
+        prompt_len_exact = True
+        if mode_name == "voice_design":
+            instruct_ids = tokenizer.encode(build_instruct_text(instruct)) if instruct else []
+            codec_prefill = language_codec_prefill_from_ids(ids, language, speaker=None)
+            prompt_len = int(len(instruct_ids) + len(text_ids) + len(codec_prefill) - 3)
+        elif mode_name == "custom_voice":
+            instruct_ids = tokenizer.encode(build_instruct_text(instruct)) if instruct else []
+            codec_prefill = language_codec_prefill_from_ids(ids, language, speaker=speaker)
+            prompt_len = int(len(instruct_ids) + len(text_ids) + len(codec_prefill) - 3)
+        else:
+            ref_text = str(request.get("ref_text") or "")
+            ref_text_ids = tokenizer.encode(build_ref_text(ref_text)) if ref_text else []
+            prompt_len = int(len(ref_text_ids) + len(text_ids))
+            prompt_len_exact = False
+
+        prompt_len = max(1, int(prompt_len))
+        budget = request_budget_metadata(request)
+        effective_budget = int(budget["effective_max_continuous_prompt_tokens"])
+        return {
+            "tokenizer_exact": True,
+            "prompt_len_exact": bool(prompt_len_exact),
+            "prompt_len": int(prompt_len),
+            "text_tokens": int(len(text_ids)),
+            "instruct_tokens": int(len(instruct_ids)),
+            "ref_text_tokens": int(len(ref_text_ids)),
+            "codec_prefill_tokens": int(len(codec_prefill)),
+            "prompt_embed_bytes": int(prompt_len * hidden_size * 4),
+            "max_new_tokens": int(max_new_tokens),
+            "total_requested_tokens": int(prompt_len + max_new_tokens),
+            "over_prompt_budget": bool(effective_budget > 0 and prompt_len > effective_budget),
+            "remaining_prompt_tokens": int(max(0, effective_budget - prompt_len)) if effective_budget > 0 else None,
+            **budget,
+        }
+
+    def request_prompt_metadata(request: dict, gen_kwargs: dict | None = None) -> dict:
+        metadata = request_prompt_memory_estimate(request, gen_kwargs)
+        try:
+            metadata.update(exact_request_prompt_metadata(request, gen_kwargs))
+        except Exception as exc:
+            metadata.update(
+                {
+                    "tokenizer_exact": False,
+                    "tokenizer_error": str(exc),
+                    **request_budget_metadata(request),
+                }
+            )
+        return metadata
+
     def request_uses_continuous_long_output(request: dict, gen_kwargs: dict | None = None) -> bool:
         if request.get("force_short_segment_pipeline", False):
             return False
@@ -1628,6 +1933,8 @@ def create_app(
 
     def validate_continuous_prompt_budget(runtime, request: dict, gen_kwargs: dict, long_output: bool) -> dict:
         estimate = request_prompt_memory_estimate(request, gen_kwargs)
+        budget = request_budget_metadata(request)
+        estimate.update(budget)
         if not long_output:
             return estimate
         mode_name = normalize_mode(request.get("mode"))
@@ -1642,16 +1949,19 @@ def create_app(
             prompt_len = int(exact.get("prompt_len") or estimate["prompt_tokens_estimate"])
         else:
             prompt_len = int(estimate["prompt_tokens_estimate"])
+        effective_budget = int(budget["effective_max_continuous_prompt_tokens"])
         if (
-            effective_max_continuous_prompt_tokens > 0
-            and prompt_len > effective_max_continuous_prompt_tokens
+            effective_budget > 0
+            and prompt_len > effective_budget
         ):
             raise ValueError(
                 f"continuous long-output prompt has {prompt_len} tokens, "
-                f"effective_max_continuous_prompt_tokens={effective_max_continuous_prompt_tokens} "
-                f"(config={max_continuous_prompt_tokens_config}, policy={long_text_budget_policy}). "
-                "Increase --max-continuous-prompt-tokens, set it to 0 to disable the prompt budget, "
-                "or shorten the request."
+                f"effective_max_continuous_prompt_tokens={effective_budget} "
+                f"(config={budget['max_continuous_prompt_tokens_config']}, "
+                f"policy={budget['long_text_budget_policy']}, "
+                f"max_vram_percent={budget['max_vram_percent']:g}). "
+                "Increase --max-continuous-prompt-tokens, raise --max-vram-ratio, "
+                "set max_continuous_prompt_tokens to 0 to disable the prompt budget, or shorten the request."
             )
         return estimate
 
@@ -1807,9 +2117,11 @@ def create_app(
             max_units = int(request.get("auto_segment_units") or os.environ.get("QWEN3_TTS_OV_WEB_SEGMENT_UNITS") or WEB_AUTO_SEGMENT_UNITS)
         except Exception:
             max_units = WEB_AUTO_SEGMENT_UNITS
-        if effective_max_continuous_prompt_tokens > 0:
+        segment_budget = request_budget_metadata(request)
+        segment_effective_prompt_tokens = int(segment_budget["effective_max_continuous_prompt_tokens"])
+        if segment_effective_prompt_tokens > 0:
             instruct_units = speech_text_unit_count(str(request.get("instruct") or ""))
-            budget_units = max(8, effective_max_continuous_prompt_tokens - instruct_units - 96)
+            budget_units = max(8, segment_effective_prompt_tokens - instruct_units - 96)
             max_units = min(max_units, budget_units)
         segments = split_text_for_streaming(text, max_units=max_units)
         if len(segments) <= 1:
@@ -2139,11 +2451,13 @@ def create_app(
                 "native_paged_kv_gqa": getattr(runtime, "native_paged_kv_gqa_override", None)
                 or os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA")
                 or "on",
-                "native_paged_kv_precision": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION") or "f16",
-                "native_paged_kv_cache_input_precision": (
-                    os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_INPUT_PRECISION") or "f32"
-                ),
-                "native_paged_kv_block_size": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE") or "8",
+                "kv_cache_profile": effective_kv_cache_profile,
+                "requested_kv_cache_profile": kv_cache_profile,
+                "native_paged_kv_precision": effective_kv_cache_precision,
+                "native_paged_kv_cache_input_precision": effective_kv_cache_input_precision,
+                "native_paged_kv_block_size": effective_kv_cache_block_size,
+                "kv_cache_bytes_per_element": effective_kv_cache_bytes_per_element,
+                "kv_cache_relative_to_fp16": effective_kv_cache_relative_to_fp16,
                 "native_paged_kv_static_decode": (
                     os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE") or "off"
                 ),
@@ -2225,6 +2539,22 @@ def create_app(
             headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
         )
 
+    @app.post("/v1/tts/tokenize")
+    def tts_tokenize(request: dict):
+        try:
+            gen_kwargs = generation_kwargs(request, default_repetition_penalty=default_repetition_penalty)
+            metadata = request_prompt_metadata(request, gen_kwargs)
+            metadata.update(
+                {
+                    "type": "token_budget",
+                    "mode": normalize_mode(request.get("mode")),
+                    "language": str(request.get("language") or "Auto"),
+                }
+            )
+            return metadata
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/v1/tts")
     def tts(request: dict):
         try:
@@ -2251,8 +2581,8 @@ def create_app(
                         "format": "pcm_s16le",
                         "started_at": started,
                         **metadata,
-                        **request_prompt_memory_estimate(request, metadata_gen_kwargs),
                         **runtime_stream_metadata,
+                        **request_prompt_metadata(request, metadata_gen_kwargs),
                         **continuity,
                         "long_ar_do_sample": bool(metadata_gen_kwargs.get("do_sample", False)),
                         "active_tts_requests": app.state.memory["active_tts_requests"],
@@ -2402,8 +2732,8 @@ def create_app(
                     "format": "pcm_s16le",
                     "started_at": started,
                     **metadata,
-                    **request_prompt_memory_estimate(request, metadata_gen_kwargs),
                     **runtime_stream_metadata,
+                    **request_prompt_metadata(request, metadata_gen_kwargs),
                     **continuity,
                     "long_ar_do_sample": bool(metadata_gen_kwargs.get("do_sample", False)),
                     "active_tts_requests": app.state.memory["active_tts_requests"],
@@ -2476,6 +2806,8 @@ def serve(
     max_concurrent_tts: int = 1,
     long_output_memory_policy: str = "stable",
     max_continuous_prompt_tokens: str | int = "auto",
+    max_vram_ratio: str | int | float | None = None,
+    kv_cache_profile: str = "auto",
     usm_retry_count: int = 1,
 ):
     import uvicorn
@@ -2505,6 +2837,8 @@ def serve(
         max_concurrent_tts=max_concurrent_tts,
         long_output_memory_policy=long_output_memory_policy,
         max_continuous_prompt_tokens=max_continuous_prompt_tokens,
+        max_vram_ratio=max_vram_ratio,
+        kv_cache_profile=kv_cache_profile,
         usm_retry_count=usm_retry_count,
     )
     uvicorn.run(app, host=host, port=port)

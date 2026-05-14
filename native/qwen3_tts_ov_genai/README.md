@@ -65,7 +65,12 @@ Low-level flags remain available for diagnostics:
 - `--native-paged-kv-gqa on|off`
 - `--native-paged-kv-split-subcode on|off`
 - `--native-paged-kv-block-size N`
-- `--native-paged-kv-precision f16|bf16|f32`
+- `--native-paged-kv-precision f16|bf16|u8`
+- `--kv-cache-profile fp16|bf16|u8|u8-input|u8-all` from the Python CLI is the
+  preferred public switch for memory experiments. The production default is
+  `u8`: it stores paged-KV cache in 8-bit form while keeping cache inputs at
+  FP32; it reduces KV cache storage to roughly half of FP16 but does not mean
+  every attention operator runs as INT8.
 - `--native-paged-kv-score-aggregation on|off`
 
 Use these flags only for A/B testing. Production should use `--realtime-profile fastest`.

@@ -94,6 +94,19 @@ uv run python -m qwen3_tts_ov serve \
 curl http://127.0.0.1:17860/health
 ```
 
+默认 `fastest` 路径会启用 U8 paged-KV cache。需要显式确认或降低长文本 token 预算使用的显存比例时：
+
+```bash
+uv run python -m qwen3_tts_ov serve \
+  --model-root openvino \
+  --device GPU \
+  --realtime-profile fastest \
+  --kv-cache-profile u8 \
+  --max-vram-ratio 70
+```
+
+`/health` 中的 `warmup.kv_cache_profile`、`memory.native_paged_kv_precision` 和 `memory.kv_cache_relative_to_fp16` 会显示实际生效配置。
+
 Web Demo：
 
 ```text

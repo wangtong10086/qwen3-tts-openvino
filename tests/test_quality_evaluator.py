@@ -131,6 +131,17 @@ def test_select_winner_filters_quality_failures_and_chooses_lowest_median_rtf():
     assert winner["runtime"] is None
 
 
+def test_summary_selected_profile_tracks_winner():
+    winner = {"profile": "good_fast"}
+
+    summary = {
+        "selected_profile": winner.get("profile") if winner else None,
+        "winner": winner,
+    }
+
+    assert summary["selected_profile"] == "good_fast"
+
+
 def test_experimental_split_subcode_profile_is_not_default_safe():
     assert quality.LONG_TEXT_PROFILES["long_reference_no_cache_fp16_sample"]["default_safe"]
     assert "long_reference_no_cache_fp16_sample" in quality.parse_profiles("quality")

@@ -98,7 +98,7 @@ LONG_TEXT_PROFILES: dict[str, dict[str, Any]] = {
         },
         "env": {
             "native_codegen_device": "GPU",
-            "native_paged_kv_precision": "f16",
+            "native_paged_kv_precision": "u8",
             "native_paged_kv_block_size": "16",
             "native_paged_kv_gqa": "0",
             "native_paged_kv_split_subcode": "0",
@@ -130,7 +130,7 @@ LONG_TEXT_PROFILES: dict[str, dict[str, Any]] = {
         },
         "env": {
             "native_codegen_device": "GPU",
-            "native_paged_kv_precision": "f16",
+            "native_paged_kv_precision": "u8",
             "native_paged_kv_block_size": "16",
             "native_paged_kv_gqa": "1",
             "native_paged_kv_split_subcode": "1",
@@ -163,7 +163,7 @@ LONG_TEXT_PROFILES: dict[str, dict[str, Any]] = {
         },
         "env": {
             "native_codegen_device": "GPU",
-            "native_paged_kv_precision": "f16",
+            "native_paged_kv_precision": "u8",
             "native_paged_kv_block_size": "16",
             "native_paged_kv_gqa": "1",
             "native_paged_kv_split_subcode": "1",
@@ -192,7 +192,7 @@ LONG_TEXT_PROFILES: dict[str, dict[str, Any]] = {
         },
         "env": {
             "native_codegen_device": "GPU",
-            "native_paged_kv_precision": "f16",
+            "native_paged_kv_precision": "u8",
             "native_paged_kv_block_size": "16",
             "native_paged_kv_gqa": "0",
             "native_paged_kv_split_subcode": "0",
@@ -220,7 +220,7 @@ LONG_TEXT_PROFILES: dict[str, dict[str, Any]] = {
         },
         "env": {
             "native_codegen_device": "GPU",
-            "native_paged_kv_precision": "f16",
+            "native_paged_kv_precision": "u8",
             "native_paged_kv_block_size": "16",
             "native_paged_kv_gqa": "1",
             "native_paged_kv_split_subcode": "0",
@@ -298,7 +298,7 @@ LONG_TEXT_PROFILES: dict[str, dict[str, Any]] = {
         },
         "env": {
             "native_codegen_device": "GPU",
-            "native_paged_kv_precision": "f16",
+            "native_paged_kv_precision": "u8",
             "native_paged_kv_block_size": "16",
             "native_paged_kv_gqa": "1",
             "native_paged_kv_split_subcode": "1",
@@ -1190,6 +1190,7 @@ def main(argv: list[str] | None = None) -> int:
 
     winner = select_winner(results)
     summary = {
+        "selected_profile": winner.get("profile") if winner else None,
         "text_units": speech_text_unit_count(text),
         "max_new_tokens": max_new_tokens,
         "profiles": profiles,

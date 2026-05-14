@@ -546,3 +546,29 @@ def test_fastest_profile_uses_cpu_native_device_for_cpu_server(monkeypatch, tmp_
 
     assert health["warmup"]["native_codegen_device"] == "CPU"
     assert "QWEN3_TTS_OV_NATIVE_GPU_LARGE_ALLOCATIONS" not in os.environ
+
+
+def test_fastest_server_reports_u8_kv_cache_profile(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from qwen3_tts_ov import server
+
+    monkeypatch.delenv("QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION", raising=False)
+    monkeypatch.delenv("QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_INPUT_PRECISION", raising=False)
+    monkeypatch.delenv("QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE", raising=False)
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        realtime_profile="fastest",
+        device="GPU",
+        kv_cache_profile="u8",
+    )
+    client = fastapi_testclient.TestClient(app)
+
+    health = client.get("/health").json()
+
+    assert health["warmup"]["kv_cache_profile"] == "u8"
+    assert health["warmup"]["native_paged_kv_precision"] == "u8"
+    assert health["warmup"]["native_paged_kv_cache_input_precision"] == "f32"
+    assert health["warmup"]["kv_cache_bytes_per_element"] == 1
+    assert health["warmup"]["kv_cache_relative_to_fp16"] == 0.5
+    assert health["memory"]["kv_cache_profile"] == "u8"

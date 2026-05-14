@@ -1,12 +1,17 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from qwen3_tts_ov.cache import build_ov_cache_config, default_ov_cache_root, normalize_ov_cache_mode, resolve_ov_cache_dir
 from qwen3_tts_ov.cache_warmup import collect_warmup_tasks, select_buckets
+from qwen3_tts_ov.cli import apply_profile_defaults
 from qwen3_tts_ov.manifest import resolve_ir_dir
 from qwen3_tts_ov.profiles import (
     effective_codegen_unroll,
+    kv_cache_profile_from_options,
+    kv_cache_profile_options,
+    kv_cache_precision_bytes,
     effective_runtime_options,
     missing_graph_variant_message,
     scheduled_codegen_unrolls,
@@ -27,6 +32,76 @@ def test_build_ov_cache_config_can_disable_cache(tmp_path):
         "CACHE_MODE": "OPTIMIZE_SIZE",
     }
     assert build_ov_cache_config(tmp_path, disable_ov_cache=True) == {}
+
+
+def test_kv_cache_profiles_map_to_runtime_precision():
+    assert kv_cache_profile_options("auto") == {}
+    assert kv_cache_profile_options("u8") == {
+        "native_paged_kv_precision": "u8",
+        "native_paged_kv_cache_input_precision": "f32",
+        "native_paged_kv_block_size": 16,
+    }
+    assert kv_cache_profile_options("u8-all")["native_paged_kv_cache_input_precision"] == "u8"
+    assert kv_cache_profile_from_options("u8", "f32", 16) == "u8"
+    assert kv_cache_profile_from_options("f16", "u8", 16) == "u8-input"
+    assert kv_cache_precision_bytes("u8") == 1
+    assert kv_cache_precision_bytes("f16") == 2
+
+
+def test_fastest_profile_defaults_to_u8_kv_cache():
+    args = SimpleNamespace(
+        realtime_profile="fastest",
+        native_paged_kv=None,
+        native_pipeline=None,
+        native_paged_kv_precision=None,
+        native_paged_kv_cache_input_precision=None,
+        native_paged_kv_block_size=None,
+        kv_cache_profile="auto",
+    )
+
+    apply_profile_defaults(args)
+
+    assert args.native_paged_kv == "require"
+    assert args.native_paged_kv_precision == "u8"
+    assert args.native_paged_kv_cache_input_precision == "f32"
+    assert args.native_paged_kv_block_size == 16
+
+
+def test_fastest_profile_respects_kv_cache_profile_override():
+    args = SimpleNamespace(
+        realtime_profile="fastest",
+        native_paged_kv=None,
+        native_pipeline=None,
+        native_paged_kv_precision=None,
+        native_paged_kv_cache_input_precision=None,
+        native_paged_kv_block_size=None,
+        kv_cache_profile="u8",
+    )
+
+    apply_profile_defaults(args)
+
+    assert args.native_paged_kv == "require"
+    assert args.native_paged_kv_precision == "u8"
+    assert args.native_paged_kv_cache_input_precision == "f32"
+    assert args.native_paged_kv_block_size == 16
+
+
+def test_fastest_profile_preserves_explicit_native_kv_cache_precision():
+    args = SimpleNamespace(
+        realtime_profile="fastest",
+        native_paged_kv=None,
+        native_pipeline=None,
+        native_paged_kv_precision="u8",
+        native_paged_kv_cache_input_precision="u8",
+        native_paged_kv_block_size=8,
+        kv_cache_profile="auto",
+    )
+
+    apply_profile_defaults(args)
+
+    assert args.native_paged_kv_precision == "u8"
+    assert args.native_paged_kv_cache_input_precision == "u8"
+    assert args.native_paged_kv_block_size == 8
 
 
 def test_cache_warmup_prefers_common_low_latency_bucket():

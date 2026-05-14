@@ -83,6 +83,8 @@ guide.
 
 - VoiceDesign, CustomVoice, and VoiceClone runtime interfaces.
 - Native C++ codec generation pipeline with OpenVINO paged-KV attention.
+- Paged-KV cache defaults to U8 storage, roughly half the storage of FP16 KV
+  cache; use `--kv-cache-profile fp16` for a conservative baseline.
 - Streaming sidecar with WebSocket, HTTP NDJSON, and OpenAI-compatible Speech API.
 - Long VoiceDesign requests are generated as one continuous autoregressive
   sequence; audio is chunked only for playback.

@@ -30,10 +30,12 @@ from .profiles import (
     FASTEST_NATIVE_PIPELINE,
     FASTEST_PREFERRED_CACHE_BUCKET,
     FASTEST_PROFILE_NAME,
+    KV_CACHE_PROFILE_CHOICES,
     PUBLIC_REALTIME_PROFILE_CHOICES,
     REALTIME_PROFILE_CHOICES,
     RUNTIME_MODE_CHOICES,
     is_fastest_or_norepeat_mode,
+    kv_cache_profile_options,
 )
 from .runtime import OpenVINOQwen3TTS
 
@@ -78,6 +80,12 @@ def add_runtime_args(
     parser.add_argument("--native-buffer-reuse", default=None, choices=["auto", "off", "on"], help=advanced)
     parser.add_argument("--native-prompt", default=None, choices=["off", "on"], help=advanced)
     parser.add_argument("--native-prompt-device", default=None, help=advanced)
+    parser.add_argument(
+        "--kv-cache-profile",
+        default="auto",
+        choices=KV_CACHE_PROFILE_CHOICES,
+        help="Paged-KV cache memory profile. Default auto uses the fastest default, currently u8.",
+    )
     parser.add_argument("--native-paged-kv", default=None, choices=["auto", "off", "on", "require"], help=advanced)
     parser.add_argument("--native-paged-kv-gqa", default=None, choices=["auto", "off", "on"], help=advanced)
     parser.add_argument("--native-paged-kv-precision", default=None, choices=["f16", "bf16", "u8"], help=advanced)
@@ -144,6 +152,15 @@ def build_runtime(args):
     )
 
 
+def apply_kv_cache_profile_defaults(args):
+    options = kv_cache_profile_options(getattr(args, "kv_cache_profile", "auto"))
+    if not options:
+        return
+    args.native_paged_kv_precision = options["native_paged_kv_precision"]
+    args.native_paged_kv_cache_input_precision = options["native_paged_kv_cache_input_precision"]
+    args.native_paged_kv_block_size = int(options["native_paged_kv_block_size"])
+
+
 def apply_profile_defaults(args):
     if getattr(args, "native_paged_kv", None) in {"on", "require"}:
         args.realtime_profile = "fp16"
@@ -157,6 +174,7 @@ def apply_profile_defaults(args):
         args.preferred_cache_bucket = "0"
         if getattr(args, "native_pipeline", None) is None:
             args.native_pipeline = "require" if args.native_paged_kv == "require" else "on"
+        apply_kv_cache_profile_defaults(args)
         return
     realtime_profile = getattr(args, "realtime_profile", None)
     if realtime_profile not in (None, "") and realtime_profile not in REALTIME_PROFILE_CHOICES:
@@ -176,12 +194,18 @@ def apply_profile_defaults(args):
         args.native_buffer_reuse = FASTEST_NATIVE_BUFFER_REUSE
         args.native_paged_kv = FASTEST_NATIVE_PAGED_KV
         args.native_paged_kv_gqa = FASTEST_NATIVE_PAGED_KV_GQA
-        args.native_paged_kv_precision = FASTEST_NATIVE_PAGED_KV_PRECISION
-        args.native_paged_kv_block_size = FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE
+        if getattr(args, "native_paged_kv_precision", None) is None:
+            args.native_paged_kv_precision = FASTEST_NATIVE_PAGED_KV_PRECISION
+        if getattr(args, "native_paged_kv_cache_input_precision", None) is None:
+            args.native_paged_kv_cache_input_precision = "f32"
+        if getattr(args, "native_paged_kv_block_size", None) is None:
+            args.native_paged_kv_block_size = FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE
         args.native_paged_kv_split_subcode = FASTEST_NATIVE_PAGED_KV_SPLIT_SUBCODE
         args.native_paged_kv_score_aggregation = FASTEST_NATIVE_PAGED_KV_SCORE_AGGREGATION
         args.native_codegen_device = FASTEST_NATIVE_CODEGEN_DEVICE
+        apply_kv_cache_profile_defaults(args)
         return
+    apply_kv_cache_profile_defaults(args)
 
 
 def apply_native_env(args):
@@ -585,6 +609,8 @@ def run_serve(args):
         max_concurrent_tts=args.max_concurrent_tts,
         long_output_memory_policy=args.long_output_memory_policy,
         max_continuous_prompt_tokens=args.max_continuous_prompt_tokens,
+        max_vram_ratio=args.max_vram_ratio,
+        kv_cache_profile=args.kv_cache_profile,
         usm_retry_count=args.usm_retry_count,
     )
 
@@ -806,6 +832,11 @@ def main(argv=None):
         "--max-continuous-prompt-tokens",
         default="auto",
         help="Long full-AR prompt budget: auto, 0 to disable, or a positive token limit.",
+    )
+    serve_parser.add_argument(
+        "--max-vram-ratio",
+        default=None,
+        help="Memory budget ratio used when prompt tokens are auto: 0.8 or 80 means 80%%.",
     )
     serve_parser.add_argument("--usm-retry-count", type=int, default=1)
     serve_parser.set_defaults(func=run_serve)

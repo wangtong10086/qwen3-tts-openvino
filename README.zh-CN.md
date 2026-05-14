@@ -86,6 +86,7 @@ uv run python -m qwen3_tts_ov serve \
 - codec 生成使用 OpenVINO paged-KV attention。
 - talker seed 图使用 `int8_sym_paged_talker_split`。
 - cached subcode 图保持 FP16，优先保证音质稳定。
+- KV cache 默认使用 U8 paged-KV 存储，显存占用约为 FP16 KV cache 的一半；可用 `--kv-cache-profile fp16` 回到保守路径。
 - 流式输出 mono 24 kHz `pcm_s16le`。
 - 长文本使用完整上下文全自回归生成；runtime 只把音频切块给播放器，不默认切分输入文本。
 - 长文本 prompt 预算默认 `auto`：GPU 路径为 `2048` tokens，CPU-only 为 `4096` tokens；超长输入可通过 `--max-continuous-prompt-tokens` 调整。
@@ -93,6 +94,7 @@ uv run python -m qwen3_tts_ov serve \
 ## 常用入口
 
 - 最终用户启动：`qwen3-tts-ov-server --device GPU`
+- 保守 FP16 KV 启动：`qwen3-tts-ov-server --device GPU --kv-cache-profile fp16`
 - 一键构建：`uv run python -m qwen3_tts_ov build-fastest --model ...`
 - 开发服务：`uv run python -m qwen3_tts_ov serve --model-root openvino --device GPU`
 - 流式 CLI：`uv run python -m qwen3_tts_ov stream voice-design ...`

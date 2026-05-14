@@ -13,11 +13,39 @@ FASTEST_NATIVE_PIPELINE = "require"
 FASTEST_NATIVE_BUFFER_REUSE = "off"
 FASTEST_NATIVE_PAGED_KV = "require"
 FASTEST_NATIVE_PAGED_KV_GQA = "on"
-FASTEST_NATIVE_PAGED_KV_PRECISION = "f16"
+FASTEST_NATIVE_PAGED_KV_PRECISION = "u8"
 FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE = 16
 FASTEST_NATIVE_PAGED_KV_SPLIT_SUBCODE = "on"
 FASTEST_NATIVE_PAGED_KV_SCORE_AGGREGATION = "on"
 FASTEST_NATIVE_CODEGEN_DEVICE = "GPU"
+KV_CACHE_PROFILE_CHOICES = ("auto", "fp16", "bf16", "u8", "u8-input", "u8-all")
+KV_CACHE_PROFILE_OPTIONS = {
+    "fp16": {
+        "native_paged_kv_precision": "f16",
+        "native_paged_kv_cache_input_precision": "f32",
+        "native_paged_kv_block_size": FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE,
+    },
+    "bf16": {
+        "native_paged_kv_precision": "bf16",
+        "native_paged_kv_cache_input_precision": "f32",
+        "native_paged_kv_block_size": FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE,
+    },
+    "u8": {
+        "native_paged_kv_precision": "u8",
+        "native_paged_kv_cache_input_precision": "f32",
+        "native_paged_kv_block_size": FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE,
+    },
+    "u8-input": {
+        "native_paged_kv_precision": "f16",
+        "native_paged_kv_cache_input_precision": "u8",
+        "native_paged_kv_block_size": FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE,
+    },
+    "u8-all": {
+        "native_paged_kv_precision": "u8",
+        "native_paged_kv_cache_input_precision": "u8",
+        "native_paged_kv_block_size": FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE,
+    },
+}
 
 RUNTIME_MODE_CHOICES = (
     "fastest",
@@ -64,6 +92,56 @@ REALTIME_PROFILE_CHOICES = (
 PUBLIC_REALTIME_PROFILE_CHOICES = ("fastest", "auto")
 CODEGEN_UNROLL_CHOICES = ("profile", "1", "4", "6", "8", "12")
 CODEGEN_SCHEDULE_CHOICES = ("current", "ll-v2", "balanced-v2")
+
+
+def normalize_kv_cache_profile(profile: str | None) -> str:
+    normalized = str(profile or "auto").strip().lower().replace("_", "-")
+    if normalized not in KV_CACHE_PROFILE_CHOICES:
+        raise ValueError(f"kv_cache_profile must be one of {', '.join(KV_CACHE_PROFILE_CHOICES)}")
+    return normalized
+
+
+def kv_cache_profile_options(profile: str | None) -> dict:
+    normalized = normalize_kv_cache_profile(profile)
+    if normalized == "auto":
+        return {}
+    return dict(KV_CACHE_PROFILE_OPTIONS[normalized])
+
+
+def kv_cache_profile_from_options(
+    precision: str | None,
+    cache_input_precision: str | None,
+    block_size: int | str | None,
+) -> str:
+    precision_text = str(precision or FASTEST_NATIVE_PAGED_KV_PRECISION).strip().lower()
+    cache_input_text = str(cache_input_precision or "f32").strip().lower()
+    try:
+        block_size_int = int(block_size or FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE)
+    except Exception:
+        block_size_int = FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE
+    for name, options in KV_CACHE_PROFILE_OPTIONS.items():
+        if (
+            precision_text == options["native_paged_kv_precision"]
+            and cache_input_text == options["native_paged_kv_cache_input_precision"]
+            and block_size_int == int(options["native_paged_kv_block_size"])
+        ):
+            return name
+    return "custom"
+
+
+def kv_cache_precision_bytes(precision: str | None) -> int:
+    normalized = str(precision or FASTEST_NATIVE_PAGED_KV_PRECISION).strip().lower()
+    if normalized in {"u8", "i8", "uint8", "int8"}:
+        return 1
+    if normalized in {"f16", "bf16", "float16", "bfloat16"}:
+        return 2
+    if normalized in {"f32", "float32"}:
+        return 4
+    if normalized in {"u4", "i4", "uint4", "int4"}:
+        return 1
+    return 2
+
+
 REALTIME_BENCHMARK_PROFILE_OPTIONS = {
     "fastest": {
         "realtime_profile": FASTEST_PROFILE_NAME,

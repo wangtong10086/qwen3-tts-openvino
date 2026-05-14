@@ -62,6 +62,14 @@ qwen3-tts-ov-server --device GPU --max-continuous-prompt-tokens 4096
 
 也可以设置为 `0` 关闭 prompt 预算保护。关闭后仍不会自动分段，后续如果显存不足会由 OpenVINO/USM 错误和 retry 机制处理。
 
+显存压力主要来自长 prompt 的 paged-KV cache 和运行时中间 buffer。默认生产路径使用 `u8` KV cache；如果需要显式指定或配合更低 prompt 预算，可以启动时使用：
+
+```bash
+qwen3-tts-ov-server --device GPU --kv-cache-profile u8 --max-vram-ratio 70
+```
+
+`u8` 会把 KV cache 存储元素从 FP16 的 2 bytes 降为 1 byte，`/health` 中 `kv_cache_relative_to_fp16` 应显示为 `0.5`。需要保守对照时使用 `--kv-cache-profile fp16`；切换到 `u8-all` 前需要重新做长文本质量评测。
+
 ## 长文本采样参数
 
 默认生成参数跟随上游习惯：

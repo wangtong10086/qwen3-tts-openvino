@@ -115,6 +115,8 @@ curl -N http://127.0.0.1:17860/v1/audio/speech \
 - `--model-cache-dir <path>`: 指定自动下载缓存目录。
 - `--model-repo <repo>`、`--model-revision <rev>`、`--model-subdir <dir>`: 指定下载来源。
 - `--max-continuous-prompt-tokens auto|0|N`: 长文本 full-AR prompt token 预算。默认 `auto`，GPU 路径为 `2048`，CPU-only 路径为 `4096`；`0` 表示关闭该预算保护。
+- `--kv-cache-profile auto|fp16|bf16|u8|u8-input|u8-all`: paged-KV cache 显存档位。默认 `auto` 跟随最快路径，即 U8 KV cache；需要保守对照时使用 `fp16`。
+- `--max-vram-ratio auto|N`: Web Demo 和服务端 prompt 预算使用的最大显存占比；例如 `70` 表示按 70% 可用显存计算长文本 token 上限。
 
 缓存目录也可以用环境变量 `QWEN3_TTS_OV_MODEL_CACHE_DIR` 指定。
 
@@ -137,6 +139,24 @@ curl -N http://127.0.0.1:17860/v1/audio/speech \
 ```
 
 服务端 `/health` 和流式 metadata 会返回 `max_continuous_prompt_tokens_config`、`effective_max_continuous_prompt_tokens` 和 `long_text_budget_policy`，用于确认实际生效值。
+
+## KV Cache 显存档位
+
+默认 release 路径使用 U8 paged-KV cache，降低长文本和长输出时的显存压力。需要显式指定时可以写：
+
+```bash
+./qwen3-tts-ov-server --device GPU --kv-cache-profile u8 --max-vram-ratio 70
+```
+
+可选档位：
+
+- `fp16`: KV cache 为 FP16，保守质量对照路径。
+- `bf16`: KV cache 为 BF16，用于对比硬件行为。
+- `u8`: KV cache 存储为 U8，cache input 仍保持 FP32，默认生产路径。
+- `u8-input`: KV cache 保持 FP16，但 cache input 改为 U8，主要用于实验。
+- `u8-all`: KV cache 和 cache input 都使用 U8，显存更低，但需要额外做音质验证。
+
+`/health` 的 `warmup`、`memory` 和 runtime metadata 会返回 `kv_cache_profile`、`native_paged_kv_precision`、`native_paged_kv_cache_input_precision`、`kv_cache_relative_to_fp16`。其中 `kv_cache_relative_to_fp16=0.5` 表示 KV cache 元素理论占用约为 FP16 的一半。这里压缩的是 paged-KV cache 存储，不等价于全部 attention 算子都以 INT8 计算。
 
 ## 系统要求
 

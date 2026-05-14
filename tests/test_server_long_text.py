@@ -257,12 +257,12 @@ def test_continuous_prompt_budget_auto_limits_by_device():
     assert server.resolve_continuous_prompt_budget("auto", uses_gpu_device=True) == (
         "auto",
         2048,
-        "auto_gpu",
+        "auto_gpu_80pct",
     )
     assert server.resolve_continuous_prompt_budget(None, uses_gpu_device=False) == (
         "auto",
         4096,
-        "auto_cpu",
+        "auto_cpu_100pct",
     )
     assert server.resolve_continuous_prompt_budget("0", uses_gpu_device=True) == (
         "0",
@@ -274,6 +274,11 @@ def test_continuous_prompt_budget_auto_limits_by_device():
         1536,
         "explicit",
     )
+    assert server.resolve_continuous_prompt_budget("auto", uses_gpu_device=True, max_vram_ratio=50) == (
+        "auto",
+        1280,
+        "auto_gpu_50pct",
+    )
 
 
 def test_continuous_prompt_budget_rejects_invalid_values():
@@ -281,6 +286,8 @@ def test_continuous_prompt_budget_rejects_invalid_values():
         server.resolve_continuous_prompt_budget("many", uses_gpu_device=True)
     with pytest.raises(ValueError, match="max-continuous-prompt-tokens"):
         server.resolve_continuous_prompt_budget("-1", uses_gpu_device=True)
+    with pytest.raises(ValueError, match="max-vram-ratio"):
+        server.resolve_continuous_prompt_budget("auto", uses_gpu_device=True, max_vram_ratio=120)
 
 
 def test_health_reports_effective_continuous_prompt_budget(monkeypatch, tmp_path):
@@ -292,14 +299,72 @@ def test_health_reports_effective_continuous_prompt_budget(monkeypatch, tmp_path
 
     assert gpu_health["memory"]["max_continuous_prompt_tokens_config"] == "auto"
     assert gpu_health["memory"]["effective_max_continuous_prompt_tokens"] == 2048
-    assert gpu_health["memory"]["long_text_budget_policy"] == "auto_gpu"
+    assert gpu_health["memory"]["long_text_budget_policy"] == "auto_gpu_80pct"
+    assert gpu_health["memory"]["max_vram_percent"] == 80
 
     cpu_app = server.create_app(model_root=tmp_path / "openvino", warmup=False, device="CPU")
     cpu_health = fastapi_testclient.TestClient(cpu_app).get("/health").json()
 
     assert cpu_health["memory"]["max_continuous_prompt_tokens_config"] == "auto"
     assert cpu_health["memory"]["effective_max_continuous_prompt_tokens"] == 4096
-    assert cpu_health["memory"]["long_text_budget_policy"] == "auto_cpu"
+    assert cpu_health["memory"]["long_text_budget_policy"] == "auto_cpu_100pct"
+    assert cpu_health["memory"]["max_vram_percent"] == 100
+
+
+def test_tokenize_endpoint_uses_real_tokenizer_budget(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    monkeypatch.chdir(tmp_path)
+    ir_dir = tmp_path / "openvino" / "voice_design"
+    ir_dir.mkdir(parents=True)
+    manifest = {
+        "tts_model_type": "voice_design",
+        "model_dir": ".",
+        "ids": {
+            "codec_nothink_id": 1,
+            "codec_think_bos_id": 2,
+            "codec_think_eos_id": 3,
+            "codec_think_id": 4,
+            "codec_language_id": {"chinese": 5, "english": 6},
+            "spk_is_dialect": {},
+        },
+        "graphs": {},
+        "graph_variants": {},
+    }
+    (ir_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    class FakeTokenizer:
+        def __init__(self, model_dir):
+            self.model_dir = model_dir
+
+        def encode(self, text):
+            return list(range(len(str(text))))
+
+    monkeypatch.setattr(server, "Qwen2BPETokenizer", FakeTokenizer)
+    app = server.create_app(model_root=tmp_path / "openvino", warmup=False, device="GPU")
+    client = fastapi_testclient.TestClient(app)
+
+    request = {
+        "mode": "voice_design",
+        "text": "你好",
+        "instruct": "读",
+        "language": "Chinese",
+        "max_vram_ratio": 50,
+        "generation": {"max_new_tokens": 48},
+    }
+    response = client.post("/v1/tts/tokenize", json=request)
+
+    assert response.status_code == 200
+    data = response.json()
+    expected_text = len(server.build_assistant_text("你好"))
+    expected_instruct = len(server.build_instruct_text("读"))
+    assert data["tokenizer_exact"] is True
+    assert data["text_tokens"] == expected_text
+    assert data["instruct_tokens"] == expected_instruct
+    assert data["codec_prefill_tokens"] == 4
+    assert data["prompt_len"] == expected_text + expected_instruct + 4 - 3
+    assert data["effective_max_continuous_prompt_tokens"] == 1280
+    assert data["max_vram_percent"] == 50
+    assert data["over_prompt_budget"] is False
 
 
 def test_default_auto_budget_allows_prompt_above_old_1024_limit(monkeypatch, tmp_path):
