@@ -722,6 +722,28 @@ def normalize_long_text_profile_for_manifest(profile: dict | None, manifest: dic
     return normalized
 
 
+def normalize_long_text_profile_for_devices(profile: dict | None, requested_devices: list[str]) -> dict | None:
+    if not profile:
+        return profile
+    uses_gpu = any("GPU" in str(item or "").upper() for item in requested_devices)
+    if uses_gpu:
+        return profile
+    profile_env = dict(profile.get("profile_env") or {})
+    requested_device = str(profile_env.get("native_codegen_device") or "").strip().upper()
+    if requested_device != "GPU":
+        return profile
+    fallback_device = next((str(item).strip() for item in requested_devices if str(item).strip()), "CPU")
+    normalized = dict(profile)
+    normalized["profile_env"] = profile_env
+    profile_env["native_codegen_device"] = fallback_device
+    normalized["native_codegen_device_fallback"] = {
+        "requested": requested_device,
+        "effective": fallback_device,
+        "reason": "server_device_has_no_gpu",
+    }
+    return normalized
+
+
 def builtin_long_text_profile_from_manifest(manifest: dict) -> dict | None:
     """Return the fastest built-in full-AR long-text profile supported by an IR.
 
@@ -1340,6 +1362,10 @@ def create_app(
             selected_quality_profile = normalize_long_text_profile_for_manifest(
                 selected_quality_profile,
                 runtime_manifest,
+            )
+            selected_quality_profile = normalize_long_text_profile_for_devices(
+                selected_quality_profile,
+                requested_devices,
             )
             if selected_quality_profile:
                 apply_long_text_profile_env(selected_quality_profile)

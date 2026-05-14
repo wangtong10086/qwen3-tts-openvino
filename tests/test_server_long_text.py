@@ -107,6 +107,24 @@ def test_builtin_long_ar_profile_keeps_cached_exact_when_manifest_supports_it():
     assert "split_subcode_mode_fallback" not in profile
 
 
+def test_long_ar_profile_uses_cpu_codegen_when_server_device_has_no_gpu():
+    profile = server.explicit_long_text_profile("paged-sample-int8")
+
+    normalized = server.normalize_long_text_profile_for_devices(profile, ["CPU"])
+
+    assert normalized["profile_env"]["native_codegen_device"] == "CPU"
+    assert normalized["native_codegen_device_fallback"]["requested"] == "GPU"
+
+
+def test_long_ar_profile_keeps_gpu_codegen_when_server_uses_gpu():
+    profile = server.explicit_long_text_profile("paged-sample-int8")
+
+    normalized = server.normalize_long_text_profile_for_devices(profile, ["GPU"])
+
+    assert normalized["profile_env"]["native_codegen_device"] == "GPU"
+    assert "native_codegen_device_fallback" not in normalized
+
+
 def test_builtin_long_ar_profile_falls_back_to_fp16_paged_seed_without_int8_variant():
     manifest = {
         "graphs": {
