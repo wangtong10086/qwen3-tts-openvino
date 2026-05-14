@@ -65,6 +65,29 @@ def test_release_model_download_fetches_missing_model_root(tmp_path, monkeypatch
     assert (result.model_root / "voice_design" / "manifest.json").exists()
 
 
+def test_release_model_download_fetches_missing_mode_into_model_root(tmp_path, monkeypatch):
+    def fake_snapshot_download(*, repo_id, revision, local_dir, subdir, allow_patterns=None):
+        target = local_dir / subdir / "base"
+        target.mkdir(parents=True)
+        (target / "manifest.json").write_text(json.dumps({"tts_model_type": "base"}), encoding="utf-8")
+        return local_dir
+
+    monkeypatch.setattr(model_download, "_snapshot_download", fake_snapshot_download)
+
+    result = model_download.download_mode_ir(
+        tmp_path / "openvino",
+        "voice_clone",
+        repo_id="owner/repo",
+        revision="main",
+        subdir="openvino_realtime",
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert result.status == "downloaded"
+    assert result.target_dir == tmp_path / "openvino" / "base"
+    assert (tmp_path / "openvino" / "base" / "manifest.json").exists()
+
+
 def test_release_model_download_can_be_disabled(tmp_path):
     result = model_download.ensure_release_model_root(
         tmp_path / "missing",

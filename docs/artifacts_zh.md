@@ -38,7 +38,7 @@ runtime 打包有两种 profile：
 - `runtime-minimal`: 推荐发布包，只保留 native paged-KV 长文本完整自回归路径，移除开发 fallback、实验图和重音频依赖。
 - `full`: 开发调试包，保留 manifest 引用的完整 IR 和更宽依赖空间。
 
-当前公开 OpenVINO IR 位于 Hugging Face：`waston10086/qwen3-tts-openvino-voice-design`，推荐使用其中的 `openvino_realtime/` 目录进行最终用户部署和 release smoke。
+当前公开 OpenVINO IR 位于 Hugging Face：`waston10086/qwen3-tts-openvino-voice-design`，推荐使用其中的 `openvino_realtime/` 目录进行最终用户部署和 release smoke。该目录包含 `voice_design`、`custom_voice` 和用于 VoiceClone 的 `base`。
 
 ## 检查命令
 

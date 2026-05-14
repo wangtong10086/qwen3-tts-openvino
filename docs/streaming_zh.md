@@ -47,20 +47,25 @@ metadata 会包含 `realtime_profile`、`chunk_strategy`、`recommended_playback
 
 这样可以避免分段生成导致的音色、语气和韵律不连续。
 
+## VoiceClone 流式
+
+VoiceClone 默认使用 ICL 克隆路径，也就是 `x_vector_only=false`。请求必须提供参考音频和对应的 `ref_text`，服务端会先从参考音频提取 codec prompt 和 speaker embedding，再从同一条自回归链路生成目标文本；流式 decoder 只输出目标文本对应的新音频，不播放参考音频。
+
+`x_vector_only=true` 只适合做 speaker embedding-only 的对照实验。它不会把参考音频 codec prompt 拼入生成上下文，因此通常不如默认 ICL 路径稳定地保留参考音频的韵律和说话风格。
+
 ## 长文本 prompt 预算
 
-服务端默认使用 `--max-continuous-prompt-tokens auto` 做推理前保护，避免极长 prompt 在部分 GPU/驱动上触发 OpenVINO USM 分配失败。`auto` 的生效值为：
+服务端默认使用 `--max-continuous-prompt-tokens auto` 做推理前保护，避免极长 prompt 在部分 GPU/驱动上触发 OpenVINO USM 分配失败。GPU 路径会根据模型上下文、KV/cache-input 精度、block size、GPU 总显存、`--max-vram-ratio` 和保留显存计算可用 KV blocks；CPU-only 路径使用保守固定预算。
 
-- GPU 或默认 release 路径：`2048`
-- CPU-only：`4096`
+长文本 full-AR 不再根据文本长度预估 `max_new_tokens`。服务端会先计算精确 prompt tokens，再将运行时 `max_new_tokens` 设置为 `effective_max_total_tokens - prompt_len - 1`，让模型生成直到 EOS 或上下文/KV 上限。metadata 中的 `max_generation_tokens_available` 和 `generation_stop_condition=eos_or_context_limit` 可用于确认当前请求的真实生成上限。
 
-如果 metadata 或错误信息显示文本超过预算，可以启动时提高上限：
+如果 metadata 或错误信息显示文本超过预算，可以先提高显存比例或降低保留显存：
 
 ```bash
-qwen3-tts-ov-server --device GPU --max-continuous-prompt-tokens 4096
+qwen3-tts-ov-server --device GPU --max-vram-ratio 90 --kv-cache-reserve-mb 1024
 ```
 
-也可以设置为 `0` 关闭 prompt 预算保护。关闭后仍不会自动分段，后续如果显存不足会由 OpenVINO/USM 错误和 retry 机制处理。
+也可以显式设置 `--max-continuous-prompt-tokens N`，或设置为 `0` 关闭 prompt 预算保护。关闭后仍不会自动分段，后续如果显存不足会由 OpenVINO/USM 错误和 retry 机制处理。
 
 显存压力主要来自长 prompt 的 paged-KV cache 和运行时中间 buffer。默认生产路径使用 `u8` KV cache；如果需要显式指定或配合更低 prompt 预算，可以启动时使用：
 
@@ -68,7 +73,9 @@ qwen3-tts-ov-server --device GPU --max-continuous-prompt-tokens 4096
 qwen3-tts-ov-server --device GPU --kv-cache-profile u8 --max-vram-ratio 70
 ```
 
-`u8` 会把 KV cache 存储元素从 FP16 的 2 bytes 降为 1 byte，`/health` 中 `kv_cache_relative_to_fp16` 应显示为 `0.5`。需要保守对照时使用 `--kv-cache-profile fp16`；切换到 `u8-all` 前需要重新做长文本质量评测。
+`u8` 会把 KV cache 存储元素从 FP16 的 2 bytes 降为 1 byte，`/health` 中 `kv_cache_relative_to_fp16` 应显示为 `0.5`。但默认 `u8` 的 cache input 仍为 FP32，planner 会按实际 cache input 做保守预算；需要保守对照时使用 `--kv-cache-profile fp16`，切换到 `u8-all` 前需要重新做长文本质量评测。
+
+流式 metadata 会返回 `effective_max_total_tokens`、`effective_max_continuous_prompt_tokens`、`preallocated_kv_blocks`、`kv_cache_limit_source`。Web Demo 会用 tokenizer 实时计算 prompt token，并用这些字段判断当前文本是否超过预算。
 
 ## 长文本采样参数
 

@@ -18,6 +18,10 @@ Runtime App 包在 GitHub Release：
 
 - Model repo: <https://huggingface.co/waston10086/qwen3-tts-openvino-voice-design>
 - 使用目录：`openvino_realtime/`
+- 包含模式：
+  - `openvino_realtime/voice_design`
+  - `openvino_realtime/custom_voice`
+  - `openvino_realtime/base`，用于 VoiceClone
 
 离线部署或需要预下载时，可以从网页下载，也可以用 Hugging Face CLI：
 
@@ -96,7 +100,9 @@ curl -N http://127.0.0.1:17860/v1/audio/speech \
 ## 发布物边界
 
 - GitHub Release 只包含 runtime App 包，不包含模型权重或 OpenVINO IR。
-- Hugging Face model repo 存放已编译 OpenVINO IR，当前公开的是 VoiceDesign realtime IR。release server 默认在缺少本地 IR 时自动下载它。
+- Hugging Face model repo 存放已编译 OpenVINO IR，当前公开包含 VoiceDesign、CustomVoice 和 Base/VoiceClone realtime IR。release server 默认在缺少本地 IR 时自动下载 `openvino_realtime/`。
+- CustomVoice 需要 `custom_voice/manifest.json`，VoiceClone 需要 Base/VoiceClone IR 的 `base/manifest.json`。服务端 `/health` 会返回 `available_modes`，Web Demo 会显示缺失/已就绪，并可一键下载对应模式。
+- VoiceClone 默认走 `ref_audio + ref_text` ICL 克隆路径，`x_vector_only` 默认关闭。最终用户在 Web Demo 中上传参考音频时，应同时填写对应参考文本；只有做 speaker embedding-only 对照实验时才开启 `x_vector_only`。
 - OpenVINO compile cache 会在用户机器首次运行时生成，不随 release 分发。
 - 需要私有分发 IR 时，可以使用 `scripts/package_ir.py` 自行打包；当前公开分发推荐直接使用 Hugging Face。
 
@@ -114,20 +120,37 @@ curl -N http://127.0.0.1:17860/v1/audio/speech \
 - `--model-root <path>`: 使用本地已下载或私有分发的 IR。
 - `--model-cache-dir <path>`: 指定自动下载缓存目录。
 - `--model-repo <repo>`、`--model-revision <rev>`、`--model-subdir <dir>`: 指定下载来源。
-- `--max-continuous-prompt-tokens auto|0|N`: 长文本 full-AR prompt token 预算。默认 `auto`，GPU 路径为 `2048`，CPU-only 路径为 `4096`；`0` 表示关闭该预算保护。
+- `--max-continuous-prompt-tokens auto|0|N`: 长文本 full-AR prompt token 预算。默认 `auto`；GPU 路径使用 KV-cache planner 按显存和 KV/cache-input 精度计算，CPU-only 路径使用保守固定预算；`0` 表示关闭该预算保护。
 - `--kv-cache-profile auto|fp16|bf16|u8|u8-input|u8-all`: paged-KV cache 显存档位。默认 `auto` 跟随最快路径，即 U8 KV cache；需要保守对照时使用 `fp16`。
 - `--max-vram-ratio auto|N`: Web Demo 和服务端 prompt 预算使用的最大显存占比；例如 `70` 表示按 70% 可用显存计算长文本 token 上限。
+- `--kv-cache-reserve-mb auto|N`: KV planner 预留给模型权重、中间 buffer 和驱动的显存。
+- `--kv-cache-max-blocks auto|N`: 手动限制可计划的 KV block 数。
+- `--kv-cache-preallocation auto|off|static`: `auto` 只计算预算；`static` 同时启用 native static decode block 容量。
 
 缓存目录也可以用环境变量 `QWEN3_TTS_OV_MODEL_CACHE_DIR` 指定。
+
+Web Demo 的模型下载按钮调用服务端 `/v1/models/download`，下载到当前 `model_root` 下的对应目录：
+
+```text
+VoiceDesign  -> openvino/voice_design
+CustomVoice  -> openvino/custom_voice
+VoiceClone   -> openvino/base
+```
+
+如果不同模式使用不同 Hugging Face repo/subdir，可以用环境变量覆盖：
+
+```bash
+export QWEN3_TTS_OV_MODEL_REPO_CUSTOM_VOICE=owner/custom-voice-ir
+export QWEN3_TTS_OV_MODEL_SUBDIR_CUSTOM_VOICE=openvino_realtime
+export QWEN3_TTS_OV_MODEL_REPO_VOICE_CLONE=owner/base-ir
+export QWEN3_TTS_OV_MODEL_SUBDIR_VOICE_CLONE=openvino_realtime
+```
 
 ## 长文本预算
 
 长文本默认不切分输入文本，而是使用同一条 full-AR 自回归链路。为了避免过长 prompt 在部分 GPU/驱动上触发 OpenVINO USM 分配失败，server 会在推理前做 prompt token 预算检查。
 
-默认 `--max-continuous-prompt-tokens auto` 已覆盖常见长文本：
-
-- GPU 或默认 release 路径：`2048`
-- CPU-only：`4096`
+默认 `--max-continuous-prompt-tokens auto` 会在 GPU 路径上使用 KV-cache planner：先读取模型层数、head 数、head dim、上下文长度、KV storage 精度和 cache input 精度，再按 `--max-vram-ratio` 与保留显存计算可用 KV blocks，最后得到 `effective_max_total_tokens` 和 `effective_max_continuous_prompt_tokens`。默认 `u8` 档位的 KV storage 是 U8，但 cache input 仍为 FP32，因此 planner 会按实际 cache input 做保守预算；需要进一步降低 block 预算占用时再评测 `u8-all`。
 
 如果请求仍然超出预算，可以按机器显存/内存情况提高或关闭限制：
 
@@ -138,7 +161,7 @@ curl -N http://127.0.0.1:17860/v1/audio/speech \
 ./qwen3-tts-ov-server --device GPU --max-continuous-prompt-tokens 0
 ```
 
-服务端 `/health` 和流式 metadata 会返回 `max_continuous_prompt_tokens_config`、`effective_max_continuous_prompt_tokens` 和 `long_text_budget_policy`，用于确认实际生效值。
+服务端 `/health` 和流式 metadata 会返回 `max_continuous_prompt_tokens_config`、`effective_max_continuous_prompt_tokens`、`effective_max_total_tokens`、`preallocated_kv_blocks`、`kv_cache_budget_bytes` 和 `long_text_budget_policy`，用于确认实际生效值。
 
 ## KV Cache 显存档位
 

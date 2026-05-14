@@ -107,6 +107,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Memory budget ratio used when prompt tokens are auto: 0.8 or 80 means 80%%.",
     )
+    parser.add_argument(
+        "--kv-cache-preallocation",
+        default="auto",
+        choices=["auto", "off", "static"],
+        help="KV cache planner allocation mode. static also enables native static decode blocks.",
+    )
+    parser.add_argument(
+        "--kv-cache-reserve-mb",
+        default="auto",
+        help="Non-KV GPU memory reserve for the planner, in MiB, or auto.",
+    )
+    parser.add_argument(
+        "--kv-cache-max-blocks",
+        default="auto",
+        help="Optional maximum KV cache blocks for the planner.",
+    )
     parser.add_argument("--usm-retry-count", type=int, default=1)
     return parser
 
@@ -147,7 +163,14 @@ def main(argv: list[str] | None = None) -> None:
         max_continuous_prompt_tokens=args.max_continuous_prompt_tokens,
         max_vram_ratio=args.max_vram_ratio,
         kv_cache_profile=args.kv_cache_profile,
+        kv_cache_preallocation=args.kv_cache_preallocation,
+        kv_cache_reserve_mb=args.kv_cache_reserve_mb,
+        kv_cache_max_blocks=args.kv_cache_max_blocks,
         usm_retry_count=args.usm_retry_count,
+        model_download_repo=args.model_repo,
+        model_download_revision=args.model_revision,
+        model_download_subdir=args.model_subdir,
+        model_download_cache_dir=args.model_cache_dir,
     )
 
 

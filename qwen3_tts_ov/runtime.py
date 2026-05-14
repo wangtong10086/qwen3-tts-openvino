@@ -216,6 +216,7 @@ class StreamChunk:
     codes: np.ndarray
     is_final: bool
     timings: dict
+    pcm_s16le: bytes | None = None
 
 
 @lru_cache
@@ -1932,6 +1933,7 @@ class OpenVINOQwen3TTS:
                     decode_ms = float(item.get("decode_ms", 0.0))
                     audio_ms = (float(audio.shape[0]) / float(self.sample_rate) * 1000.0) if audio.size else 0.0
                     compute_ms = codegen_ms + decode_ms
+                    pcm_convert_ms = float(item.get("pcm_convert_ms", 0.0) or 0.0)
                     if audio_ms > 0:
                         stream_audio_ms += audio_ms
                         stream_compute_ms += compute_ms
@@ -1943,8 +1945,10 @@ class OpenVINOQwen3TTS:
                     if paged_kv_requested and isinstance(native_timing, dict):
                         static_mode = str(native_timing.get("paged_static_decode_mode") or "dynamic")
                         actual_static_decode = bool(native_timing.get("paged_static_decode_enabled")) and static_mode != "dynamic"
+                        actual_async_decode = bool(native_timing.get("async_decode", False))
                     else:
                         actual_static_decode = None
+                        actual_async_decode = None
                     timings = {
                         **self.timings.snapshot(emitted_frames),
                         **dict(getattr(self, "last_codegen_info", {}) or {}),
@@ -1972,6 +1976,7 @@ class OpenVINOQwen3TTS:
                         "configured_chunk_frames": int(steady_chunk),
                         "native_audio_pipeline": True,
                         "native_prompt_pipeline": bool(native_prompt_pipeline),
+                        "native_async_decode": actual_async_decode,
                         "native_sampling": bool(do_sample and paged_kv_requested and effective_paged_split_subcode),
                         "do_sample": bool(do_sample),
                         "top_k": int(top_k),
@@ -1980,6 +1985,7 @@ class OpenVINOQwen3TTS:
                         "native_remote_embed": bool(item.get("remote_embed", getattr(runner, "last_remote_embed", False))),
                         "native_ov_profile": item.get("native_ov_profile"),
                         "native_timing": native_timing,
+                        "pcm_convert_ms": pcm_convert_ms,
                         "paged_kv_static_decode_actual": actual_static_decode,
                         "paged_kv_static_decode": actual_static_decode if paged_kv_requested else None,
                         "pipeline_decode": True,
@@ -1995,6 +2001,7 @@ class OpenVINOQwen3TTS:
                         codes=codes,
                         is_final=is_final,
                         timings=timings,
+                        pcm_s16le=item.get("pcm_s16le") or None,
                     )
                     chunk_index += 1
                     yield chunk
@@ -3797,6 +3804,29 @@ class OpenVINOQwen3TTS:
         wavs = []
         for item_text, item_language, prompt in zip(texts, languages, prompts):
             item_ref_text = prompt.ref_text if prompt.ref_text is not None else ref_text
+            if self._native_pipeline_mode() in {"1", "true", "on", "require"} and self.talker_request is None:
+                chunks = list(
+                    self.stream_voice_clone(
+                        text=item_text,
+                        language=item_language,
+                        ref_text=item_ref_text,
+                        voice_clone_prompt=prompt,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=min_new_tokens,
+                        repetition_penalty=repetition_penalty,
+                        max_prompt_tokens=max_prompt_tokens,
+                        progress_interval=progress_interval,
+                        do_sample=do_sample,
+                        top_k=top_k,
+                        top_p=top_p,
+                        temperature=temperature,
+                    )
+                )
+                audio_parts = [np.asarray(chunk.audio, dtype=np.float32) for chunk in chunks if chunk.audio.size]
+                if not audio_parts:
+                    raise RuntimeError("voice clone generation stopped before producing any audio chunk")
+                wavs.append(np.concatenate(audio_parts, axis=0))
+                continue
             codes = self.generate_codes(
                 text=item_text,
                 instruct="",

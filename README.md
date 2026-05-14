@@ -81,16 +81,22 @@ guide.
 
 ## Highlights
 
-- VoiceDesign, CustomVoice, and VoiceClone runtime interfaces.
+- VoiceDesign, CustomVoice, and VoiceClone runtime interfaces. The public
+  Hugging Face IR contains `voice_design`, `custom_voice`, and `base`
+  directories under `openvino_realtime/`; VoiceClone uses the `base` IR.
+- VoiceClone defaults to ICL cloning with `ref_audio` + `ref_text`, so the
+  reference audio codec prompt is used. `x_vector_only` is opt-in for
+  speaker-embedding-only experiments.
 - Native C++ codec generation pipeline with OpenVINO paged-KV attention.
 - Paged-KV cache defaults to U8 storage, roughly half the storage of FP16 KV
   cache; use `--kv-cache-profile fp16` for a conservative baseline.
 - Streaming sidecar with WebSocket, HTTP NDJSON, and OpenAI-compatible Speech API.
 - Long VoiceDesign requests are generated as one continuous autoregressive
   sequence; audio is chunked only for playback.
-- Long prompt budget defaults to `auto`: 2048 tokens on GPU paths and 4096
-  tokens on CPU-only paths; use `--max-continuous-prompt-tokens` for longer
-  requests.
+- Long prompt budget defaults to `auto`: GPU paths use a KV-cache planner based
+  on model context, KV/cache-input precision, and `--max-vram-ratio`; CPU-only
+  paths keep a conservative fixed budget. Use `--max-continuous-prompt-tokens`
+  to override.
 - Production runtime profile: `fastest`, `pcm_s16le`, mono 24 kHz output.
 
 ## Documentation

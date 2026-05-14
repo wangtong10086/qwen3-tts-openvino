@@ -10,6 +10,7 @@ from qwen3_tts_ov.server import (
     needs_continuous_long_output,
     openai_speech_to_tts_request,
     playback_buffer_for_stream,
+    request_x_vector_only,
     select_continuous_long_output_variant,
     stream_metadata,
 )
@@ -37,6 +38,24 @@ def test_openai_speech_maps_custom_voice_request():
     assert internal["instruct"] == "Speak brightly."
     assert internal["generation"]["max_new_tokens"] == 32
     assert internal["stream"]["chunk_strategy"] == "stable"
+
+
+def test_voice_clone_x_vector_only_defaults_false_and_parses_false_strings():
+    internal, _, _ = openai_speech_to_tts_request(
+        {
+            "model": "Qwen/Qwen3-TTS-12Hz-1.7B",
+            "input": "Hello",
+            "task_type": "voice_clone",
+            "ref_audio": "reference.wav",
+            "ref_text": "Reference text.",
+        }
+    )
+
+    assert internal["mode"] == "voice_clone"
+    assert internal["x_vector_only"] is False
+    assert request_x_vector_only({"x_vector_only": "false"}) is False
+    assert request_x_vector_only({"x_vector_only_mode": "0"}) is False
+    assert request_x_vector_only({"x_vector_only": "true"}) is True
 
 
 def test_stream_metadata_uses_strategy_defaults():

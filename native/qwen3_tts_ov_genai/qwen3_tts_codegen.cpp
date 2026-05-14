@@ -95,6 +95,7 @@ struct NativeCodegen {
     int64_t stream_num_code_groups = 16;
     int64_t decode_upsample_rate = 2000;
     bool last_remote_embed_used = false;
+    bool last_async_decode = false;
     struct ProfileEntry {
         std::string label;
         std::string node_name;
@@ -114,8 +115,17 @@ struct NativeCodegen {
         double sampling_ms = 0.0;
         double decode_infer_ms = 0.0;
         double callback_ms = 0.0;
+        double callback_enqueue_ms = 0.0;
+        double inline_decode_ms = 0.0;
         double codegen_callback_ms = 0.0;
         double decode_callback_ms = 0.0;
+        double decode_queue_wait_ms = 0.0;
+        int64_t decode_queue_depth_max = 0;
+        double host_copy_ms = 0.0;
+        uint64_t host_copy_bytes = 0;
+        int64_t host_copy_fallback_count = 0;
+        int64_t zero_copy_count = 0;
+        double pcm_convert_ms = 0.0;
         double total_ms = 0.0;
     };
     struct ScratchBuffers {
@@ -704,6 +714,124 @@ const T* tensor_data(const ov::Tensor& tensor) {
     return tensor.data<const T>();
 }
 
+std::string tensor_debug_string(const ov::Tensor& tensor) {
+    std::ostringstream out;
+    out << "type=" << tensor.get_element_type() << ", shape=" << tensor.get_shape() << ", size=" << tensor.get_size();
+    return out.str();
+}
+
+template <typename T>
+struct HostTensorView {
+    const T* data = nullptr;
+    size_t size = 0;
+    ov::Tensor host_tensor;
+    bool copied = false;
+};
+
+template <typename T>
+HostTensorView<T> tensor_to_host_view(NativeCodegen* runner, const ov::Tensor& tensor, const char* label) {
+    HostTensorView<T> view;
+    view.size = tensor.get_size();
+    if (view.size == 0) {
+        return view;
+    }
+    view.data = tensor.data<const T>();
+    if (view.data) {
+        if (runner) {
+            runner->last_timing.zero_copy_count += 1;
+        }
+        return view;
+    }
+    const auto copy_started = std::chrono::steady_clock::now();
+    view.host_tensor = ov::Tensor(tensor.get_element_type(), tensor.get_shape());
+    tensor.copy_to(view.host_tensor);
+    if (runner) {
+        runner->last_timing.host_copy_ms += elapsed_ms_since(copy_started);
+        runner->last_timing.host_copy_bytes += static_cast<uint64_t>(tensor.get_byte_size());
+        runner->last_timing.host_copy_fallback_count += 1;
+    }
+    view.data = view.host_tensor.template data<const T>();
+    view.copied = true;
+    if (!view.data) {
+        std::ostringstream msg;
+        msg << "failed to copy " << (label ? label : "tensor") << " to host-readable memory ("
+            << tensor_debug_string(tensor) << ")";
+        throw std::runtime_error(msg.str());
+    }
+    return view;
+}
+
+template <typename T>
+std::vector<T> tensor_to_host_vector(NativeCodegen* runner, const ov::Tensor& tensor, const char* label) {
+    const size_t size = tensor.get_size();
+    if (size == 0) {
+        return {};
+    }
+    const auto view = tensor_to_host_view<T>(runner, tensor, label);
+    return std::vector<T>(view.data, view.data + view.size);
+}
+
+struct FloatTensorView {
+    const float* data = nullptr;
+    size_t size = 0;
+    ov::Tensor host_tensor;
+    std::vector<float> converted_storage;
+    bool copied = false;
+    bool converted = false;
+};
+
+FloatTensorView tensor_to_host_f32_view(NativeCodegen* runner, const ov::Tensor& tensor, const char* label) {
+    FloatTensorView view;
+    view.size = tensor.get_size();
+    if (view.size == 0) {
+        return view;
+    }
+    const auto element_type = tensor.get_element_type();
+    if (element_type == ov::element::f32) {
+        auto base = tensor_to_host_view<float>(runner, tensor, label);
+        view.data = base.data;
+        view.size = base.size;
+        view.host_tensor = std::move(base.host_tensor);
+        view.copied = base.copied;
+        return view;
+    }
+    if (element_type == ov::element::f16) {
+        const auto values = tensor_to_host_view<ov::float16>(runner, tensor, label);
+        view.converted_storage.reserve(values.size);
+        for (size_t i = 0; i < values.size; ++i) {
+            view.converted_storage.push_back(static_cast<float>(values.data[i]));
+        }
+        view.data = view.converted_storage.data();
+        view.size = view.converted_storage.size();
+        view.copied = values.copied;
+        view.converted = true;
+        return view;
+    }
+    if (element_type == ov::element::bf16) {
+        const auto values = tensor_to_host_view<ov::bfloat16>(runner, tensor, label);
+        view.converted_storage.reserve(values.size);
+        for (size_t i = 0; i < values.size; ++i) {
+            view.converted_storage.push_back(static_cast<float>(values.data[i]));
+        }
+        view.data = view.converted_storage.data();
+        view.size = view.converted_storage.size();
+        view.copied = values.copied;
+        view.converted = true;
+        return view;
+    }
+    std::ostringstream msg;
+    msg << (label ? label : "tensor") << " must be f32/f16/bf16, got " << tensor_debug_string(tensor);
+    throw std::runtime_error(msg.str());
+}
+
+std::vector<float> tensor_to_host_f32_vector(NativeCodegen* runner, const ov::Tensor& tensor, const char* label) {
+    const auto view = tensor_to_host_f32_view(runner, tensor, label);
+    if (!view.data || view.size == 0) {
+        return {};
+    }
+    return std::vector<float>(view.data, view.data + view.size);
+}
+
 bool env_enabled(const char* name, bool default_value) {
     return enabled_env(name, default_value);
 }
@@ -903,6 +1031,8 @@ std::string native_timing_json(const NativeCodegen& runner) {
     json += ", \"paged_kv_cache_input_precision\": \"" + json_escape_native(runner.paged_kv_cache_input_precision) + "\"";
     json += ", \"paged_split_subcode\": ";
     json += runner.paged_split_subcode ? "true" : "false";
+    json += ", \"async_decode\": ";
+    json += runner.last_async_decode ? "true" : "false";
     json += ", \"paged_static_decode_enabled\": ";
     json += runner.paged_static_decode_enabled ? "true" : "false";
     json += ", \"paged_static_decode_mode\": \"" + json_escape_native(runner.paged_static_decode_mode) + "\"";
@@ -912,8 +1042,17 @@ std::string native_timing_json(const NativeCodegen& runner) {
     json += ", \"sampling_ms\": " + std::to_string(item.sampling_ms);
     json += ", \"decode_infer_ms\": " + std::to_string(item.decode_infer_ms);
     json += ", \"callback_ms\": " + std::to_string(item.callback_ms);
+    json += ", \"callback_enqueue_ms\": " + std::to_string(item.callback_enqueue_ms);
+    json += ", \"inline_decode_ms\": " + std::to_string(item.inline_decode_ms);
     json += ", \"codegen_callback_ms\": " + std::to_string(item.codegen_callback_ms);
     json += ", \"decode_callback_ms\": " + std::to_string(item.decode_callback_ms);
+    json += ", \"decode_queue_wait_ms\": " + std::to_string(item.decode_queue_wait_ms);
+    json += ", \"decode_queue_depth_max\": " + std::to_string(item.decode_queue_depth_max);
+    json += ", \"host_copy_ms\": " + std::to_string(item.host_copy_ms);
+    json += ", \"host_copy_bytes\": " + std::to_string(item.host_copy_bytes);
+    json += ", \"host_copy_fallback_count\": " + std::to_string(item.host_copy_fallback_count);
+    json += ", \"zero_copy_count\": " + std::to_string(item.zero_copy_count);
+    json += ", \"pcm_convert_ms\": " + std::to_string(item.pcm_convert_ms);
     json += ", \"total_ms\": " + std::to_string(item.total_ms);
     json += "}";
     return json;
@@ -1072,6 +1211,7 @@ struct NativeDecodeTask {
     int64_t chunk_index = 0;
     bool is_final = false;
     double codegen_ms = 0.0;
+    std::chrono::steady_clock::time_point queued_at;
 };
 
 struct NativeAudioStreamState {
@@ -1121,6 +1261,7 @@ NativeDecodeTask make_decode_task(NativeAudioStreamState& state, bool is_final) 
     task.chunk_index = state.chunk_index;
     task.is_final = is_final;
     task.codegen_ms = codegen_ms;
+    task.queued_at = decode_submit_time;
 
     if (new_frames <= 0) {
         state.chunk_index += 1;
@@ -1160,6 +1301,7 @@ NativeDecodeTask make_decode_task(NativeAudioStreamState& state, bool is_final) 
 void execute_decode_task(NativeAudioStreamState& state, const NativeDecodeTask& task) {
     auto* runner = state.runner;
     const int64_t num_code_groups = task.num_code_groups;
+    runner->last_timing.decode_queue_wait_ms += std::max(0.0, elapsed_ms_since(task.queued_at));
 
     if (task.new_frames <= 0) {
         if (state.callback) {
@@ -1314,16 +1456,27 @@ void decode_and_emit_audio(NativeAudioStreamState& state, bool is_final) {
     rethrow_decode_worker_error(state);
     NativeDecodeTask task = make_decode_task(state, is_final);
     if (!state.async_decode) {
-        execute_decode_task(state, task);
+        double inline_ms = 0.0;
+        measure_ms(inline_ms, [&]() {
+            execute_decode_task(state, task);
+        });
+        state.runner->last_timing.inline_decode_ms += inline_ms;
         return;
     }
+    double enqueue_ms = 0.0;
     {
+        const auto enqueue_started = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(state.mutex);
         if (state.worker_error) {
             std::rethrow_exception(state.worker_error);
         }
         state.decode_queue.push_back(std::move(task));
+        state.runner->last_timing.decode_queue_depth_max = std::max<int64_t>(
+            state.runner->last_timing.decode_queue_depth_max,
+            static_cast<int64_t>(state.decode_queue.size()));
+        enqueue_ms = elapsed_ms_since(enqueue_started);
     }
+    state.runner->last_timing.callback_enqueue_ms += enqueue_ms;
     state.cv.notify_one();
 }
 
@@ -1511,6 +1664,7 @@ void bind_paged_step_inputs(
 }
 
 int64_t select_first_code_from_logits(
+    NativeCodegen* runner,
     const ov::Tensor& logits_tensor,
     int64_t generated,
     int64_t min_new_tokens,
@@ -1521,12 +1675,34 @@ int64_t select_first_code_from_logits(
     const NativeSamplingConfig* sampling = nullptr,
     std::mt19937_64* rng = nullptr) {
     const size_t size = logits_tensor.get_size();
-    const float* logits_base = tensor_data<float>(logits_tensor);
-    if (!logits_base || size == 0 || vocab_size <= 0 || static_cast<size_t>(vocab_size) > size) {
-        throw std::runtime_error("invalid paged split logits tensor");
+    const auto logits_host = tensor_to_host_f32_view(runner, logits_tensor, "paged split logits");
+    int64_t effective_vocab_size = vocab_size;
+    const auto shape = logits_tensor.get_shape();
+    if (!shape.empty() && shape.back() > 0) {
+        const int64_t last_dim = static_cast<int64_t>(shape.back());
+        if (
+            effective_vocab_size <= 0 ||
+            static_cast<size_t>(effective_vocab_size) > size ||
+            size % static_cast<size_t>(effective_vocab_size) != 0) {
+            effective_vocab_size = last_dim;
+        }
     }
-    const size_t rows = std::max<size_t>(1, size / static_cast<size_t>(vocab_size));
-    const float* logits = logits_base + (rows - 1) * static_cast<size_t>(vocab_size);
+    if (
+        !logits_host.data ||
+        logits_host.size == 0 ||
+        size == 0 ||
+        effective_vocab_size <= 0 ||
+        static_cast<size_t>(effective_vocab_size) > logits_host.size ||
+        logits_host.size % static_cast<size_t>(effective_vocab_size) != 0) {
+        std::ostringstream msg;
+        msg << "invalid paged split logits tensor (" << tensor_debug_string(logits_tensor)
+            << ", requested_vocab_size=" << vocab_size
+            << ", effective_vocab_size=" << effective_vocab_size << ")";
+        throw std::runtime_error(msg.str());
+    }
+    vocab_size = effective_vocab_size;
+    const size_t rows = std::max<size_t>(1, logits_host.size / static_cast<size_t>(vocab_size));
+    const float* logits = logits_host.data + (rows - 1) * static_cast<size_t>(vocab_size);
     const int64_t suppress_from = std::max<int64_t>(0, vocab_size - 1024);
     std::vector<std::pair<int64_t, float>> candidates;
     candidates.reserve(static_cast<size_t>(vocab_size));
@@ -1618,14 +1794,18 @@ int64_t select_first_code_from_logits(
     return candidates[distribution(*rng)].first;
 }
 
-const float* last_hidden_vector_ptr(const ov::Tensor& last_hidden_tensor, int64_t hidden_size) {
-    const float* base = tensor_data<float>(last_hidden_tensor);
+std::vector<float> last_hidden_vector(NativeCodegen* runner, const ov::Tensor& last_hidden_tensor, int64_t hidden_size) {
+    const auto host = tensor_to_host_f32_view(runner, last_hidden_tensor, "paged split last_hidden");
     const size_t size = last_hidden_tensor.get_size();
-    if (!base || hidden_size <= 0 || size < static_cast<size_t>(hidden_size)) {
-        throw std::runtime_error("invalid paged split last_hidden tensor");
+    if (!host.data || host.size == 0 || hidden_size <= 0 || size < static_cast<size_t>(hidden_size)) {
+        std::ostringstream msg;
+        msg << "invalid paged split last_hidden tensor (" << tensor_debug_string(last_hidden_tensor)
+            << ", hidden_size=" << hidden_size << ")";
+        throw std::runtime_error(msg.str());
     }
-    const size_t rows = std::max<size_t>(1, size / static_cast<size_t>(hidden_size));
-    return base + (rows - 1) * static_cast<size_t>(hidden_size);
+    const size_t rows = std::max<size_t>(1, host.size / static_cast<size_t>(hidden_size));
+    const float* last_row = host.data + (rows - 1) * static_cast<size_t>(hidden_size);
+    return std::vector<float>(last_row, last_row + hidden_size);
 }
 
 void run_paged_split_subcode_step(
@@ -1644,15 +1824,36 @@ void run_paged_split_subcode_step(
         throw std::runtime_error("paged split subcode graph is not configured");
     }
     auto& request = runner->subcode_request;
-    const float* last_hidden = last_hidden_vector_ptr(last_hidden_tensor, hidden_size);
+    std::vector<float> last_hidden;
     int64_t first_code_buffer[1] = {first_code};
     measure_ms(runner->last_timing.tensor_bind_ms, [&]() {
-        request.set_tensor(
-            "past_hidden",
-            ov::Tensor(
-                ov::element::f32,
-                ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
-                const_cast<float*>(last_hidden)));
+        bool direct_hidden_bound = false;
+        const auto hidden_shape = last_hidden_tensor.get_shape();
+        const bool direct_hidden_enabled = env_enabled("QWEN3_TTS_OV_NATIVE_SPLIT_SUBCODE_REMOTE_HIDDEN", true);
+        if (
+            direct_hidden_enabled &&
+            last_hidden_tensor.get_element_type() == ov::element::f32 &&
+            hidden_shape.size() == 3 &&
+            hidden_shape[0] == 1 &&
+            hidden_shape[1] == 1 &&
+            hidden_shape[2] == static_cast<size_t>(hidden_size)) {
+            try {
+                request.set_tensor("past_hidden", last_hidden_tensor);
+                direct_hidden_bound = true;
+                runner->last_timing.zero_copy_count += 1;
+            } catch (...) {
+                direct_hidden_bound = false;
+            }
+        }
+        if (!direct_hidden_bound) {
+            last_hidden = last_hidden_vector(runner, last_hidden_tensor, hidden_size);
+            request.set_tensor(
+                "past_hidden",
+                ov::Tensor(
+                    ov::element::f32,
+                    ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
+                    const_cast<float*>(last_hidden.data())));
+        }
         request.set_tensor(
             "first_code",
             ov::Tensor(ov::element::i64, ov::Shape{1, 1}, first_code_buffer));
@@ -1663,16 +1864,25 @@ void run_paged_split_subcode_step(
     record_request_profile(runner, "codegen_paged_kv_subcode", request);
     auto codes_tensor = request.get_output_tensor(0);
     auto sum_embed_tensor = request.get_output_tensor(1);
-    const int64_t* codes = tensor_data<int64_t>(codes_tensor);
-    const float* sum_embed = tensor_data<float>(sum_embed_tensor);
-    if (static_cast<int64_t>(codes_tensor.get_size()) < num_code_groups) {
-        throw std::runtime_error("paged split subcode graph returned too few codec groups");
+    const auto codes = tensor_to_host_view<int64_t>(runner, codes_tensor, "paged split subcode codes");
+    const auto sum_embed = tensor_to_host_f32_view(runner, sum_embed_tensor, "paged split subcode sum_embed");
+    if (!codes.data || static_cast<int64_t>(codes.size) < num_code_groups) {
+        std::ostringstream msg;
+        msg << "paged split subcode graph returned too few codec groups (" << tensor_debug_string(codes_tensor)
+            << ", expected_groups=" << num_code_groups << ")";
+        throw std::runtime_error(msg.str());
     }
-    frame_codes.assign(codes, codes + num_code_groups);
+    if (!sum_embed.data || static_cast<int64_t>(sum_embed.size) < hidden_size) {
+        std::ostringstream msg;
+        msg << "paged split subcode graph returned too small sum_embed (" << tensor_debug_string(sum_embed_tensor)
+            << ", hidden_size=" << hidden_size << ")";
+        throw std::runtime_error(msg.str());
+    }
+    frame_codes.assign(codes.data, codes.data + num_code_groups);
     next_embed.resize(static_cast<size_t>(hidden_size));
     for (int64_t i = 0; i < hidden_size; ++i) {
         next_embed[static_cast<size_t>(i)] =
-            sum_embed[static_cast<size_t>(i)] + tts_pad_embed[static_cast<size_t>(i)];
+            sum_embed.data[static_cast<size_t>(i)] + tts_pad_embed[static_cast<size_t>(i)];
     }
 }
 
@@ -1852,6 +2062,7 @@ void run_paged_kv_impl(
             int64_t first_code = 0;
             measure_ms(runner->last_timing.sampling_ms, [&]() {
                 first_code = select_first_code_from_logits(
+                    runner,
                     logits_tensor,
                     generated,
                     min_new_tokens,
@@ -2611,7 +2822,8 @@ public:
         state.runner = &m_runner;
         state.callback = callback;
         state.user_data = user_data;
-        state.async_decode = env_enabled("QWEN3_TTS_OV_NATIVE_ASYNC_DECODE", false);
+        state.async_decode = env_enabled("QWEN3_TTS_OV_NATIVE_ASYNC_DECODE", true);
+        m_runner.last_async_decode = state.async_decode;
         state.codegen_started = std::chrono::steady_clock::now();
         if (prefix_frames > 0) {
             const size_t prefix_values = static_cast<size_t>(prefix_frames * num_code_groups);

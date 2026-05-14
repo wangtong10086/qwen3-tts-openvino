@@ -38,6 +38,11 @@ from .profiles import (
     kv_cache_profile_options,
 )
 from .runtime import OpenVINOQwen3TTS
+from .model_download import (
+    DEFAULT_RELEASE_MODEL_REPO,
+    DEFAULT_RELEASE_MODEL_REVISION,
+    DEFAULT_RELEASE_MODEL_SUBDIR,
+)
 
 
 def add_runtime_args(
@@ -223,8 +228,10 @@ def apply_native_env(args):
         else:
             os.environ[env_name] = "require"
     async_decode = getattr(args, "native_async_decode", None)
-    if async_decode in (None, "auto", "off"):
+    if async_decode in (None, "auto"):
         os.environ.pop("QWEN3_TTS_OV_NATIVE_ASYNC_DECODE", None)
+    elif async_decode == "off":
+        os.environ["QWEN3_TTS_OV_NATIVE_ASYNC_DECODE"] = "0"
     elif async_decode == "on":
         os.environ["QWEN3_TTS_OV_NATIVE_ASYNC_DECODE"] = "1"
     buffer_reuse = getattr(args, "native_buffer_reuse", None)
@@ -611,7 +618,14 @@ def run_serve(args):
         max_continuous_prompt_tokens=args.max_continuous_prompt_tokens,
         max_vram_ratio=args.max_vram_ratio,
         kv_cache_profile=args.kv_cache_profile,
+        kv_cache_preallocation=args.kv_cache_preallocation,
+        kv_cache_reserve_mb=args.kv_cache_reserve_mb,
+        kv_cache_max_blocks=args.kv_cache_max_blocks,
         usm_retry_count=args.usm_retry_count,
+        model_download_repo=args.model_repo,
+        model_download_revision=args.model_revision,
+        model_download_subdir=args.model_subdir,
+        model_download_cache_dir=args.model_cache_dir,
     )
 
 
@@ -819,6 +833,10 @@ def main(argv=None):
     serve_parser = sub.add_parser("serve")
     add_runtime_args(serve_parser, default_ir_dir=None, include_generation=False, include_output=False)
     serve_parser.add_argument("--model-root", default="openvino")
+    serve_parser.add_argument("--model-repo", default=DEFAULT_RELEASE_MODEL_REPO)
+    serve_parser.add_argument("--model-revision", default=DEFAULT_RELEASE_MODEL_REVISION)
+    serve_parser.add_argument("--model-subdir", default=DEFAULT_RELEASE_MODEL_SUBDIR)
+    serve_parser.add_argument("--model-cache-dir", default=None)
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=17860)
     serve_parser.add_argument("--no-warmup", action="store_true")
@@ -837,6 +855,22 @@ def main(argv=None):
         "--max-vram-ratio",
         default=None,
         help="Memory budget ratio used when prompt tokens are auto: 0.8 or 80 means 80%%.",
+    )
+    serve_parser.add_argument(
+        "--kv-cache-preallocation",
+        default="auto",
+        choices=["auto", "off", "static"],
+        help="KV cache planner allocation mode. static also enables native static decode blocks.",
+    )
+    serve_parser.add_argument(
+        "--kv-cache-reserve-mb",
+        default="auto",
+        help="Non-KV GPU memory reserve for the planner, in MiB, or auto.",
+    )
+    serve_parser.add_argument(
+        "--kv-cache-max-blocks",
+        default="auto",
+        help="Optional maximum KV cache blocks for the planner.",
     )
     serve_parser.add_argument("--usm-retry-count", type=int, default=1)
     serve_parser.set_defaults(func=run_serve)

@@ -4,7 +4,48 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from qwen3_tts_ov import server
+from qwen3_tts_ov import model_download, server
+from qwen3_tts_ov.runtime import StreamChunk
+
+
+def budget_planner_manifest(include_talker_config=True):
+    manifest = {
+        "format": "qwen3_tts_openvino_v3",
+        "tts_model_type": "voice_design",
+        "tts_model_size": "1.7B",
+        "graphs": {},
+        "graph_variants": {},
+        "paged_kv": {
+            "default_block_size": 16,
+            "kv_cache_heads": 16,
+            "kv_cache_gqa_heads": 8,
+            "kv_cache_head_dim": 128,
+        },
+    }
+    if include_talker_config:
+        manifest["talker_config"] = {
+            "num_hidden_layers": 28,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "hidden_size": 2048,
+            "head_dim": 128,
+            "max_position_embeddings": 32768,
+        }
+    return manifest
+
+
+def test_chunk_to_pcm16_prefers_precomputed_bytes():
+    chunk = StreamChunk(
+        index=0,
+        audio=np.asarray([0.0, 1.0], dtype=np.float32),
+        sample_rate=24000,
+        codes=np.empty((0, 16), dtype=np.int64),
+        is_final=False,
+        timings={},
+        pcm_s16le=b"native-pcm",
+    )
+
+    assert server.chunk_to_pcm16(chunk) == b"native-pcm"
 
 
 def test_auto_segment_requires_explicit_allow(monkeypatch):
@@ -208,6 +249,95 @@ def test_sidecar_long_text_uses_builtin_paged_sample_profile_without_outputs_sum
     assert runtime_kwargs[0]["native_paged_kv_split_subcode"] == "1"
 
 
+def test_health_reports_voice_clone_unavailable_when_base_ir_missing(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+
+    monkeypatch.chdir(tmp_path)
+    ir_dir = tmp_path / "openvino" / "voice_design"
+    ir_dir.mkdir(parents=True)
+    (ir_dir / "manifest.json").write_text(
+        json.dumps({"tts_model_type": "voice_design", "graphs": {}, "graph_variants": {}}),
+        encoding="utf-8",
+    )
+    app = server.create_app(model_root=tmp_path / "openvino", warmup=False)
+    client = fastapi_testclient.TestClient(app)
+
+    response = client.get("/health")
+    assert response.status_code == 200
+    modes = response.json()["available_modes"]
+
+    assert modes["voice_design"]["available"] is True
+    assert modes["voice_clone"]["available"] is False
+    assert modes["voice_clone"]["required_manifest"].endswith("openvino/base/manifest.json")
+
+
+def test_voice_clone_request_fails_before_runtime_when_base_ir_missing(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+
+    monkeypatch.chdir(tmp_path)
+    ir_dir = tmp_path / "openvino" / "voice_design"
+    ir_dir.mkdir(parents=True)
+    (ir_dir / "manifest.json").write_text(
+        json.dumps({"tts_model_type": "voice_design", "graphs": {}, "graph_variants": {}}),
+        encoding="utf-8",
+    )
+    app = server.create_app(model_root=tmp_path / "openvino", warmup=False)
+    client = fastapi_testclient.TestClient(app)
+
+    response = client.post(
+        "/v1/tts/tokenize",
+        json={"mode": "voice_clone", "text": "hello", "language": "English", "ref_text": "hello"},
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "VoiceClone is not available" in detail
+    assert "openvino/base/manifest.json" in detail
+
+
+def test_model_download_endpoint_installs_missing_voice_clone_ir(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+
+    monkeypatch.chdir(tmp_path)
+    voice_design = tmp_path / "openvino" / "voice_design"
+    voice_design.mkdir(parents=True)
+    (voice_design / "manifest.json").write_text(
+        json.dumps({"tts_model_type": "voice_design", "graphs": {}, "graph_variants": {}}),
+        encoding="utf-8",
+    )
+
+    def fake_snapshot_download(*, repo_id, revision, local_dir, subdir, allow_patterns=None):
+        target = local_dir / subdir / "base"
+        target.mkdir(parents=True)
+        (target / "manifest.json").write_text(
+            json.dumps({"tts_model_type": "base", "graphs": {}, "graph_variants": {}}),
+            encoding="utf-8",
+        )
+        return local_dir
+
+    monkeypatch.setattr(model_download, "_snapshot_download", fake_snapshot_download)
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        model_download_repo="owner/repo",
+        model_download_subdir="openvino_realtime",
+        model_download_cache_dir=tmp_path / "cache",
+    )
+    client = fastapi_testclient.TestClient(app)
+
+    before = client.get("/health").json()
+    assert before["available_modes"]["voice_clone"]["available"] is False
+    assert before["available_modes"]["voice_clone"]["download"]["status"] == "missing"
+
+    response = client.post("/v1/models/download", json={"mode": "voice_clone", "sync": True})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["job"]["status"] == "downloaded"
+    assert payload["available_modes"]["voice_clone"]["available"] is True
+    assert (tmp_path / "openvino" / "base" / "manifest.json").exists()
+
+
 def test_auto_long_text_profile_only_applies_sampled_paged_winners(monkeypatch):
     assert server.should_auto_apply_long_text_profile({"profile": "long_paged_split_sample_int8_sym"})
     assert not server.should_auto_apply_long_text_profile({"profile": "long_reference_no_cache_fp16_sample"})
@@ -228,7 +358,7 @@ def test_long_voice_design_defaults_to_sampling():
     assert kwargs["repetition_penalty"] == 1.05
 
 
-def test_full_context_long_text_uses_conservative_frame_budget():
+def test_full_context_generation_kwargs_keeps_requested_cap_until_prompt_is_known():
     text = "据央视网昨日消息，白宫公布了将随特朗普一同访华的商界领袖名单。" * 4
     request = {
         "mode": "voice_design",
@@ -239,8 +369,25 @@ def test_full_context_long_text_uses_conservative_frame_budget():
 
     kwargs = server.generation_kwargs(request)
 
-    assert kwargs["max_new_tokens"] >= server.speech_text_unit_count(text) * 4
-    assert kwargs["max_new_tokens"] <= 2048
+    assert kwargs["max_new_tokens"] == 48
+    assert kwargs["do_sample"] is True
+
+
+def test_full_context_generation_does_not_estimate_speech_length_in_generation_kwargs():
+    text = (
+        "This is a long technical report paragraph with enough English words "
+        "to require more than the legacy two thousand forty eight codec frame cap. "
+    ) * 500
+    request = {
+        "mode": "voice_design",
+        "text": text,
+        "full_context_text": True,
+        "generation": {"max_new_tokens": 48},
+    }
+
+    kwargs = server.generation_kwargs(request)
+
+    assert kwargs["max_new_tokens"] == 48
 
 
 def test_explicit_do_sample_false_is_respected_for_long_text():
@@ -290,6 +437,91 @@ def test_continuous_prompt_budget_rejects_invalid_values():
         server.resolve_continuous_prompt_budget("auto", uses_gpu_device=True, max_vram_ratio=120)
 
 
+def test_kv_cache_planner_budget_scales_with_vram_ratio(monkeypatch, tmp_path):
+    monkeypatch.setenv("QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA", "1")
+    monkeypatch.setattr(server, "openvino_device_total_memory_bytes", lambda device: 512 * 1024 * 1024)
+    manifest = budget_planner_manifest()
+    ctx = server.kv_cache_budget_context(
+        ir_dir=tmp_path,
+        manifest=manifest,
+        uses_gpu_device=True,
+        device="GPU",
+        kv_cache_precision="u8",
+        kv_cache_input_precision="f32",
+        kv_cache_block_size=16,
+        kv_cache_reserve_mb=0,
+    )
+
+    meta50 = server.continuous_prompt_budget_metadata(
+        "auto",
+        uses_gpu_device=True,
+        max_vram_ratio=50,
+        max_new_tokens=512,
+        kv_budget_context=ctx,
+    )
+    meta80 = server.continuous_prompt_budget_metadata(
+        "auto",
+        uses_gpu_device=True,
+        max_vram_ratio=80,
+        max_new_tokens=512,
+        kv_budget_context=ctx,
+    )
+
+    assert ctx["kv_cache_planner_bytes_per_block"] == ctx["kv_cache_conservative_bytes_per_block"]
+    assert ctx["kv_cache_planner_bytes_per_block"] > ctx["kv_cache_bytes_per_block"]
+    assert meta50["continuous_prompt_budget_source"] == "kv_cache_planner"
+    assert meta80["long_text_budget_policy"] == "auto_gpu_80pct_kv_planner"
+    assert meta80["preallocated_kv_blocks"] > meta50["preallocated_kv_blocks"]
+    assert meta80["effective_max_continuous_prompt_tokens"] > meta50["effective_max_continuous_prompt_tokens"]
+
+
+def test_kv_cache_planner_u8_allows_more_tokens_than_fp16_when_cache_input_is_u8(monkeypatch, tmp_path):
+    monkeypatch.setenv("QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA", "1")
+    monkeypatch.setattr(server, "openvino_device_total_memory_bytes", lambda device: 512 * 1024 * 1024)
+    manifest = budget_planner_manifest()
+
+    ctx_u8 = server.kv_cache_budget_context(
+        ir_dir=tmp_path,
+        manifest=manifest,
+        uses_gpu_device=True,
+        device="GPU",
+        kv_cache_precision="u8",
+        kv_cache_input_precision="u8",
+        kv_cache_block_size=16,
+        kv_cache_reserve_mb=0,
+    )
+    ctx_fp16 = server.kv_cache_budget_context(
+        ir_dir=tmp_path,
+        manifest=manifest,
+        uses_gpu_device=True,
+        device="GPU",
+        kv_cache_precision="f16",
+        kv_cache_input_precision="f16",
+        kv_cache_block_size=16,
+        kv_cache_reserve_mb=0,
+    )
+
+    meta_u8 = server.continuous_prompt_budget_metadata(
+        "auto",
+        uses_gpu_device=True,
+        max_vram_ratio=80,
+        max_new_tokens=512,
+        kv_budget_context=ctx_u8,
+    )
+    meta_fp16 = server.continuous_prompt_budget_metadata(
+        "auto",
+        uses_gpu_device=True,
+        max_vram_ratio=80,
+        max_new_tokens=512,
+        kv_budget_context=ctx_fp16,
+    )
+
+    assert ctx_fp16["kv_cache_bytes_per_block"] == ctx_u8["kv_cache_bytes_per_block"] * 2
+    assert ctx_fp16["kv_cache_planner_bytes_per_block"] == ctx_u8["kv_cache_planner_bytes_per_block"] * 2
+    assert meta_u8["preallocated_kv_blocks"] > meta_fp16["preallocated_kv_blocks"]
+    assert meta_u8["effective_max_continuous_prompt_tokens"] > meta_fp16["effective_max_continuous_prompt_tokens"]
+
+
 def test_health_reports_effective_continuous_prompt_budget(monkeypatch, tmp_path):
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
     monkeypatch.delenv("QWEN3_TTS_OV_NATIVE_PAGED_KV", raising=False)
@@ -309,6 +541,35 @@ def test_health_reports_effective_continuous_prompt_budget(monkeypatch, tmp_path
     assert cpu_health["memory"]["effective_max_continuous_prompt_tokens"] == 4096
     assert cpu_health["memory"]["long_text_budget_policy"] == "auto_cpu_100pct"
     assert cpu_health["memory"]["max_vram_percent"] == 100
+
+
+def test_health_uses_kv_planner_for_release_minimal_manifest(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA", "1")
+    monkeypatch.setattr(server, "openvino_device_total_memory_bytes", lambda device: 2 * 1024 * 1024 * 1024)
+    ir_dir = tmp_path / "openvino" / "voice_design"
+    ir_dir.mkdir(parents=True)
+    (ir_dir / "manifest.json").write_text(
+        json.dumps(budget_planner_manifest(include_talker_config=False)),
+        encoding="utf-8",
+    )
+
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        device="GPU",
+        kv_cache_reserve_mb=0,
+    )
+    health = fastapi_testclient.TestClient(app).get("/health").json()
+    memory = health["memory"]
+
+    assert memory["continuous_prompt_budget_source"] == "kv_cache_planner"
+    assert memory["kv_cache_planner_available"] is True
+    assert memory["kv_cache_planner_estimated_config"] is True
+    assert memory["effective_max_total_tokens"] == 7488
+    assert memory["preallocated_kv_blocks"] == 468
+    assert memory["effective_max_continuous_prompt_tokens"] == 7439
 
 
 def test_tokenize_endpoint_uses_real_tokenizer_budget(monkeypatch, tmp_path):
@@ -365,6 +626,132 @@ def test_tokenize_endpoint_uses_real_tokenizer_budget(monkeypatch, tmp_path):
     assert data["effective_max_continuous_prompt_tokens"] == 1280
     assert data["max_vram_percent"] == 50
     assert data["over_prompt_budget"] is False
+
+
+def test_tokenize_endpoint_budget_accounts_for_requested_max_new_tokens(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA", "1")
+    monkeypatch.setattr(server, "openvino_device_total_memory_bytes", lambda device: 2 * 1024 * 1024 * 1024)
+    ir_dir = tmp_path / "openvino" / "voice_design"
+    ir_dir.mkdir(parents=True)
+    manifest = budget_planner_manifest()
+    manifest.update(
+        {
+            "model_dir": ".",
+            "ids": {
+                "codec_nothink_id": 1,
+                "codec_think_bos_id": 2,
+                "codec_think_eos_id": 3,
+                "codec_think_id": 4,
+                "codec_language_id": {"chinese": 5, "english": 6},
+                "spk_is_dialect": {},
+            },
+        }
+    )
+    (ir_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    class FakeTokenizer:
+        def __init__(self, model_dir):
+            self.model_dir = model_dir
+
+        def encode(self, text):
+            return list(range(len(str(text))))
+
+    monkeypatch.setattr(server, "Qwen2BPETokenizer", FakeTokenizer)
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        device="GPU",
+        kv_cache_reserve_mb=0,
+    )
+    client = fastapi_testclient.TestClient(app)
+
+    small = client.post(
+        "/v1/tts/tokenize",
+        json={
+            "mode": "voice_design",
+            "text": "你好",
+            "language": "Chinese",
+            "generation": {"max_new_tokens": 48},
+        },
+    ).json()
+    large = client.post(
+        "/v1/tts/tokenize",
+        json={
+            "mode": "voice_design",
+            "text": "你好",
+            "language": "Chinese",
+            "generation": {"max_new_tokens": 2048},
+        },
+    ).json()
+
+    assert small["continuous_prompt_budget_source"] == "kv_cache_planner"
+    assert small["effective_max_total_tokens"] == 7488
+    assert small["max_new_tokens_for_budget"] == 48
+    assert small["max_generation_tokens_available"] == small["effective_max_total_tokens"] - small["prompt_len"] - 1
+    assert small["requested_generation_over_budget"] is False
+    assert large["max_new_tokens_for_budget"] == 2048
+    assert large["max_generation_tokens_available"] == large["effective_max_total_tokens"] - large["prompt_len"] - 1
+    assert large["requested_generation_over_budget"] is False
+    assert small["effective_max_continuous_prompt_tokens"] - large["effective_max_continuous_prompt_tokens"] == 2000
+
+
+def test_static_kv_preallocation_clamps_request_budget(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA", "1")
+    monkeypatch.setattr(server, "openvino_device_total_memory_bytes", lambda device: 512 * 1024 * 1024)
+    ir_dir = tmp_path / "openvino" / "voice_design"
+    ir_dir.mkdir(parents=True)
+    manifest = budget_planner_manifest()
+    manifest.update(
+        {
+            "model_dir": ".",
+            "ids": {
+                "codec_nothink_id": 1,
+                "codec_think_bos_id": 2,
+                "codec_think_eos_id": 3,
+                "codec_think_id": 4,
+                "codec_language_id": {"chinese": 5, "english": 6},
+                "spk_is_dialect": {},
+            },
+        }
+    )
+    (ir_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    class FakeTokenizer:
+        def __init__(self, model_dir):
+            self.model_dir = model_dir
+
+        def encode(self, text):
+            return list(range(len(str(text))))
+
+    monkeypatch.setattr(server, "Qwen2BPETokenizer", FakeTokenizer)
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        device="GPU",
+        max_vram_ratio=50,
+        kv_cache_reserve_mb=0,
+        kv_cache_preallocation="static",
+    )
+    client = fastapi_testclient.TestClient(app)
+
+    data = client.post(
+        "/v1/tts/tokenize",
+        json={
+            "mode": "voice_design",
+            "text": "你好",
+            "language": "Chinese",
+            "max_vram_ratio": 90,
+            "generation": {"max_new_tokens": 48},
+        },
+    ).json()
+
+    assert data["preallocated_kv_blocks"] == 73
+    assert data["effective_max_total_tokens"] == 1168
+    assert data["kv_cache_limit_source"] == "kv_cache_max_blocks"
 
 
 def test_default_auto_budget_allows_prompt_above_old_1024_limit(monkeypatch, tmp_path):
@@ -424,6 +811,100 @@ def test_default_auto_budget_allows_prompt_above_old_1024_limit(monkeypatch, tmp
         assert websocket.receive_json()["type"] == "audio"
         websocket.receive_bytes()
         assert websocket.receive_json()["type"] == "final"
+
+
+def test_full_context_stream_runs_until_eos_or_context_capacity(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA", "1")
+    monkeypatch.setattr(server, "openvino_device_total_memory_bytes", lambda device: 2 * 1024 * 1024 * 1024)
+    ir_dir = tmp_path / "openvino" / "voice_design"
+    ir_dir.mkdir(parents=True)
+    manifest = budget_planner_manifest()
+    manifest.update(
+        {
+            "model_dir": ".",
+            "ids": {
+                "codec_nothink_id": 1,
+                "codec_think_bos_id": 2,
+                "codec_think_eos_id": 3,
+                "codec_think_id": 4,
+                "codec_language_id": {"chinese": 5, "english": 6},
+                "spk_is_dialect": {},
+            },
+        }
+    )
+    (ir_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    stream_kwargs = []
+
+    class FakeTokenizer:
+        def __init__(self, model_dir=None):
+            self.model_dir = model_dir
+
+        def encode(self, text):
+            return list(range(len(str(text))))
+
+    class FakeRuntime:
+        def __init__(self, *args, **kwargs):
+            self.tokenizer = FakeTokenizer()
+
+        def language_codec_prefill(self, language, speaker=None):
+            return [1, 2, 3, 4]
+
+        def stream_voice_design(self, **kwargs):
+            stream_kwargs.append(kwargs)
+            yield SimpleNamespace(
+                audio=np.zeros(16, dtype=np.float32),
+                sample_rate=24000,
+                codes=np.zeros((1, 16), dtype=np.int64),
+                is_final=True,
+                timings={"stream_rtf": 0.9},
+                index=0,
+            )
+
+    monkeypatch.setattr(server, "Qwen2BPETokenizer", FakeTokenizer)
+    monkeypatch.setattr(server, "OpenVINOQwen3TTS", FakeRuntime)
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        device="GPU",
+        kv_cache_reserve_mb=0,
+    )
+    client = fastapi_testclient.TestClient(app)
+    text = "This is a long technical report paragraph. " * 10
+
+    with client.websocket_connect("/v1/tts/stream") as websocket:
+        websocket.send_json(
+            {
+                "mode": "voice_design",
+                "text": text,
+                "full_context_text": True,
+                "generation": {"max_new_tokens": 48},
+                "stream": {"include_chunk_metadata": True},
+            }
+        )
+        metadata = websocket.receive_json()
+        assert metadata["type"] == "metadata"
+        assert metadata["generation_stop_condition"] == "eos_or_context_limit"
+        assert metadata["max_new_tokens"] == metadata["max_generation_tokens_available"]
+        assert metadata["context_generated_tokens"] == 0
+        assert metadata["context_used_tokens"] == metadata["prompt_len"]
+        final = websocket.receive_json()
+        assert final["type"] == "final"
+        timings = final["timings"]
+        assert timings["context_limit_tokens"] == metadata["effective_max_total_tokens"]
+        assert abs(timings["context_prompt_tokens"] - metadata["prompt_len"]) <= 1
+        assert timings["context_generated_tokens"] == 1
+        assert timings["context_used_tokens"] == timings["context_prompt_tokens"] + 1
+        assert timings["context_remaining_tokens"] == (
+            timings["context_limit_tokens"] - timings["context_prompt_tokens"] - timings["context_generated_tokens"] - 1
+        )
+        assert timings["context_usage_percent"] >= metadata["context_usage_percent"]
+        assert final["timings"]["context_generated_tokens"] == 1
+
+    assert abs(stream_kwargs[0]["max_new_tokens"] - metadata["max_generation_tokens_available"]) <= 1
+    assert stream_kwargs[0]["max_new_tokens"] > 48
 
 
 def test_explicit_1024_budget_still_blocks_oversized_prompt(monkeypatch, tmp_path):

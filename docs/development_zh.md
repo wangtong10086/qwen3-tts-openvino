@@ -69,7 +69,7 @@ git push origin v0.1.2
 3. 分别执行 smoke。
 4. 将两个 runtime 包上传到 GitHub Release。
 
-GitHub Release 只分发 runtime App。已编译 OpenVINO IR 当前发布在 Hugging Face：`waston10086/qwen3-tts-openvino-voice-design`。
+GitHub Release 只分发 runtime App。已编译 OpenVINO IR 当前发布在 Hugging Face：`waston10086/qwen3-tts-openvino-voice-design`，其中 `openvino_realtime/` 包含 VoiceDesign、CustomVoice 和 Base/VoiceClone 三个目录。
 
 ## 本地打包
 

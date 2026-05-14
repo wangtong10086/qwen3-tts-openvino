@@ -1,11 +1,12 @@
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
 
 from qwen3_tts_ov.cache import build_ov_cache_config, default_ov_cache_root, normalize_ov_cache_mode, resolve_ov_cache_dir
 from qwen3_tts_ov.cache_warmup import collect_warmup_tasks, select_buckets
-from qwen3_tts_ov.cli import apply_profile_defaults
+from qwen3_tts_ov.cli import apply_native_env, apply_profile_defaults
 from qwen3_tts_ov.manifest import resolve_ir_dir
 from qwen3_tts_ov.profiles import (
     effective_codegen_unroll,
@@ -102,6 +103,14 @@ def test_fastest_profile_preserves_explicit_native_kv_cache_precision():
     assert args.native_paged_kv_precision == "u8"
     assert args.native_paged_kv_cache_input_precision == "u8"
     assert args.native_paged_kv_block_size == 8
+
+
+def test_native_async_decode_off_sets_disable_env(monkeypatch):
+    monkeypatch.delenv("QWEN3_TTS_OV_NATIVE_ASYNC_DECODE", raising=False)
+
+    apply_native_env(SimpleNamespace(native_async_decode="off"))
+
+    assert os.environ["QWEN3_TTS_OV_NATIVE_ASYNC_DECODE"] == "0"
 
 
 def test_cache_warmup_prefers_common_low_latency_bucket():

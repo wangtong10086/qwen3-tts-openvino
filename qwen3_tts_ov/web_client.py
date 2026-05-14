@@ -260,6 +260,57 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       box-shadow: 0 1px 3px rgba(23, 32, 29, 0.12);
     }
 
+    .segmented button:disabled {
+      color: #9aa5a1;
+      background: transparent;
+      box-shadow: none;
+    }
+
+    .model-manager {
+      display: grid;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .model-row {
+      display: grid;
+      grid-template-columns: minmax(92px, 0.9fr) minmax(72px, 0.7fr) minmax(0, 1.6fr) auto;
+      gap: 8px;
+      align-items: center;
+      min-height: 40px;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface-soft);
+    }
+
+    .model-row strong {
+      font-size: 13px;
+    }
+
+    .model-row .mini-status {
+      font-size: 12px;
+      font-weight: 750;
+    }
+
+    .model-row .mini-status.good { color: var(--green); }
+    .model-row .mini-status.warn { color: #956b00; }
+    .model-row .mini-status.bad { color: var(--red); }
+
+    .model-row .model-path {
+      color: var(--muted);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .model-row button {
+      min-height: 32px;
+      padding: 7px 10px;
+      white-space: nowrap;
+    }
+
     .check {
       display: inline-flex;
       align-items: center;
@@ -351,6 +402,15 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       font-size: 14px;
       letter-spacing: 0;
       overflow-wrap: anywhere;
+    }
+
+    .helper-item strong .subline {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 650;
+      line-height: 1.25;
     }
 
     .tag {
@@ -523,6 +583,8 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       .output-grid, .status-strip { grid-template-columns: 1fr 1fr; }
       .helper { grid-template-columns: 1fr 1fr; }
       .grid-2, .grid-3, .meters { grid-template-columns: 1fr; }
+      .model-row { grid-template-columns: 1fr auto; }
+      .model-row .model-path { grid-column: 1 / -1; }
     }
 
     @media (max-width: 520px) {
@@ -575,6 +637,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
               <option value="custom_voice">CustomVoice</option>
               <option value="voice_clone">VoiceClone</option>
             </select>
+            <div id="modelManager" class="model-manager" aria-live="polite"></div>
           </div>
 
           <div class="grid-2">
@@ -609,7 +672,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
           <div class="helper">
             <div class="helper-item"><span>文本 tokens</span><strong id="textUnitsValue">0</strong></div>
             <div class="helper-item"><span>Prompt tokens</span><strong id="effectiveTokens">-</strong></div>
-            <div class="helper-item"><span>最大 tokens</span><strong id="budgetValue">auto</strong></div>
+            <div class="helper-item"><span>生成预算</span><strong id="budgetValue">auto</strong></div>
             <div class="helper-item"><span>预算状态</span><strong id="requestKind">short_ar</strong></div>
           </div>
 
@@ -642,7 +705,8 @@ WEB_CLIENT_HTML = r"""<!doctype html>
               <textarea id="refText" placeholder="Reference transcript"></textarea>
             </div>
             <div class="field">
-              <label class="check"><input id="xVectorOnly" type="checkbox"> x_vector_only</label>
+              <label class="check"><input id="xVectorOnly" type="checkbox"> x_vector_only（默认关闭）</label>
+              <span class="hint">关闭时使用参考音频 codec prompt；开启后只使用 speaker embedding。</span>
             </div>
           </div>
 
@@ -730,6 +794,8 @@ WEB_CLIENT_HTML = r"""<!doctype html>
             <div class="metric"><span>策略</span><strong id="strategyValue">smooth</strong></div>
             <div class="metric"><span>连续性</span><strong id="continuityValue">-</strong></div>
             <div class="metric"><span>采样</span><strong id="samplingValue">-</strong></div>
+            <div class="metric primary"><span>上下文</span><strong id="contextUsage">-</strong></div>
+            <div class="metric"><span>已生成 tokens</span><strong id="contextGenerated">0</strong></div>
           </div>
 
           <div class="meters">
@@ -740,6 +806,10 @@ WEB_CLIENT_HTML = r"""<!doctype html>
             <div>
               <label>播放队列</label>
               <div class="bar"><i id="queueBar"></i></div>
+            </div>
+            <div>
+              <label id="contextLine">上下文使用</label>
+              <div class="bar"><i id="contextBar"></i></div>
             </div>
           </div>
 
@@ -759,6 +829,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       wsUrl: $("wsUrl"),
       mode: $("mode"),
       modeButtons: $("modeButtons"),
+      modelManager: $("modelManager"),
       language: $("language"),
       presetText: $("presetText"),
       text: $("text"),
@@ -804,8 +875,12 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       scheduleValue: $("scheduleValue"),
       continuityValue: $("continuityValue"),
       samplingValue: $("samplingValue"),
+      contextUsage: $("contextUsage"),
+      contextGenerated: $("contextGenerated"),
       receiveBar: $("receiveBar"),
       queueBar: $("queueBar"),
+      contextBar: $("contextBar"),
+      contextLine: $("contextLine"),
       textStats: $("textStats"),
       textUnitsValue: $("textUnitsValue"),
       effectiveTokens: $("effectiveTokens"),
@@ -844,12 +919,37 @@ WEB_CLIENT_HTML = r"""<!doctype html>
     let serverPromptBudgetConfig = "auto";
     let serverPromptBudgetPolicy = "auto_gpu";
     let serverMaxVramPercent = 80;
+    let serverMaxTotalTokens = 0;
+    let serverMaxNewTokensForBudget = 0;
+    let serverKvBlocks = 0;
+    let serverKvBudgetMiB = 0;
+    let serverKvLimitSource = "fallback";
+    let contextPromptTokens = 0;
+    let contextGeneratedTokens = 0;
+    let contextUsedTokens = 0;
+    let contextLimitTokens = 0;
+    let contextRemainingTokens = 0;
+    let contextUsagePercent = 0;
+    let contextGenerationLimitTokens = 0;
     let tokenBudgetState = null;
     let tokenBudgetTimer = null;
     let tokenBudgetSeq = 0;
     let uploadedRefAudio = null;
+    let availableModes = {
+      voice_design: true,
+      custom_voice: true,
+      voice_clone: true,
+    };
+    let modeAvailabilityDetails = {};
+    let modelDownloadPollTimer = null;
     const autoSegmentUnits = 64;
     const settingsKey = "qwen3-tts-ov-web-demo-v2";
+    const settingsVoiceCloneDefaultsVersion = 2;
+    const modeLabels = {
+      voice_design: "VoiceDesign",
+      custom_voice: "CustomVoice",
+      voice_clone: "VoiceClone",
+    };
     const strategyDefaults = {
       realtime: { initialChunkFrames: 8, chunkFrames: 12, leftContextFrames: 25 },
       low_latency: { initialChunkFrames: 8, chunkFrames: 12, leftContextFrames: 25 },
@@ -906,12 +1006,6 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       return count;
     }
 
-    function estimatedFullContextCodecFrames(text, requested) {
-      const units = speechTextUnitCount(text);
-      const estimate = Math.ceil(Math.max(48, units * 4.0 + 128));
-      return Math.min(2048, Math.max(Number(requested || 48), estimate));
-    }
-
     function log(message, level = "info") {
       if (level === "debug" && !els.verboseLog.checked) return;
       const now = new Date().toLocaleTimeString();
@@ -933,6 +1027,166 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       els.playState.classList.toggle("bad", tone === "bad");
     }
 
+    function isModeAvailable(mode) {
+      return availableModes[mode] !== false;
+    }
+
+    function firstAvailableMode() {
+      for (const mode of ["voice_design", "custom_voice", "voice_clone"]) {
+        if (isModeAvailable(mode)) return mode;
+      }
+      return "voice_design";
+    }
+
+    function modeUnavailableReason(mode) {
+      const detail = modeAvailabilityDetails[mode] || {};
+      return detail.reason || `${modeLabels[mode] || mode} 模型 IR 不可用`;
+    }
+
+    function availableModeSummary() {
+      const labels = [];
+      for (const mode of ["voice_design", "custom_voice", "voice_clone"]) {
+        if (isModeAvailable(mode)) labels.push(modeLabels[mode] || mode);
+      }
+      return labels.length ? labels.join("/") : "none";
+    }
+
+    function downloadStatusTone(status, available) {
+      if (available || status === "downloaded" || status === "local") return "good";
+      if (status === "queued" || status === "downloading") return "warn";
+      return "bad";
+    }
+
+    function downloadStatusLabel(status, available) {
+      if (available || status === "downloaded" || status === "local") return "已就绪";
+      if (status === "queued") return "排队中";
+      if (status === "downloading") return "下载中";
+      if (status === "failed") return "下载失败";
+      return "缺失";
+    }
+
+    function renderModelManager() {
+      if (!els.modelManager) return;
+      els.modelManager.innerHTML = "";
+      for (const mode of ["voice_design", "custom_voice", "voice_clone"]) {
+        const entry = modeAvailabilityDetails[mode] || {};
+        const download = entry.download || {};
+        const available = entry.available !== false;
+        const status = String(download.status || (available ? "local" : "missing"));
+        const tone = downloadStatusTone(status, available);
+        const row = document.createElement("div");
+        row.className = "model-row";
+
+        const name = document.createElement("strong");
+        name.textContent = modeLabels[mode] || mode;
+        row.appendChild(name);
+
+        const state = document.createElement("span");
+        state.className = `mini-status ${tone}`;
+        state.textContent = downloadStatusLabel(status, available);
+        row.appendChild(state);
+
+        const path = document.createElement("span");
+        path.className = "model-path";
+        path.textContent = available
+          ? (entry.ir_dir || download.target_dir || "-")
+          : (download.target_manifest || entry.required_manifest || entry.expected_ir_dir || "-");
+        path.title = path.textContent;
+        row.appendChild(path);
+
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = available ? "ghost" : "secondary";
+        button.dataset.downloadMode = mode;
+        const canDownload = download.can_download !== false;
+        const busy = status === "queued" || status === "downloading";
+        button.disabled = available || busy || !canDownload;
+        button.textContent = available ? "已下载" : (busy ? "下载中" : (canDownload ? "下载" : "未配置源"));
+        button.title = canDownload
+          ? `${download.repo_id || ""}/${download.subdir || ""}`
+          : "服务端未配置该模式的 Hugging Face 下载源";
+        row.appendChild(button);
+
+        els.modelManager.appendChild(row);
+      }
+    }
+
+    function applyModeAvailability(modes) {
+      if (!modes || typeof modes !== "object") return;
+      modeAvailabilityDetails = modes;
+      for (const mode of ["voice_design", "custom_voice", "voice_clone"]) {
+        const entry = modes[mode] || {};
+        const available = entry.available !== false;
+        availableModes[mode] = available;
+        const title = available
+          ? `${modeLabels[mode] || mode} 可用${entry.ir_dir ? `: ${entry.ir_dir}` : ""}`
+          : modeUnavailableReason(mode);
+        const button = els.modeButtons.querySelector(`button[data-mode="${mode}"]`);
+        if (button) {
+          button.disabled = !available;
+          button.title = title;
+          button.classList.toggle("active", els.mode.value === mode && available);
+        }
+        const option = els.mode.querySelector(`option[value="${mode}"]`);
+        if (option) {
+          option.disabled = !available;
+          option.title = title;
+        }
+      }
+      if (!isModeAvailable(els.mode.value)) {
+        const fallback = firstAvailableMode();
+        log(`${modeLabels[els.mode.value] || els.mode.value} 当前不可用：${modeUnavailableReason(els.mode.value)}，已切换到 ${modeLabels[fallback] || fallback}`);
+        setMode(fallback);
+      }
+      renderModelManager();
+      scheduleModelDownloadPolling();
+    }
+
+    function scheduleModelDownloadPolling() {
+      if (modelDownloadPollTimer) clearTimeout(modelDownloadPollTimer);
+      const hasBusyDownload = Object.values(modeAvailabilityDetails).some((entry) => {
+        const status = entry && entry.download ? String(entry.download.status || "") : "";
+        return status === "queued" || status === "downloading";
+      });
+      if (!hasBusyDownload) return;
+      modelDownloadPollTimer = setTimeout(async () => {
+        await checkHealth();
+        scheduleModelDownloadPolling();
+      }, 1800);
+    }
+
+    async function downloadModel(mode) {
+      const detail = modeAvailabilityDetails[mode] || {};
+      const download = detail.download || {};
+      if (detail.available !== false) {
+        log(`${modeLabels[mode] || mode} 已就绪，无需下载`);
+        return;
+      }
+      if (download.can_download === false) {
+        log(`${modeLabels[mode] || mode} 未配置下载源`);
+        return;
+      }
+      log(`开始下载 ${modeLabels[mode] || mode}：${download.repo_id || "-"} / ${download.subdir || "-"}`);
+      try {
+        const res = await fetch("/v1/models/download", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ mode }),
+          cache: "no-store",
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+        if (data.available_modes) applyModeAvailability(data.available_modes);
+        if (data.job) {
+          log(`${modeLabels[mode] || mode} 下载任务：${data.job.status}`);
+          if (data.job.error) log(`${modeLabels[mode] || mode} 下载错误：${data.job.error}`);
+        }
+        scheduleModelDownloadPolling();
+      } catch (err) {
+        log(`${modeLabels[mode] || mode} 下载启动失败：${err && err.message ? err.message : err}`);
+      }
+    }
+
     function updateBudgetFromObject(data) {
       const budget = Number(data.effective_max_continuous_prompt_tokens || data.max_continuous_prompt_tokens || 0);
       if (Number.isFinite(budget) && budget >= 0) serverPromptBudget = budget;
@@ -942,6 +1196,24 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       if (data.long_text_budget_policy) {
         serverPromptBudgetPolicy = String(data.long_text_budget_policy);
       }
+      const totalTokens = Number(data.effective_max_total_tokens || 0);
+      serverMaxTotalTokens = Number.isFinite(totalTokens) && totalTokens > 0 ? totalTokens : 0;
+      if (data.max_new_tokens_for_budget !== undefined) {
+        const maxNewTokensForBudget = Number(data.max_new_tokens_for_budget || 0);
+        serverMaxNewTokensForBudget = Number.isFinite(maxNewTokensForBudget) && maxNewTokensForBudget > 0
+          ? maxNewTokensForBudget
+          : 0;
+      }
+      const kvBlocks = Number(data.preallocated_kv_blocks || 0);
+      serverKvBlocks = Number.isFinite(kvBlocks) && kvBlocks > 0 ? kvBlocks : 0;
+      const kvBudgetBytes = Number(data.kv_cache_budget_bytes || 0);
+      serverKvBudgetMiB = Number.isFinite(kvBudgetBytes) && kvBudgetBytes > 0
+        ? kvBudgetBytes / (1024 * 1024)
+        : 0;
+      if (data.kv_cache_limit_source) {
+        serverKvLimitSource = String(data.kv_cache_limit_source);
+      }
+      updateContextUsageFromObject(data, false);
       const vramPercent = Number(data.max_vram_percent);
       if (Number.isFinite(vramPercent) && vramPercent > 0) {
         serverMaxVramPercent = vramPercent;
@@ -962,11 +1234,13 @@ WEB_CLIENT_HTML = r"""<!doctype html>
         const modelRoot = data.model_root || "-";
         els.modelRootLine.textContent = modelRoot;
         if (data.memory) updateBudgetFromObject(data.memory);
+        if (data.available_modes) applyModeAvailability(data.available_modes);
+        const modesLine = `modes=${availableModeSummary()}`;
         if (errorKeys.length) {
-          setHealth(false, "预热异常", `warmup=${data.warmup.status || "-"} model=${modelRoot}`);
+          setHealth(false, "预热异常", `warmup=${data.warmup.status || "-"} model=${modelRoot} ${modesLine}`);
           log(`health warmup errors: ${JSON.stringify(errors)}`);
         } else {
-          setHealth(true, "在线", `model=${modelRoot}`);
+          setHealth(true, "在线", `model=${modelRoot} ${modesLine}`);
         }
         const runtimes = data.runtimes || {};
         const runtime = Object.values(runtimes)[0];
@@ -980,8 +1254,11 @@ WEB_CLIENT_HTML = r"""<!doctype html>
         const kvProfile = memory.kv_cache_profile || warmup.kv_cache_profile || "-";
         const kvRelative = Number(memory.kv_cache_relative_to_fp16 || warmup.kv_cache_relative_to_fp16 || 0);
         const kvLabel = kvRelative ? `${kvProfile}/${kvRelative.toFixed(2)}x` : kvProfile;
+        const totalLabel = serverMaxTotalTokens ? `, total=${serverMaxTotalTokens}` : "";
+        const blocksLabel = serverKvBlocks ? `, blocks=${serverKvBlocks}` : "";
+        const kvBudgetLabel = serverKvBudgetMiB ? `, kv_budget=${Math.round(serverKvBudgetMiB)}MiB` : "";
         els.runtimeLine.textContent =
-          `profile=${profile}, kv=${kvLabel}, budget=${serverPromptBudgetConfig}/${serverPromptBudget}, vram=${Math.round(serverMaxVramPercent)}%`;
+          `profile=${profile}, kv=${kvLabel}, budget=${serverPromptBudgetConfig}/${serverPromptBudget}${totalLabel}${blocksLabel}${kvBudgetLabel}, vram=${Math.round(serverMaxVramPercent)}%`;
         if (runtime) {
           log(
             `runtime profile=${profile}, mode=${runtime.mode || "-"}, variant=${runtime.graph_variant || "-"}, ` +
@@ -1011,6 +1288,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
         const res = await fetch("/v1/audio/voices", { cache: "no-store" });
         if (!res.ok) return;
         const data = await res.json();
+        if (data.available_modes) applyModeAvailability(data.available_modes);
         const voices = Array.isArray(data.voices) ? data.voices : [];
         els.speakerOptions.innerHTML = "";
         for (const voice of voices) {
@@ -1024,9 +1302,14 @@ WEB_CLIENT_HTML = r"""<!doctype html>
     }
 
     function setMode(mode) {
+      if (!isModeAvailable(mode)) {
+        const fallback = firstAvailableMode();
+        log(`${modeLabels[mode] || mode} 当前不可用：${modeUnavailableReason(mode)}，已切换到 ${modeLabels[fallback] || fallback}`);
+        mode = fallback;
+      }
       els.mode.value = mode;
       for (const button of els.modeButtons.querySelectorAll("button")) {
-        button.classList.toggle("active", button.dataset.mode === mode);
+        button.classList.toggle("active", button.dataset.mode === mode && !button.disabled);
       }
       updateModeFields();
       updateTextStats();
@@ -1060,6 +1343,117 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       els.maxVramPercentValue.textContent = `${Math.round(percent)}%`;
     }
 
+    function limitSourceLabel(source) {
+      const labels = {
+        model_context_limit: "模型上下文",
+        kv_cache_memory: "显存预算",
+        kv_cache_blocks: "KV blocks",
+        kv_cache_max_blocks: "KV blocks",
+        static_kv_blocks: "固定 KV",
+        configured_prompt_limit: "手动 Prompt",
+        prompt_limit: "Prompt 配置",
+        fallback: "保守默认",
+      };
+      return labels[String(source || "")] || "自动预算";
+    }
+
+    function setBudgetDisplay(lines) {
+      els.budgetValue.textContent = "";
+      for (const [index, line] of lines.entries()) {
+        const node = document.createElement("span");
+        node.textContent = line;
+        if (index > 0) node.className = "subline";
+        els.budgetValue.appendChild(node);
+      }
+    }
+
+    function updateBudgetDisplay(budgetValue, totalTokens, maxNewTokensForBudget, promptTokens, kvBlocks, kvLimitSource) {
+      const generationLimit = totalTokens > 0 && promptTokens > 0
+        ? Math.max(0, Math.floor(totalTokens - promptTokens - 1))
+        : Math.max(0, Number(maxNewTokensForBudget || 0));
+      const lines = [];
+      if (generationLimit > 0) {
+        lines.push(`可生成 ${generationLimit} tokens`);
+      } else {
+        lines.push("可生成 -");
+      }
+
+      const contextParts = [];
+      if (totalTokens > 0) contextParts.push(`总上下文 ${totalTokens}`);
+      if (promptTokens > 0) contextParts.push(`当前 Prompt ${promptTokens}`);
+      if (contextParts.length > 0) lines.push(contextParts.join("，"));
+
+      const requestParts = [];
+      if (maxNewTokensForBudget > 0) requestParts.push(`运行上限 ${maxNewTokensForBudget}`);
+      requestParts.push(budgetValue === 0 ? "Prompt 不限" : `Prompt 上限 ${budgetValue}`);
+      lines.push(requestParts.join("，"));
+
+      const resourceParts = [`显存 ${Math.round(currentMaxVramPercent())}%`];
+      if (kvBlocks > 0) resourceParts.push(`KV ${kvBlocks} blocks`);
+      resourceParts.push(`限制来自 ${limitSourceLabel(kvLimitSource)}`);
+      lines.push(resourceParts.join("，"));
+      setBudgetDisplay(lines);
+    }
+
+    function updateContextDisplay() {
+      const limit = Number(contextLimitTokens || serverMaxTotalTokens || 0);
+      const used = Number(contextUsedTokens || 0);
+      const generated = Number(contextGeneratedTokens || 0);
+      const remaining = Number(contextRemainingTokens || 0);
+      const percent = limit > 0
+        ? Math.min(100, Math.max(0, Number(contextUsagePercent || (used / limit * 100))))
+        : 0;
+      els.contextUsage.textContent = limit > 0 ? `${used} / ${limit}` : "-";
+      els.contextGenerated.textContent = contextGenerationLimitTokens > 0
+        ? `${generated} / ${contextGenerationLimitTokens}`
+        : String(generated || 0);
+      els.contextLine.textContent = limit > 0
+        ? `上下文使用 ${percent.toFixed(1)}%，剩余 ${remaining} tokens`
+        : "上下文使用";
+      els.contextBar.style.width = `${percent.toFixed(2)}%`;
+    }
+
+    function updateContextUsageFromObject(data, force = false) {
+      if (!data) return;
+      const source = data.timings && typeof data.timings === "object" ? data.timings : data;
+      const hasContext =
+        source.context_used_tokens !== undefined ||
+        source.context_generated_tokens !== undefined ||
+        source.prompt_len !== undefined ||
+        source.effective_max_total_tokens !== undefined ||
+        source.max_generation_tokens_available !== undefined ||
+        source.max_new_tokens !== undefined;
+      if (!force && !hasContext) return;
+
+      const prompt = Number(source.context_prompt_tokens ?? source.prompt_len ?? source.prompt_tokens_estimate ?? contextPromptTokens ?? 0);
+      const generated = Number(source.context_generated_tokens ?? source.emitted_frames ?? contextGeneratedTokens ?? 0);
+      const limit = Number(source.context_limit_tokens ?? source.effective_max_total_tokens ?? source.model_context_tokens ?? contextLimitTokens ?? serverMaxTotalTokens ?? 0);
+      const generationLimit = Number(
+        source.context_generation_limit_tokens ??
+        source.max_generation_tokens_available ??
+        source.effective_max_new_tokens ??
+        source.max_new_tokens ??
+        contextGenerationLimitTokens ??
+        0
+      );
+      const used = Number(source.context_used_tokens ?? (prompt + generated));
+      const remaining = Number(
+        source.context_remaining_tokens ??
+        (limit > 0 ? Math.max(0, limit - used - 1) : contextRemainingTokens || 0)
+      );
+      contextPromptTokens = Number.isFinite(prompt) ? Math.max(0, Math.floor(prompt)) : contextPromptTokens;
+      contextGeneratedTokens = Number.isFinite(generated) ? Math.max(0, Math.floor(generated)) : contextGeneratedTokens;
+      contextLimitTokens = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : contextLimitTokens;
+      contextGenerationLimitTokens = Number.isFinite(generationLimit) ? Math.max(0, Math.floor(generationLimit)) : contextGenerationLimitTokens;
+      contextUsedTokens = Number.isFinite(used) ? Math.max(0, Math.floor(used)) : (contextPromptTokens + contextGeneratedTokens);
+      contextRemainingTokens = Number.isFinite(remaining) ? Math.max(0, Math.floor(remaining)) : contextRemainingTokens;
+      contextUsagePercent = Number(source.context_usage_percent);
+      if (!Number.isFinite(contextUsagePercent)) {
+        contextUsagePercent = contextLimitTokens > 0 ? (contextUsedTokens / contextLimitTokens * 100) : 0;
+      }
+      updateContextDisplay();
+    }
+
     function tokenBudgetFingerprint() {
       return JSON.stringify({
         mode: els.mode.value,
@@ -1080,22 +1474,35 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       const chars = [...String(text || "")].length;
       const requested = Number(els.maxNewTokens.value || 48);
       const fullContext = els.mode.value === "voice_design" && units > autoSegmentUnits;
-      const effectiveFrames = fullContext ? estimatedFullContextCodecFrames(text, requested) : requested;
       const instructUnits = els.mode.value === "voice_clone" ? 0 : speechTextUnitCount(els.instruct.value);
       const promptEstimate = units + instructUnits + 16;
       const exact = tokenBudgetState && tokenBudgetState.tokenizer_exact && tokenBudgetState.fingerprint === tokenBudgetFingerprint();
       const textTokens = exact ? Number(tokenBudgetState.text_tokens || 0) : units;
       const promptTokens = exact ? Number(tokenBudgetState.prompt_len || promptEstimate) : promptEstimate;
       const budgetValue = exact ? Number(tokenBudgetState.effective_max_continuous_prompt_tokens || serverPromptBudget) : serverPromptBudget;
-      const budgetText = budgetValue === 0 ? "disabled" : `${budgetValue}`;
-      const overBudget = budgetValue > 0 && promptTokens > budgetValue;
+      const totalTokens = exact ? Number(tokenBudgetState.effective_max_total_tokens || serverMaxTotalTokens) : serverMaxTotalTokens;
+      const generationLimitKnown = exact
+        ? tokenBudgetState.max_generation_tokens_available !== undefined
+        : totalTokens > 0;
+      const maxGenerationTokensAvailable = exact
+        ? Number(tokenBudgetState.max_generation_tokens_available || 0)
+        : (totalTokens > 0 ? Math.max(0, totalTokens - promptTokens - 1) : 0);
+      const effectiveFrames = fullContext
+        ? Math.max(1, Number((tokenBudgetState && tokenBudgetState.max_new_tokens) || maxGenerationTokensAvailable || requested))
+        : requested;
+      const runtimeMaxNewTokens = exact ? Number(tokenBudgetState.max_new_tokens || effectiveFrames) : effectiveFrames;
+      const kvBlocks = exact ? Number(tokenBudgetState.preallocated_kv_blocks || serverKvBlocks) : serverKvBlocks;
+      const kvLimitSource = exact ? String(tokenBudgetState.kv_cache_limit_source || serverKvLimitSource) : serverKvLimitSource;
+      const overPromptBudget = budgetValue > 0 && promptTokens > budgetValue;
+      const overGenerationBudget = generationLimitKnown && runtimeMaxNewTokens > maxGenerationTokensAvailable;
+      const overBudget = overPromptBudget || overGenerationBudget;
       const exactLabel = exact ? "tokenizer" : "estimate";
       updateMaxVramLabel();
       els.textStats.textContent =
-        `${chars} chars, ${exactLabel} prompt=${promptTokens} tokens, max_new_tokens=${effectiveFrames || requested}`;
+        `${chars} chars, ${exactLabel} prompt=${promptTokens} tokens, runtime_max_new=${runtimeMaxNewTokens || requested}, max_generatable=${maxGenerationTokensAvailable || "-"}`;
       els.textUnitsValue.textContent = exact ? String(textTokens) : `${textTokens}*`;
       els.effectiveTokens.textContent = exact ? String(promptTokens) : `${promptTokens}*`;
-      els.budgetValue.textContent = `${budgetText} (${Math.round(currentMaxVramPercent())}%)`;
+      updateBudgetDisplay(budgetValue, totalTokens, runtimeMaxNewTokens, promptTokens, kvBlocks, kvLimitSource);
       els.requestKind.textContent = overBudget ? "超出预算" : (fullContext ? "full_ar" : "short_ar");
       els.longModeBadge.textContent = fullContext ? "full_ar" : "short_ar";
       els.longModeBadge.classList.toggle("good", fullContext);
@@ -1126,15 +1533,19 @@ WEB_CLIENT_HTML = r"""<!doctype html>
 
     function tokenBudgetPayload() {
       const mode = els.mode.value;
+      const textUnits = speechTextUnitCount(els.text.value);
+      const requestedMaxNewTokens = Number(els.maxNewTokens.value || 48);
+      const fullContext = mode === "voice_design" && textUnits > autoSegmentUnits;
       const payload = {
         mode,
         text: els.text.value,
         language: els.language.value,
         max_vram_ratio: currentMaxVramPercent(),
         generation: {
-          max_new_tokens: Number(els.maxNewTokens.value || 48),
+          max_new_tokens: requestedMaxNewTokens,
           min_new_tokens: Number(els.minNewTokens.value || 0),
         },
+        full_context_text: fullContext,
       };
       if (mode === "voice_design") {
         payload.instruct = els.instruct.value;
@@ -1186,7 +1597,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       const instructUnits = mode === "voice_clone" ? 0 : speechTextUnitCount(els.instruct.value);
       const requestedMaxNewTokens = Number(els.maxNewTokens.value);
       const fullContext = mode === "voice_design" && textUnits > autoSegmentUnits;
-      const effectiveMaxNewTokens = fullContext ? estimatedFullContextCodecFrames(els.text.value, requestedMaxNewTokens) : requestedMaxNewTokens;
+      const effectiveMaxNewTokens = requestedMaxNewTokens;
       const payload = {
         mode,
         text: els.text.value,
@@ -1227,9 +1638,11 @@ WEB_CLIENT_HTML = r"""<!doctype html>
           payload.ref_audio_name = uploadedRefAudio.name;
         }
       }
-      activeMaxNewTokens = effectiveMaxNewTokens;
+      activeMaxNewTokens = fullContext && tokenBudgetState && Number(tokenBudgetState.max_new_tokens) > 0
+        ? Number(tokenBudgetState.max_new_tokens)
+        : effectiveMaxNewTokens;
       if (fullContext) {
-        log(`长文本 full-AR，预计 ${activeMaxNewTokens} codec frames，prompt budget=${serverPromptBudgetConfig}/${serverPromptBudget}`);
+        log(`长文本 full-AR，将生成到 EOS 或上下文上限，当前运行上限=${activeMaxNewTokens} codec frames`);
       }
       return payload;
     }
@@ -1301,6 +1714,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
           refAudio: els.refAudio.value,
           refText: els.refText.value,
           xVectorOnly: els.xVectorOnly.checked,
+          voiceCloneDefaultsVersion: settingsVoiceCloneDefaultsVersion,
           maxNewTokens: els.maxNewTokens.value,
           minNewTokens: els.minNewTokens.value,
           maxVramPercent: els.maxVramPercent.value,
@@ -1318,12 +1732,23 @@ WEB_CLIENT_HTML = r"""<!doctype html>
         const raw = localStorage.getItem(settingsKey);
         if (!raw) return;
         const data = JSON.parse(raw);
+        const migrateVoiceCloneDefaults =
+          Number(data.voiceCloneDefaultsVersion || 0) < settingsVoiceCloneDefaultsVersion;
         for (const [key, value] of Object.entries(data)) {
           if (!Object.prototype.hasOwnProperty.call(els, key)) continue;
           const el = els[key];
           if (!el) continue;
+          if (key === "xVectorOnly" && migrateVoiceCloneDefaults) {
+            el.checked = false;
+            continue;
+          }
           if (el.type === "checkbox") el.checked = Boolean(value);
           else el.value = String(value);
+        }
+        if (migrateVoiceCloneDefaults) {
+          data.xVectorOnly = false;
+          data.voiceCloneDefaultsVersion = settingsVoiceCloneDefaultsVersion;
+          localStorage.setItem(settingsKey, JSON.stringify(data));
         }
       } catch (err) {
         // ignore stale settings
@@ -1567,6 +1992,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       } else {
         els.queueDepth.textContent = "0ms";
       }
+      updateContextDisplay();
     }
 
     function resetRun() {
@@ -1587,9 +2013,20 @@ WEB_CLIENT_HTML = r"""<!doctype html>
       synthesisDone = false;
       sampleRate = 24000;
       activeMaxNewTokens = Number(els.maxNewTokens.value);
+      contextPromptTokens = 0;
+      contextGeneratedTokens = 0;
+      contextUsedTokens = 0;
+      contextLimitTokens = 0;
+      contextRemainingTokens = 0;
+      contextUsagePercent = 0;
+      contextGenerationLimitTokens = 0;
       els.downloadBtn.disabled = true;
       els.receiveBar.style.width = "0%";
       els.queueBar.style.width = "0%";
+      els.contextBar.style.width = "0%";
+      els.contextUsage.textContent = "-";
+      els.contextGenerated.textContent = "0";
+      els.contextLine.textContent = "上下文使用";
       els.continuityValue.textContent = "-";
       els.samplingValue.textContent = "-";
       updateMetrics();
@@ -1598,6 +2035,11 @@ WEB_CLIENT_HTML = r"""<!doctype html>
     async function start() {
       if (!els.text.value.trim()) {
         log("文本不能为空");
+        return;
+      }
+      if (!isModeAvailable(els.mode.value)) {
+        log(`${modeLabels[els.mode.value] || els.mode.value} 当前不可用：${modeUnavailableReason(els.mode.value)}`);
+        setPlayState("模型缺失", "bad");
         return;
       }
       saveSettings();
@@ -1634,6 +2076,10 @@ WEB_CLIENT_HTML = r"""<!doctype html>
             }
             sampleRate = metadataSampleRate;
             updateBudgetFromObject(data);
+            updateContextUsageFromObject(data, true);
+            if (Number(data.max_new_tokens || 0) > 0) {
+              activeMaxNewTokens = Number(data.max_new_tokens);
+            }
             if (data.recommended_playback_buffer_ms) {
               targetBufferSec = Math.min(maxBufferSec, Math.max(0.05, Number(data.recommended_playback_buffer_ms) / 1000));
               if (player) player.setTargetBuffer(targetBufferSec);
@@ -1650,21 +2096,27 @@ WEB_CLIENT_HTML = r"""<!doctype html>
             const kvProfile = data.kv_cache_profile || "-";
             const kvRelative = Number(data.kv_cache_relative_to_fp16 || 0);
             const kvLabel = kvRelative ? `${kvProfile}/${kvRelative.toFixed(2)}x` : kvProfile;
+            const totalLabel = serverMaxTotalTokens ? `, total=${serverMaxTotalTokens}` : "";
+            const blocksLabel = serverKvBlocks ? `, blocks=${serverKvBlocks}` : "";
+            const kvBudgetLabel = serverKvBudgetMiB ? `, kv_budget=${Math.round(serverKvBudgetMiB)}MiB` : "";
             els.runtimeLine.textContent =
-              `decode=${data.graph_variant || "-"}, kv=${kvLabel}, budget=${serverPromptBudgetConfig}/${serverPromptBudget}, ` +
+              `decode=${data.graph_variant || "-"}, kv=${kvLabel}, budget=${serverPromptBudgetConfig}/${serverPromptBudget}${totalLabel}${blocksLabel}${kvBudgetLabel}, ` +
               `prompt=${data.prompt_len || data.prompt_tokens_estimate || "-"}, vram=${Math.round(serverMaxVramPercent)}%`;
             log(
               `metadata sample_rate=${sampleRate}, strategy=${data.chunk_strategy || "-"}, ` +
               `profile=${data.realtime_profile || "-"}, variant=${data.graph_variant || "-"}, ` +
               `long=${data.long_text_mode || "-"}, segmented=${data.segmented ? "yes" : "no"}, ` +
               `sample=${data.long_ar_do_sample ? "yes" : "no"}, paged_kv=${data.paged_kv ? "yes" : "no"}, ` +
-              `kv=${kvLabel}, prompt_tokens=${data.prompt_len || data.prompt_tokens_estimate || "-"}, max_tokens=${serverPromptBudget}`
+              `kv=${kvLabel}, prompt_tokens=${data.prompt_len || data.prompt_tokens_estimate || "-"}, ` +
+              `max_generation_tokens=${data.max_generation_tokens_available || "-"}, ` +
+              `max_prompt_tokens=${serverPromptBudget}, max_total_tokens=${serverMaxTotalTokens || "-"}, kv_blocks=${serverKvBlocks || "-"}`
             );
           } else if (data.type === "final") {
             streamFinal = true;
             if (player) player.startBuffered();
             if (data.timings) {
               latestRtf = Number(data.timings.stream_rtf || data.timings.rtf || latestRtf || 0);
+              updateContextUsageFromObject(data.timings, true);
             }
             updateMetrics(true);
             log(
@@ -1680,6 +2132,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
               latestRtf = Number(pendingAudioTiming.stream_rtf || pendingAudioTiming.rtf || latestRtf || 0);
               els.continuityValue.textContent = pendingAudioTiming.continuous_long_output ? "full_ar" : (pendingAudioTiming.long_text_mode || "-");
               els.samplingValue.textContent = pendingAudioTiming.long_ar_do_sample ? "sample" : "-";
+              updateContextUsageFromObject(pendingAudioTiming, true);
             }
             log(
               `audio meta index=${data.index}, bytes=${data.byte_length}, ` +
@@ -1715,6 +2168,7 @@ WEB_CLIENT_HTML = r"""<!doctype html>
         const chunkElapsedMs = lastChunkIntervalMs || (now - startedAt);
         if (pendingAudioTiming) {
           latestRtf = Number(pendingAudioTiming.stream_rtf || pendingAudioTiming.rtf || latestRtf || 0);
+          updateContextUsageFromObject(pendingAudioTiming, true);
           pendingAudioTiming = null;
         } else {
           latestRtf = chunkAudioMs > 0 ? chunkElapsedMs / chunkAudioMs : 0;
@@ -1827,7 +2281,16 @@ WEB_CLIENT_HTML = r"""<!doctype html>
     els.modeButtons.addEventListener("click", (event) => {
       const button = event.target.closest("button[data-mode]");
       if (!button) return;
+      if (button.disabled) {
+        log(`${modeLabels[button.dataset.mode] || button.dataset.mode} 当前不可用：${modeUnavailableReason(button.dataset.mode)}`);
+        return;
+      }
       setMode(button.dataset.mode);
+    });
+    els.modelManager.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-download-mode]");
+      if (!button || button.disabled) return;
+      downloadModel(button.dataset.downloadMode);
     });
     els.mode.addEventListener("change", () => setMode(els.mode.value));
     els.presetText.addEventListener("change", () => applyPreset(els.presetText.value));

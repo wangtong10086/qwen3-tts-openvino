@@ -6,6 +6,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,11 @@ import numpy as np
 
 class NativeCodegenUnavailable(RuntimeError):
     pass
+
+
+def float_audio_view_to_pcm16_bytes(audio: np.ndarray) -> bytes:
+    clipped = np.clip(audio, -1.0, 1.0)
+    return (clipped * 32767.0).astype("<i2", copy=False).tobytes()
 
 
 _DLL_DIRECTORY_HANDLES = []
@@ -687,9 +693,15 @@ class NativeCodegenRunner:
 
         def callback(audio_ptr, num_samples, codes_ptr, num_frames, num_groups, is_final, codegen_ms, decode_ms, _user_data):
             if int(num_samples) > 0:
-                audio = np.ctypeslib.as_array(audio_ptr, shape=(int(num_samples),)).copy()
+                audio_view = np.ctypeslib.as_array(audio_ptr, shape=(int(num_samples),))
+                pcm_started = time.perf_counter()
+                pcm_s16le = float_audio_view_to_pcm16_bytes(audio_view)
+                pcm_convert_ms = (time.perf_counter() - pcm_started) * 1000.0
+                audio = audio_view.copy()
             else:
                 audio = np.zeros((0,), dtype=np.float32)
+                pcm_s16le = b""
+                pcm_convert_ms = 0.0
             if int(num_frames) > 0:
                 flat_codes = np.ctypeslib.as_array(codes_ptr, shape=(int(num_frames) * int(num_groups),))
                 codes = flat_codes.copy().reshape(int(num_frames), int(num_groups))
@@ -705,6 +717,8 @@ class NativeCodegenRunner:
                     "codegen_ms": float(codegen_ms),
                     "decode_ms": float(decode_ms),
                     "remote_embed": remote_embed,
+                    "pcm_s16le": pcm_s16le,
+                    "pcm_convert_ms": pcm_convert_ms,
                 }
             )
             return 0
@@ -814,9 +828,15 @@ class NativeCodegenRunner:
 
         def callback(audio_ptr, num_samples, codes_ptr, num_frames, num_groups, is_final, codegen_ms, decode_ms, _user_data):
             if int(num_samples) > 0:
-                audio = np.ctypeslib.as_array(audio_ptr, shape=(int(num_samples),)).copy()
+                audio_view = np.ctypeslib.as_array(audio_ptr, shape=(int(num_samples),))
+                pcm_started = time.perf_counter()
+                pcm_s16le = float_audio_view_to_pcm16_bytes(audio_view)
+                pcm_convert_ms = (time.perf_counter() - pcm_started) * 1000.0
+                audio = audio_view.copy()
             else:
                 audio = np.zeros((0,), dtype=np.float32)
+                pcm_s16le = b""
+                pcm_convert_ms = 0.0
             if int(num_frames) > 0:
                 flat_codes = np.ctypeslib.as_array(codes_ptr, shape=(int(num_frames) * int(num_groups),))
                 codes = flat_codes.copy().reshape(int(num_frames), int(num_groups))
@@ -832,6 +852,8 @@ class NativeCodegenRunner:
                     "codegen_ms": float(codegen_ms),
                     "decode_ms": float(decode_ms),
                     "remote_embed": remote_embed,
+                    "pcm_s16le": pcm_s16le,
+                    "pcm_convert_ms": pcm_convert_ms,
                 }
             )
             return 0

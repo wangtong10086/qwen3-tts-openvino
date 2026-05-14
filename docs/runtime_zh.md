@@ -46,6 +46,10 @@ uv run python -m qwen3_tts_ov stream voice-clone \
   --output outputs/voice_clone.wav
 ```
 
+注意：VoiceClone 不能使用 VoiceDesign IR 代替。它依赖 Base/VoiceClone 导出的参考音频 encoder、speaker encoder、speech tokenizer decoder 和主自回归图，服务端需要能找到 `openvino/base/manifest.json`。公开 Hugging Face IR 已提供 `openvino_realtime/base`，Web Demo 可在缺失时直接下载。
+
+VoiceClone 默认是 ICL 克隆：`x_vector_only=false`，需要同时提供 `--ref-audio` 和准确的 `--ref-text`。这条路径会使用参考音频 codec prompt，更适合保留参考语音的音色、语气和韵律。只有需要做 speaker embedding-only 对照实验时，才显式添加 `--x-vector-only`。
+
 Batch JSONL：
 
 ```bash
@@ -105,7 +109,7 @@ uv run python -m qwen3_tts_ov serve \
   --max-vram-ratio 70
 ```
 
-`/health` 中的 `warmup.kv_cache_profile`、`memory.native_paged_kv_precision` 和 `memory.kv_cache_relative_to_fp16` 会显示实际生效配置。
+`/health` 中的 `warmup.kv_cache_profile`、`memory.native_paged_kv_precision`、`memory.kv_cache_relative_to_fp16`、`memory.effective_max_total_tokens` 和 `memory.preallocated_kv_blocks` 会显示实际生效配置。
 
 Web Demo：
 
@@ -138,6 +142,28 @@ ws://127.0.0.1:17860/v1/tts/stream
   }
 }
 ```
+
+VoiceClone 请求示例：
+
+```json
+{
+  "mode": "voice_clone",
+  "text": "This is generated with the reference voice.",
+  "language": "English",
+  "ref_audio": "/path/to/reference.wav",
+  "ref_text": "Reference transcript for the audio.",
+  "x_vector_only": false,
+  "generation": {
+    "max_new_tokens": 128
+  },
+  "stream": {
+    "chunk_strategy": "smooth",
+    "format": "pcm_s16le"
+  }
+}
+```
+
+`x_vector_only` 省略时也按 `false` 处理。Web Demo 会把历史保存过的旧设置迁移回默认关闭，避免误跳过参考音频 codec prompt。
 
 返回顺序：
 
@@ -179,4 +205,13 @@ curl http://127.0.0.1:17860/v1/audio/speech \
 
 长文本仍使用同一个 prompt 做完整自回归。服务端可以分块发送音频，但不会默认把文本切成多段独立生成。详细策略见 [streaming_zh.md](streaming_zh.md)。
 
-`--max-continuous-prompt-tokens` 默认值为 `auto`：GPU 路径生效为 `2048`，CPU-only 生效为 `4096`。更长输入可启动时改为具体数值，或设为 `0` 关闭推理前 prompt 预算保护。
+`--max-continuous-prompt-tokens` 默认值为 `auto`。GPU 路径会使用 KV-cache planner，根据 GPU 总显存、`--max-vram-ratio`、KV/cache-input 精度、block size、模型层数和上下文长度计算 `effective_max_total_tokens`。普通长输出会按请求的 `max_new_tokens` 预留输出空间；full-context 长文本不会按文本长度预估语音 token，而是在精确 tokenizer 后使用 `effective_max_total_tokens - prompt_len - 1` 作为运行时 `max_new_tokens`，生成直到 EOS 或上下文/KV 上限。CPU-only 路径仍使用保守固定预算。
+
+因此 full-context 路径不再依赖 `字数 -> 语音 token` 的估算公式；前端显示的“运行上限”是当前 prompt 后真实可生成的剩余上下文容量。
+
+相关参数：
+
+- `--max-vram-ratio auto|N`: planner 可使用的最大显存比例，例如 `70` 表示 70%。
+- `--kv-cache-reserve-mb auto|N`: 为模型权重、中间 buffer 和驱动保留的显存；默认按 GPU 显存自动保留。
+- `--kv-cache-max-blocks auto|N`: 手动限制 KV block 数，用于调试或规避特定驱动上的 USM 压力。
+- `--kv-cache-preallocation auto|off|static`: `auto` 只计算预算；`static` 同时把计划出的 block 数传给 native static decode 路径。

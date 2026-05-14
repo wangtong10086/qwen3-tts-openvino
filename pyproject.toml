@@ -8,7 +8,7 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Qwen3-TTS OpenVINO contributors" }]
 keywords = ["qwen3-tts", "openvino", "text-to-speech", "tts"]
 dependencies = [
-  "huggingface-hub",
+  "huggingface-hub>=0.34.0,<1.0",
   "numpy",
   "openvino",
   "regex",

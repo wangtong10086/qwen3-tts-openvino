@@ -13,6 +13,7 @@ if "ZE_ENABLE_ALT_DRIVERS" not in os.environ:
 import openvino as ov
 import openvino._pyopenvino as ov_private
 import torch
+import transformers.models.mimi.modeling_mimi as mimi_modeling
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 import qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 as tokenizer_v2
@@ -2145,21 +2146,64 @@ def export_stream_decoder(
     return path
 
 
-def load_speech_tokenizer(model_dir: str):
+def load_speech_tokenizer(model_dir: str, attn_implementation: str = "sdpa"):
     tokenizer_v2.create_causal_mask = lambda **kwargs: None
     tokenizer_v2.create_sliding_window_causal_mask = lambda **kwargs: None
     return Qwen3TTSTokenizer.from_pretrained(
         os.path.join(model_dir, "speech_tokenizer"),
         dtype=torch.float32,
-        attn_implementation="sdpa",
+        attn_implementation=attn_implementation,
     )
+
+
+def force_attention_implementation(module: torch.nn.Module, attn_implementation: str) -> None:
+    for submodule in module.modules():
+        config = getattr(submodule, "config", None)
+        if config is not None and hasattr(config, "_attn_implementation"):
+            config._attn_implementation = attn_implementation
+
+
+def traceable_mimi_causal_mask(
+    config,
+    input_embeds,
+    attention_mask=None,
+    cache_position=None,
+    past_key_values=None,
+    position_ids=None,
+):
+    batch, query_len = input_embeds.shape[:2]
+    device = input_embeds.device
+    dtype = input_embeds.dtype
+    if cache_position is None:
+        cache_position = torch.arange(query_len, device=device, dtype=torch.long)
+    key_len = query_len
+    if past_key_values is not None:
+        key_len = int(past_key_values.get_seq_length()) + query_len
+    key_position = torch.arange(key_len, device=device, dtype=torch.long)
+    blocked = key_position.view(1, -1) > cache_position.view(-1, 1)
+    sliding_window = getattr(config, "sliding_window", None)
+    if sliding_window:
+        blocked = blocked | (key_position.view(1, -1) <= (cache_position.view(-1, 1) - int(sliding_window)))
+    mask = torch.zeros((1, 1, query_len, key_len), device=device, dtype=dtype)
+    mask = mask.masked_fill(blocked.view(1, 1, query_len, key_len), NEG_INF)
+    if attention_mask is not None:
+        padding = attention_mask[:, None, None, :key_len] == 0
+        mask = mask.expand(batch, 1, query_len, key_len).clone()
+        mask = mask.masked_fill(padding, NEG_INF)
+    return mask
 
 
 def export_speech_encoder(model_dir: str, out_dir: Path, force: bool = False) -> Path:
     path = out_dir / "speech_encoder.xml"
     if path.exists() and path.with_suffix(".bin").exists() and not force:
         return path
-    speech_tokenizer = load_speech_tokenizer(model_dir)
+    # The Mimi encoder's SDPA mask path uses nested torch.vmap/custom_function
+    # tracing in recent Transformers/PyTorch builds, which OpenVINO conversion
+    # can fail to trace. Eager attention avoids that path and keeps the exported
+    # reference-audio encoder deterministic.
+    mimi_modeling.create_causal_mask = traceable_mimi_causal_mask
+    speech_tokenizer = load_speech_tokenizer(model_dir, attn_implementation="eager")
+    force_attention_implementation(speech_tokenizer.model.encoder, "eager")
     wrapper = SpeechEncoderWrapper(speech_tokenizer)
     example_len = int(getattr(speech_tokenizer.model, "input_sample_rate", 24000) * 3)
     save_openvino_model(
@@ -2634,6 +2678,7 @@ def write_manifest(
         "tts_model_size": config.get("tts_model_size"),
         "precision": "fp16_weights",
         "runtime_requires_torch": False,
+        "talker_config": config["talker_config"],
         "max_cache_len": int(max_cache_len),
         "cache_buckets": cache_buckets,
         "cache_kernels": cache_kernels,
@@ -2776,6 +2821,8 @@ def write_manifest(
             "kv_cache_heads": attention_heads,
             "kv_cache_gqa_heads": kv_heads,
             "kv_cache_head_dim": head_dim,
+            "kv_cache_layers": int(talker_config["num_hidden_layers"]),
+            "max_position_embeddings": int(talker_config.get("max_position_embeddings", 32768)),
             "uses_remote_tensors_on_gpu": True,
             "seed_graphs": sorted(paged_seed_graphs),
         }
@@ -3105,6 +3152,7 @@ def main() -> None:
         not path.exists() or not path.with_suffix(".bin").exists() for path in core_paths
     )
 
+    model = None
     if needs_core_export:
         started = time.time()
         model = load_model(args.model)
@@ -3356,13 +3404,18 @@ def main() -> None:
                         no_repeat=True,
                         force=force_cache_graphs,
                     )
-        with open(os.path.join(args.model, "config.json"), "r", encoding="utf-8") as f:
-            config = json.load(f)
-        if args.export_clone_graphs or config.get("tts_model_type") == "base":
-            export_speech_encoder(args.model, out_dir, force=force_cache_graphs)
-            export_speaker_encoder(model, out_dir, force=force_cache_graphs)
     else:
         print("core OpenVINO graphs already exist; skipping main model load", flush=True)
+
+    if args.export_clone_graphs or detected_model_type == "base":
+        export_speech_encoder(args.model, out_dir, force=force_cache_graphs)
+        speaker_encoder_path = out_dir / "speaker_encoder.xml"
+        if force_cache_graphs or not (speaker_encoder_path.exists() and speaker_encoder_path.with_suffix(".bin").exists()):
+            if model is None:
+                started = time.time()
+                model = load_model(args.model)
+                print(f"loaded PyTorch model for speaker encoder export in {time.time() - started:.1f}s", flush=True)
+            export_speaker_encoder(model, out_dir, force=force_cache_graphs)
 
     for tokens in decoder_tokens:
         export_decoder(args.model, out_dir, tokens)

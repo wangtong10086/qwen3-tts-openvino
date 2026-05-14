@@ -89,7 +89,9 @@ uv run python -m qwen3_tts_ov serve \
 - KV cache 默认使用 U8 paged-KV 存储，显存占用约为 FP16 KV cache 的一半；可用 `--kv-cache-profile fp16` 回到保守路径。
 - 流式输出 mono 24 kHz `pcm_s16le`。
 - 长文本使用完整上下文全自回归生成；runtime 只把音频切块给播放器，不默认切分输入文本。
-- 长文本 prompt 预算默认 `auto`：GPU 路径为 `2048` tokens，CPU-only 为 `4096` tokens；超长输入可通过 `--max-continuous-prompt-tokens` 调整。
+- 长文本 prompt 预算默认 `auto`：GPU 路径会根据模型上下文、KV/cache-input 精度和 `--max-vram-ratio` 计算 token 上限；CPU-only 使用保守固定预算。超长输入可通过 `--max-continuous-prompt-tokens` 显式覆盖。
+- 当前公开 Hugging Face IR 已包含 `openvino_realtime/voice_design`、`openvino_realtime/custom_voice` 和 `openvino_realtime/base`。VoiceClone 使用 `base` IR；Web Demo 会通过 `/health` 显示缺失/已就绪，并可直接点击下载对应模式的 IR。
+- VoiceClone 默认使用 `ref_audio + ref_text` 的 ICL 克隆路径，会把参考音频 codec prompt 纳入生成；`x_vector_only` 默认关闭，只在需要 speaker embedding-only 对照实验时手动开启。
 
 ## 常用入口
 
@@ -143,7 +145,13 @@ dist/release/
 ## FAQ
 
 - **仓库为什么没有模型和 IR？**
-  模型和 OpenVINO IR 文件很大，不适合提交到源码仓库。已编译好的 VoiceDesign OpenVINO IR 发布在 Hugging Face：`waston10086/qwen3-tts-openvino-voice-design`。
+  模型和 OpenVINO IR 文件很大，不适合提交到源码仓库。已编译好的 VoiceDesign、CustomVoice 和 Base/VoiceClone OpenVINO IR 发布在 Hugging Face：`waston10086/qwen3-tts-openvino-voice-design`。
+
+- **VoiceClone 使用哪个模型目录？**
+  VoiceClone 使用 Base IR，目录是 `openvino/base` 或 Hugging Face 中的 `openvino_realtime/base`，其中包含参考音频 encoder、speaker encoder、speech tokenizer decoder 和主自回归图。
+
+- **VoiceClone 为什么需要参考文本？**
+  默认 `x_vector_only=false`，即使用和原始链路一致的 ICL 克隆路径。此时 `ref_text` 必须是参考音频对应的准确转写，模型会同时使用参考音频 codec prompt 和 speaker embedding。只有显式传 `x_vector_only=true` 或在 Web Demo 中勾选时，才会跳过 codec prompt，仅使用 speaker embedding。
 
 - **GitHub Release 里有什么？**
   Release 只包含 Linux/Windows runtime App 包，不包含模型权重或 OpenVINO IR。

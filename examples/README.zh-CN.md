@@ -54,4 +54,6 @@ uv run python scripts/evaluate_long_text_quality.py \
 
 ## VoiceClone
 
-`voice_clone_request.example.json` 使用占位参考音频路径。运行前需要替换为本机可访问的 wav/flac/mp3 文件或 URL。
+`voice_clone_request.example.json` 使用占位参考音频路径。运行前需要替换为本机可访问的 wav/flac/mp3 文件或 URL，并把 `ref_text` 改成参考音频的准确转写。
+
+示例中 `x_vector_only` 显式写为 `false`，这也是服务端和 Web Demo 的默认行为。该模式会使用 `ref_audio + ref_text` 的 ICL 克隆路径；只有需要只测试 speaker embedding 时才改为 `true`。
