@@ -1,71 +1,75 @@
 # Release 使用说明
 
-Release 面向最终调用方，只提供本地 sidecar 服务。调用方通过浏览器、HTTP、WebSocket 或 OpenAI-compatible Speech API 使用，不需要 PyTorch、导出脚本或源码开发环境。
+Release 面向最终调用方。调用方不需要 PyTorch、导出脚本或源码开发环境，只需要：
 
-## 产物
+1. GitHub Release 中的 runtime App 包。
+2. Hugging Face 上已经编译好的 OpenVINO IR。
 
-- Runtime-minimal App 包：`qwen3-tts-ov-server-linux-x64-<version>-runtime-minimal.tar.zst` 或 `qwen3-tts-ov-server-windows-x64-<version>-runtime-minimal.zip`
-- Full App 包：`qwen3-tts-ov-server-linux-x64-<version>.tar.zst` 或 `qwen3-tts-ov-server-windows-x64-<version>.zip`
-- Runtime-minimal IR 包：`qwen3-tts-openvino-ir-voice_design-<version>-runtime-minimal.tar.zst`
-- Full IR 包：`qwen3-tts-openvino-ir-voice_design-<version>.tar.zst`
+当前正式版本：`v0.1.0`
 
-App 包包含可执行入口、Python runtime、OpenVINO runtime、OpenVINO GenAI/tokenizers 依赖和 native 加速库。IR 包单独包含 `openvino/voice_design/manifest.json` 及其引用的 `.xml/.bin`。
+## 下载内容
 
-默认推荐 `runtime-minimal`。它保留当前验证的 native paged-KV 长文本完整自回归路径，支持 VoiceDesign 和带 `base` IR 的 VoiceClone/ref audio，同时移除开发 fallback、实验图和 `librosa/scipy/numba/llvmlite/sklearn` 依赖。`runtime-minimal` 的 ref audio 支持 `soundfile/libsndfile` 可读格式，例如 WAV/FLAC/OGG；需要更宽格式兼容时使用 `full`。
+Runtime App 包在 GitHub Release：
 
-## GitHub Releases
+- Linux: `qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal.tar.zst`
+- Windows: `qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal.zip`
+- Release 页面：<https://github.com/wangtong10086/qwen3-tts-openvino/releases/tag/v0.1.0>
 
-正式 runtime 发布入口是 GitHub Actions 的 `release-runtime` workflow。
+已编译 OpenVINO IR 在 Hugging Face：
 
-推送 `v*` tag 会自动构建 Linux/Windows runtime-minimal App 包，完成基础 smoke 后上传到对应 GitHub Release：
+- Model repo: <https://huggingface.co/waston10086/qwen3-tts-openvino-voice-design>
+- 使用目录：`openvino_realtime/`
+
+可以从网页下载，也可以用 Hugging Face CLI：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+uv run --with huggingface_hub huggingface-cli download \
+  waston10086/qwen3-tts-openvino-voice-design \
+  --include "openvino_realtime/**" \
+  --local-dir qwen3-tts-openvino-ir
 ```
 
-也可以在 Actions 页面手动运行 `release-runtime`，填写 `version`，默认会创建或更新 `v<version>` Release 并上传两个 runtime 包。分平台的 `release-linux` 和 `release-windows` 只作为手动诊断入口保留。
+下载完成后，模型根目录应为：
 
-也可以从公开 Hugging Face model repo 下载已验证的 realtime IR：
-
-```bash
-uv run --with huggingface_hub python scripts/download_hf_ir.py \
-  --repo-id waston10086/qwen3-tts-openvino-voice-design \
-  --local-dir build/hf-ir \
-  --allow-pattern "openvino_realtime/**"
+```text
+qwen3-tts-openvino-ir/openvino_realtime
 ```
 
-下载后启动时把 `--model-root` 指向 `build/hf-ir/openvino_realtime`。
-
-## Linux
+## Linux 启动
 
 ```bash
-tar --zstd -xf qwen3-tts-ov-server-linux-x64-<version>-runtime-minimal.tar.zst
-tar --zstd -xf qwen3-tts-openvino-ir-voice_design-<version>-runtime-minimal.tar.zst
+tar --zstd -xf qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal.tar.zst
 
-cd qwen3-tts-ov-server-linux-x64-<version>-runtime-minimal
+cd qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal
 ./qwen3-tts-ov-server \
-  --model-root ../qwen3-tts-openvino-ir-voice_design-<version>-runtime-minimal/openvino \
+  --model-root ../qwen3-tts-openvino-ir/openvino_realtime \
   --device GPU
 ```
 
-如果把 IR 包中的 `openvino/` 目录复制到 App 包目录旁边，可以省略 `--model-root`。
+打开：
 
-## Windows
+```text
+http://127.0.0.1:17860/
+```
+
+## Windows 启动
 
 ```powershell
-Expand-Archive qwen3-tts-ov-server-windows-x64-<version>-runtime-minimal.zip
-Expand-Archive qwen3-tts-openvino-ir-voice_design-<version>-runtime-minimal.zip
+Expand-Archive qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal.zip -DestinationPath .
 
-cd qwen3-tts-ov-server-windows-x64-<version>-runtime-minimal
+cd qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal
 .\qwen3-tts-ov-server.exe `
-  --model-root ..\qwen3-tts-openvino-ir-voice_design-<version>-runtime-minimal\openvino `
+  --model-root ..\qwen3-tts-openvino-ir\openvino_realtime `
   --device GPU
 ```
 
-Windows 包必须在 Windows runner 上构建。不要使用 Linux 交叉编译出的 DLL。
+打开：
 
-## 调用
+```text
+http://127.0.0.1:17860/
+```
+
+## 调用接口
 
 Web Demo：
 
@@ -90,9 +94,29 @@ curl -N http://127.0.0.1:17860/v1/audio/speech \
   --output speech.pcm
 ```
 
+更多 CLI、HTTP、WebSocket 和 Python API 说明见 [运行接口](runtime_zh.md)。
+
+## 发布物边界
+
+- GitHub Release 只包含 runtime App 包，不包含模型权重或 OpenVINO IR。
+- Hugging Face model repo 存放已编译 OpenVINO IR，当前公开的是 VoiceDesign realtime IR。
+- OpenVINO compile cache 会在用户机器首次运行时生成，不随 release 分发。
+- 需要私有分发 IR 时，可以使用 `scripts/package_ir.py` 自行打包；当前公开分发推荐直接使用 Hugging Face。
+
 ## 系统要求
 
 - Linux x86_64 或 Windows x64。
 - Intel GPU 使用时需要目标机器已安装对应 GPU 驱动、OpenCL/Level Zero runtime。
 - CPU 可作为 fallback，但实时性能不保证。
-- 首次启动会在用户缓存目录生成 OpenVINO compile cache；cache 不随 release 分发。
+- Windows runtime 必须使用 Windows 构建产物；不要使用 Linux 交叉编译出的 DLL。
+
+## 维护者发布流程
+
+正式 runtime 发布由 GitHub Actions 的 `release-runtime` workflow 负责。推送 `v*` tag 会自动构建 Linux/Windows runtime-minimal App 包，完成 smoke 后上传到对应 GitHub Release：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Actions 页面也可以手动运行 `release-runtime`，填写 `version`，用于重发指定版本。分平台的 `release-linux` 和 `release-windows` 只作为手动诊断入口保留。

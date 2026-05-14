@@ -1,21 +1,23 @@
 # Quick Start
 
-本页描述从源码仓库到浏览器 Web Demo 的最短路径。默认目标是 VoiceDesign + Intel GPU + `fastest` profile。
+本页面面向源码开发者，目标是从 PyTorch 模型导出当前推荐的 `fastest` OpenVINO IR，并启动浏览器 Web Demo。
 
-## 1. 准备环境
+如果你只是想直接运行服务，不需要重新导出模型，请先看 [Release 使用说明](release_zh.md)：runtime 在 GitHub Release，已编译 IR 在 Hugging Face。
+
+## 1. 准备开发环境
 
 ```bash
 uv sync --extra native --extra server --extra export
 uv run python -m qwen3_tts_ov --help
 ```
 
-如果是首次 clone，并且 `third_party/openvino.genai` 还没有初始化，`build-fastest` 会自动执行 submodule 初始化。也可以手动执行：
+首次 clone 后如果 `third_party/openvino.genai` 尚未初始化，`build-fastest` 会自动初始化 submodule。也可以手动执行：
 
 ```bash
 git submodule update --init --recursive
 ```
 
-## 2. 下载模型
+## 2. 准备 PyTorch 模型
 
 VoiceDesign 示例：
 
@@ -25,16 +27,16 @@ uv run modelscope download \
   --local_dir ./models/Qwen3-TTS-12Hz-1.7B-VoiceDesign
 ```
 
-CustomVoice 和 Base/VoiceClone 需要分别下载对应模型目录：
+CustomVoice 和 Base/VoiceClone 需要分别准备对应模型目录：
 
 ```text
 models/Qwen3-TTS-12Hz-1.7B-CustomVoice
 models/Qwen3-TTS-12Hz-1.7B-Base
 ```
 
-模型目录不进入 git。
+`models/` 不进入 git。
 
-## 3. 一键构建 fastest
+## 3. 一键构建 fastest IR
 
 ```bash
 uv run python -m qwen3_tts_ov build-fastest \
@@ -51,7 +53,7 @@ uv run python -m qwen3_tts_ov build-fastest \
 4. 生成 `int8_sym_paged_talker_split` variant。
 5. 执行 OpenVINO cache warmup。
 
-默认 `--graph-set production` 只导出当前 `fastest` 运行必需的图，避免 fixed-bucket/unroll 诊断图带来的额外内存压力。需要从旧产物完全重来时：
+从旧产物完全重来时：
 
 ```bash
 uv run python -m qwen3_tts_ov build-fastest \
@@ -62,9 +64,7 @@ uv run python -m qwen3_tts_ov build-fastest \
   --clean-native
 ```
 
-只有需要 legacy benchmark 或诊断 fixed-bucket/unroll graph 时，才使用 `--graph-set compat`。
-
-先预览将执行的命令：
+只想预览将执行的命令：
 
 ```bash
 uv run python -m qwen3_tts_ov build-fastest \
@@ -74,16 +74,17 @@ uv run python -m qwen3_tts_ov build-fastest \
   --dry-run
 ```
 
-如果已经有本地旧 IR，例如 `openvino_full/`，可直接验证它是否满足 fastest：
+默认 `--graph-set production` 只导出生产运行必需的图，降低导出内存压力。只有需要 legacy benchmark 或 fixed-bucket/unroll 诊断图时，才使用：
 
 ```bash
 uv run python -m qwen3_tts_ov build-fastest \
-  --out-dir openvino_full \
-  --skip-submodule \
-  --dry-run
+  --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --out-dir openvino/voice_design \
+  --device GPU \
+  --graph-set compat
 ```
 
-## 4. 启动服务
+## 4. 启动开发服务
 
 ```bash
 uv run python -m qwen3_tts_ov serve \
@@ -102,7 +103,7 @@ uv run python -m qwen3_tts_ov serve \
 http://127.0.0.1:17860/
 ```
 
-## 5. 快速命令检查
+## 5. 常用检查
 
 ```bash
 uv run python -m qwen3_tts_ov build-fastest --help
@@ -110,8 +111,18 @@ uv run python -m qwen3_tts_ov serve --help
 uv run python -m qwen3_tts_ov stream voice-design --help
 ```
 
+如果已经有本地旧 IR，例如 `openvino_full/`，可先用 dry-run 检查是否满足当前 fastest 路径：
+
+```bash
+uv run python -m qwen3_tts_ov build-fastest \
+  --out-dir openvino_full \
+  --skip-submodule \
+  --dry-run
+```
+
 ## 常见问题
 
-- 如果 `build-fastest` 报模型不存在，先确认 `--model` 指向本地模型目录。
-- 如果 fastest 报缺少 graph，不要切换到旧 profile 绕过；重新导出或重新压缩 IR。
-- 如果首次请求很慢，先执行 `build-fastest` 或 [cache warmup](cache_zh.md)。
+- `build-fastest` 报模型不存在：确认 `--model` 指向本地 PyTorch 模型目录。
+- `fastest` 报缺少 graph：重新导出或重新压缩 IR，不要切到旧 profile 绕过。
+- 首次请求很慢：先执行 `build-fastest` 或 [cache warmup](cache_zh.md)。
+- 只想部署不想导出：使用 [Release 使用说明](release_zh.md) 中的预编译包和 Hugging Face IR。

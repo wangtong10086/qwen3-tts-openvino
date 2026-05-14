@@ -4,93 +4,109 @@ OpenVINO-only 的 Qwen3-TTS 12Hz 推理、导出、流式 sidecar 和 native 加
 
 [English README](README.md) | [文档索引](docs/README.zh-CN.md) | [示例请求](examples/README.zh-CN.md)
 
-本仓库是源码仓库，不提交模型权重、OpenVINO IR、生成音频、虚拟环境、OpenVINO 编译缓存或 native 编译产物。
+本仓库是源码仓库，不提交模型权重、OpenVINO IR、生成音频、OpenVINO 编译缓存或 native 编译产物。
 
-## 特性
+## 我应该怎么用
 
-- 支持 VoiceDesign、CustomVoice、VoiceClone。
-- `build-fastest` 一键构建当前验证过的最快路径，默认使用低内存 production 图集合。
-- native C++ codec 生成链路，使用 OpenVINO paged-KV attention。
-- 本地 sidecar 提供 WebSocket、HTTP NDJSON 和 OpenAI-compatible Speech API。
-- 流式输出 mono 24 kHz `pcm_s16le`。
-- 长文本默认完整上下文全自回归，不自动分段。
+| 目标 | 推荐路径 |
+| --- | --- |
+| 直接在 Linux/Windows 上运行 TTS 服务 | 下载 [GitHub Release runtime](https://github.com/wangtong10086/qwen3-tts-openvino/releases/tag/v0.1.0)，再下载 [Hugging Face 已编译 OpenVINO IR](https://huggingface.co/waston10086/qwen3-tts-openvino-voice-design) |
+| 从 PyTorch 模型重新导出、压缩、调试 | 使用 `uv run python -m qwen3_tts_ov build-fastest ...` |
+| 维护发布包 | 推送 `v*` tag，自动运行 `release-runtime` 构建 Linux/Windows 包并上传 GitHub Releases |
 
-## Quick Start
+## 直接使用预编译包
 
-1. 安装依赖：
+1. 从 GitHub Release 下载 runtime 包：
 
-```bash
-uv sync --extra native --extra server --extra export
+```text
+qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal.tar.zst
+qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal.zip
 ```
 
-2. 下载 VoiceDesign 模型到本地 `models/`：
+2. 从 Hugging Face 下载已编译 OpenVINO IR：
 
 ```bash
-uv run modelscope download \
-  --model Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
-  --local_dir ./models/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+uv run --with huggingface_hub huggingface-cli download \
+  waston10086/qwen3-tts-openvino-voice-design \
+  --include "openvino_realtime/**" \
+  --local-dir qwen3-tts-openvino-ir
 ```
 
-3. 一键构建最快路径：
+3. 启动 sidecar。
+
+Linux：
 
 ```bash
-uv run python -m qwen3_tts_ov build-fastest \
-  --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
-  --out-dir openvino/voice_design \
+tar --zstd -xf qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal.tar.zst
+cd qwen3-tts-ov-server-linux-x64-0.1.0-runtime-minimal
+./qwen3-tts-ov-server \
+  --model-root ../qwen3-tts-openvino-ir/openvino_realtime \
   --device GPU
 ```
 
-从旧导出产物完全重来时可加 `--clean --clean-native`。
+Windows：
 
-4. 启动 sidecar：
-
-```bash
-uv run python -m qwen3_tts_ov serve \
-  --model-root openvino \
-  --device GPU \
-  --realtime-profile fastest \
-  --host 127.0.0.1 \
-  --port 17860
+```powershell
+Expand-Archive qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal.zip -DestinationPath .
+cd qwen3-tts-ov-server-windows-x64-0.1.0-runtime-minimal
+.\qwen3-tts-ov-server.exe `
+  --model-root ..\qwen3-tts-openvino-ir\openvino_realtime `
+  --device GPU
 ```
 
-5. 打开浏览器：
+4. 打开浏览器：
 
 ```text
 http://127.0.0.1:17860/
 ```
 
-完整安装说明见 [docs/quick_start_zh.md](docs/quick_start_zh.md)。
+完整部署说明见 [docs/release_zh.md](docs/release_zh.md)。
+
+## 开发者 Quick Start
+
+需要从 PyTorch 模型重新导出或调试图时，使用源码开发路径。
+
+```bash
+uv sync --extra native --extra server --extra export
+
+uv run python -m qwen3_tts_ov build-fastest \
+  --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --out-dir openvino/voice_design \
+  --device GPU
+
+uv run python -m qwen3_tts_ov serve \
+  --model-root openvino \
+  --device GPU \
+  --realtime-profile fastest
+```
+
+完整源码构建说明见 [docs/quick_start_zh.md](docs/quick_start_zh.md)。
 
 ## 当前生产路径
 
-`fastest` profile 表示：
-
-- 必须构建 native C++ pipeline。
-- 必须导出 paged-KV seed graph。
-- 必须生成 `int8_sym_paged_talker_split` 权重压缩 variant。
-- 默认使用 `native paged-KV + GQA + split-subcode + block16`。
-- 默认 `chunk_strategy=smooth`，降低浏览器播放块间卡顿风险。
-
-长文本仍使用同一个 prompt 从头到尾全自回归生成。只要 IR manifest 包含最快路径需要的 paged seed 和 cached subcode 图，sidecar 会自动使用 sampled paged-KV full-AR 加速；缺图时才回退到 FP16 reference。自动分段只作为显式诊断 fallback。
+- `fastest` profile 依赖 native C++ pipeline。
+- codec 生成使用 OpenVINO paged-KV attention。
+- talker seed 图使用 `int8_sym_paged_talker_split`。
+- cached subcode 图保持 FP16，优先保证音质稳定。
+- 流式输出 mono 24 kHz `pcm_s16le`。
+- 长文本使用完整上下文全自回归生成；runtime 只把音频切块给播放器，不默认切分输入文本。
 
 ## 常用入口
 
-- 使用侧启动：`qwen3-tts-ov-server --model-root openvino --device GPU`
+- 最终用户启动：`qwen3-tts-ov-server --model-root qwen3-tts-openvino-ir/openvino_realtime --device GPU`
 - 一键构建：`uv run python -m qwen3_tts_ov build-fastest --model ...`
-- 启动服务：`uv run python -m qwen3_tts_ov serve --model-root openvino --device GPU`
+- 开发服务：`uv run python -m qwen3_tts_ov serve --model-root openvino --device GPU`
 - 流式 CLI：`uv run python -m qwen3_tts_ov stream voice-design ...`
 - 批处理：`uv run python -m qwen3_tts_ov batch --batch-jsonl examples/requests.example.jsonl`
 - OpenAI-compatible API：`POST /v1/audio/speech`
 
 运行方式、Python API 和 HTTP/WebSocket 协议见 [docs/runtime_zh.md](docs/runtime_zh.md)。
 
-正式 runtime 发布由 GitHub Actions 的 `release-runtime` 执行。推送 `v*` tag 会自动构建 Linux/Windows runtime-minimal 包并上传到 GitHub Releases。
-
 ## 文档
 
-- [Quick Start](docs/quick_start_zh.md): 从空仓库到 Web Demo。
-- [Release 使用说明](docs/release_zh.md): 预编译 Linux/Windows 包的使用方式。
-- [开发说明](docs/development_zh.md): 源码开发、导出、压缩和 release 打包。
+- [Release 使用说明](docs/release_zh.md): 预编译 runtime + Hugging Face IR 的最终用户部署方式。
+- [Quick Start](docs/quick_start_zh.md): 从源码仓库下载模型、构建最快 IR、启动 Web Demo。
+- [开发说明](docs/development_zh.md): 源码开发、导出、压缩、release workflow 和诊断入口。
 - [运行接口](docs/runtime_zh.md): CLI、Python API、sidecar、OpenAI-compatible API。
 - [导出与压缩](docs/export_zh.md): 手动导出 IR 和生成 fastest variant。
 - [流式与长文本](docs/streaming_zh.md): 流式协议、长文本 full-AR、质量门禁。
@@ -104,7 +120,7 @@ http://127.0.0.1:17860/
 qwen3_tts_ov/    runtime、exporter、CLI、sidecar 和 web demo
 native/          native C++ OpenVINO pipeline 源码
 scripts/         构建、压缩、benchmark、质量评测脚本
-devtools/        实验 benchmark、profiling 和 legacy 入口
+devtools/        实验 benchmark、profiling 和诊断入口
 docs/            中文文档
 examples/        JSON/JSONL/长文本示例
 tests/           单元测试
@@ -120,12 +136,16 @@ outputs/
 .venv/
 .uv-cache/
 native/build/
+dist/release/
 ```
 
 ## FAQ
 
-- **为什么仓库没有模型和 IR？**  
-  模型和导出的 IR 通常很大，必须本地下载和导出。
+- **仓库为什么没有模型和 IR？**
+  模型和 OpenVINO IR 文件很大，不适合提交到源码仓库。已编译好的 VoiceDesign OpenVINO IR 发布在 Hugging Face：`waston10086/qwen3-tts-openvino-voice-design`。
+
+- **GitHub Release 里有什么？**
+  Release 只包含 Linux/Windows runtime App 包，不包含模型权重或 OpenVINO IR。
 
 - **为什么 native 是必需项？**  
   当前最快路径依赖 C++ pipeline 将 codec 自回归循环移出 Python。缺少 native 库时生产路径会直接报错。
