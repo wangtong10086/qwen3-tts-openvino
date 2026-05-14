@@ -32,6 +32,7 @@ def make_runtime():
     runtime.decode_upsample_rate = 2
     runtime.timings = FakeTimings()
     runtime.streaming_decoder_left_context = 25
+    runtime.streaming_decoder_input_shape = "dynamic"
     runtime.default_chunk_strategy = "low_latency"
     runtime.streaming_decoder_strategies = {name: dict(config) for name, config in DEFAULT_STREAM_CHUNK_STRATEGIES.items()}
 
@@ -151,6 +152,41 @@ def test_stream_decoder_key_prefers_first_chunk_then_left_context_graph():
     assert runtime._stream_decoder_key(0, 12, 12, 25) == (0, 12)
     assert runtime._stream_decoder_key(12, 12, 12, 25) == (25, 12)
     assert runtime._stream_decoder_key(25, 18, 12, 25) == (25, 24)
+
+
+def test_static_stream_decoder_window_pads_context_and_final_chunk():
+    runtime = make_runtime()
+    runtime.streaming_decoder_input_shape = "static"
+    window = np.asarray([[10, 11], [20, 21], [30, 31]], dtype=np.int64)
+
+    padded, context, padded_frames = runtime._pad_static_stream_decoder_window(
+        window,
+        context_frames=1,
+        target_context_frames=2,
+        target_chunk_frames=4,
+    )
+
+    assert context == 2
+    assert padded_frames == 2
+    assert padded.shape == (6, 2)
+    assert padded.tolist() == [[10, 11], [10, 11], [20, 21], [30, 31], [30, 31], [30, 31]]
+
+
+def test_dynamic_stream_decoder_window_keeps_final_chunk_unpadded():
+    runtime = make_runtime()
+    runtime.streaming_decoder_input_shape = "dynamic"
+    window = np.asarray([[10, 11], [20, 21], [30, 31]], dtype=np.int64)
+
+    padded, context, padded_frames = runtime._pad_static_stream_decoder_window(
+        window,
+        context_frames=1,
+        target_context_frames=2,
+        target_chunk_frames=4,
+    )
+
+    assert context == 2
+    assert padded_frames == 0
+    assert padded.tolist() == [[10, 11], [10, 11], [20, 21], [30, 31]]
 
 
 def test_paged_kv_unroll_requires_explicit_experimental_flag():

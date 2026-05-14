@@ -51,8 +51,11 @@ uv run python -m qwen3_tts_ov export \
   --decoder-tokens 256 \
   --stream-decoder-chunks 12,24 \
   --stream-decoder-first-chunks 8,12 \
-  --stream-decoder-left-context 25
+  --stream-decoder-left-context 25 \
+  --stream-decoder-input-shape static
 ```
+
+`--stream-decoder-input-shape static` 是生产默认值，用于导出 NPU 可编译的固定 shape streaming decoder，例如 `c0_t8=[1,8,16]`、`c25_t24=[1,49,16]`。旧调试路径需要动态 shape 时可显式使用 `--stream-decoder-input-shape dynamic`。
 
 ## CustomVoice
 
@@ -76,7 +79,8 @@ uv run python -m qwen3_tts_ov export \
   --decoder-tokens 256 \
   --stream-decoder-chunks 12,24 \
   --stream-decoder-first-chunks 8,12 \
-  --stream-decoder-left-context 25
+  --stream-decoder-left-context 25 \
+  --stream-decoder-input-shape static
 ```
 
 ## Base / VoiceClone
@@ -102,6 +106,7 @@ uv run python -m qwen3_tts_ov export \
   --stream-decoder-chunks 12,24 \
   --stream-decoder-first-chunks 8,12 \
   --stream-decoder-left-context 25 \
+  --stream-decoder-input-shape static \
   --export-clone-graphs
 ```
 

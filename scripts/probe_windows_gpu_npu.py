@@ -100,6 +100,7 @@ def compile_named_graphs(
                 "device": device,
                 "compile_ms": round((time.time() - started) * 1000.0, 3),
                 "inputs": [str(item.get_any_name()) for item in model.inputs],
+                "input_shapes": [str(getattr(item, "partial_shape", "")) for item in model.inputs],
                 "outputs": [str(item.get_any_name()) for item in model.outputs],
                 "request_created": request is not None,
             }

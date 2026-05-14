@@ -2125,6 +2125,7 @@ def export_stream_decoder(
     out_dir: Path,
     chunk_frames: int,
     left_context_frames: int,
+    input_shape: str = "static",
     force: bool = False,
 ) -> Path:
     path = out_dir / f"speech_decoder_stream_c{left_context_frames}_t{chunk_frames}.xml"
@@ -2136,11 +2137,17 @@ def export_stream_decoder(
     num_quantizers = speech_tokenizer.model.config.decoder_config.num_quantizers
     example_len = int(left_context_frames) + int(chunk_frames)
     example = torch.zeros((1, example_len, num_quantizers), dtype=torch.long)
+    if input_shape == "static":
+        ov_input_shapes = [ov.PartialShape([1, example_len, num_quantizers])]
+    elif input_shape == "dynamic":
+        ov_input_shapes = [ov.PartialShape([1, -1, num_quantizers])]
+    else:
+        raise ValueError(f"unsupported stream decoder input shape: {input_shape!r}")
     save_openvino_model(
         wrapper,
         (example,),
         path,
-        [ov.PartialShape([1, -1, num_quantizers])],
+        ov_input_shapes,
         force=force,
     )
     return path
@@ -2567,6 +2574,7 @@ def write_manifest(
     stream_decoder_chunks: list[int],
     stream_decoder_left_context: int,
     stream_decoder_first_chunks: list[int],
+    stream_decoder_input_shape: str,
 ) -> None:
     manifest_path = out_dir / "manifest.json"
     previous_manifest = {}
@@ -2862,6 +2870,7 @@ def write_manifest(
             },
             "graphs": stream_decoder_graphs,
             "contexts": stream_decoder_contexts,
+            "input_shape": stream_decoder_input_shape,
             "output_format": "pcm_f32",
         }
     tokenizer_ir = {}
@@ -2928,6 +2937,12 @@ def main() -> None:
     parser.add_argument("--stream-decoder-chunks", default="8,12,24")
     parser.add_argument("--stream-decoder-first-chunks", default="6,8,12")
     parser.add_argument("--stream-decoder-left-context", type=int, default=25)
+    parser.add_argument(
+        "--stream-decoder-input-shape",
+        default="static",
+        choices=["static", "dynamic"],
+        help="Export streaming decoder graphs with fixed input frames for NPU or dynamic frames for legacy runtimes.",
+    )
     parser.add_argument(
         "--rms-export-mode",
         default="default",
@@ -3425,6 +3440,7 @@ def main() -> None:
             out_dir,
             chunk_frames=chunk_frames,
             left_context_frames=0,
+            input_shape=args.stream_decoder_input_shape,
             force=force_cache_graphs,
         )
     for chunk_frames in stream_decoder_chunks:
@@ -3433,6 +3449,7 @@ def main() -> None:
             out_dir,
             chunk_frames=chunk_frames,
             left_context_frames=args.stream_decoder_left_context,
+            input_shape=args.stream_decoder_input_shape,
             force=force_cache_graphs,
         )
     if not args.skip_tokenizer_ir:
@@ -3453,6 +3470,7 @@ def main() -> None:
         stream_decoder_chunks,
         args.stream_decoder_left_context,
         stream_decoder_first_chunks,
+        args.stream_decoder_input_shape,
     )
     update_codegen_variant_manifest(
         out_dir,

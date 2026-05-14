@@ -18,11 +18,16 @@ dependencies = [
 
 [project.optional-dependencies]
 export = [
+  "accelerate",
+  "einops",
   "torch",
   "transformers",
   "nncf",
   "modelscope",
   "openvino-tokenizers",
+  "onnxruntime",
+  "sox",
+  "torchaudio",
 ]
 server = [
   "fastapi",
@@ -36,6 +41,7 @@ quality = [
 native = [
   "openvino-genai",
   "openvino-tokenizers",
+  "onnxruntime",
 ]
 audio-full = [
   "librosa",

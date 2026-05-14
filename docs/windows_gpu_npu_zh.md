@@ -9,6 +9,49 @@ NPU: streaming speech decoder
 
 WSL 当前不作为 NPU 验证环境。测试需要 Windows 原生 Intel GPU/NPU 驱动，并且 OpenVINO `Core().available_devices` 能看到 `GPU` 和 `NPU`。
 
+## WSL 导出 NPU 静态 IR
+
+Windows NPU 编译要求 streaming decoder 使用固定输入 shape。可以在 WSL 中导出 IR，再复制到 Windows 原生 runtime 验证：
+
+```bash
+PYTHONPATH=/home/wt/Qwen3-TTS uv run python -m qwen3_tts_ov export \
+  --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --model-type voice_design \
+  --out-dir /mnt/d/qwen3-tts-ov-win-build/npu-static/ir/openvino/voice_design \
+  --skip-fixed-cache-graphs \
+  --cache-buckets 96 \
+  --cache-kernels exact \
+  --fused-cache-kernels exact \
+  --fused-subcode-mode cached \
+  --fused-cache-unroll-steps "" \
+  --fused-cache-decode-unroll-steps "" \
+  --fused-cache-stateful-mask-steps "" \
+  --fused-cache-norepeat-steps "" \
+  --export-paged-kv-seed \
+  --paged-kv-unroll-steps "" \
+  --paged-kv-subcode-attention-kernels sdpa \
+  --decoder-tokens 256 \
+  --stream-decoder-first-chunks 8,12 \
+  --stream-decoder-chunks 12,24 \
+  --stream-decoder-left-context 25 \
+  --stream-decoder-input-shape static
+
+uv run python scripts/compress_openvino_weights.py \
+  --ir-dir /mnt/d/qwen3-tts-ov-win-build/npu-static/ir/openvino/voice_design \
+  --preset fastest
+```
+
+导出的 streaming decoder 关键 shape 应为：
+
+```text
+speech_decoder_stream_c0_t8.xml    [1,8,16]
+speech_decoder_stream_c0_t12.xml   [1,12,16]
+speech_decoder_stream_c25_t12.xml  [1,37,16]
+speech_decoder_stream_c25_t24.xml  [1,49,16]
+```
+
+Windows 严格验证使用 `--npu-offload decoder`；该模式不会静默回退 GPU，适合判断 NPU decoder 是否真正可编译。
+
 ## 本地 PowerShell
 
 在 Windows PowerShell 中运行：

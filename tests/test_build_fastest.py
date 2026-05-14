@@ -85,6 +85,7 @@ def test_build_fastest_plans_default_voice_design_steps(tmp_path, monkeypatch):
     assert export[export.index("--paged-kv-unroll-steps") + 1] == ""
     assert export[export.index("--stream-decoder-first-chunks") + 1] == "8,12"
     assert export[export.index("--stream-decoder-chunks") + 1] == "12,24"
+    assert export[export.index("--stream-decoder-input-shape") + 1] == "static"
     compress = commands_by_name["compress"]
     assert compress[-4:] == ["--ir-dir", "openvino/voice_design", "--preset", "fastest"]
     warmup = commands_by_name["warmup"]
@@ -153,6 +154,7 @@ def test_build_fastest_compat_graph_set_keeps_diagnostic_unrolls(tmp_path, monke
     assert export[export.index("--cache-buckets") + 1] == "96,128,192,256,320,384"
     assert export[export.index("--fused-cache-unroll-steps") + 1] == "4,6,8,12"
     assert export[export.index("--fused-cache-decode-unroll-steps") + 1] == "4,8,12"
+    assert export[export.index("--stream-decoder-input-shape") + 1] == "static"
 
 
 def test_build_fastest_clean_ignores_existing_manifest(tmp_path, monkeypatch):

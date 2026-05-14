@@ -261,6 +261,25 @@ def test_native_pipeline_filters_gpu_only_properties_for_npu_decoders():
     assert 'config.erase("GPU_HOST_TASK_PRIORITY")' in source
     assert 'config.erase("GPU_QUEUE_THROTTLE")' in source
     assert "m_runner.first_stream_decoder_model = m_runner.core.compile_model(first_decoder_xml, device, config)" in source
+    assert "stream_decoder_input_spec" in source
+    assert "first_stream_decoder_static_input" in source
+    assert "decode_padded_frames" in source
+
+
+def test_exporter_supports_static_stream_decoder_shapes_for_npu():
+    source = (REPO_ROOT / "qwen3_tts_ov" / "exporter.py").read_text(encoding="utf-8")
+
+    assert "--stream-decoder-input-shape" in source
+    assert 'choices=["static", "dynamic"]' in source
+    assert "ov.PartialShape([1, example_len, num_quantizers])" in source
+    assert '"input_shape": stream_decoder_input_shape' in source
+
+
+def test_windows_probe_reports_compiled_input_shapes():
+    source = (REPO_ROOT / "scripts" / "probe_windows_gpu_npu.py").read_text(encoding="utf-8")
+
+    assert '"input_shapes"' in source
+    assert 'getattr(item, "partial_shape", "")' in source
 
 
 def test_windows_gpu_npu_smoke_powershell_asserts_audio_and_prompt_devices():

@@ -567,6 +567,7 @@ class OpenVINOQwen3TTS:
         graphs = self.manifest["graphs"]
         stream_config = self.manifest.get("streaming_decoder", {})
         self.streaming_decoder_left_context = int(stream_config.get("left_context_frames", 25))
+        self.streaming_decoder_input_shape = str(stream_config.get("input_shape") or "dynamic").strip().lower()
         self.default_chunk_strategy = self._normalize_chunk_strategy_name(
             stream_config.get("default_strategy") or "low_latency"
         )
@@ -1960,6 +1961,11 @@ class OpenVINOQwen3TTS:
                     stream_compute_rtf = (stream_compute_ms / stream_audio_ms) if stream_audio_ms > 0 else 0.0
                     is_final = bool(item.get("is_final", False))
                     native_timing = item.get("native_timing")
+                    native_decode_input_frames = None
+                    native_decode_padded_frames = None
+                    if isinstance(native_timing, dict):
+                        native_decode_input_frames = native_timing.get("decode_input_frames")
+                        native_decode_padded_frames = native_timing.get("decode_padded_frames")
                     if paged_kv_requested and isinstance(native_timing, dict):
                         static_mode = str(native_timing.get("paged_static_decode_mode") or "dynamic")
                         actual_static_decode = bool(native_timing.get("paged_static_decode_enabled")) and static_mode != "dynamic"
@@ -1973,6 +1979,8 @@ class OpenVINOQwen3TTS:
                         "decode_path": f"native:stream:c{first_context if chunk_index == 0 else steady_context}_t{first_chunk if chunk_index == 0 else steady_chunk}",
                         "decode_context_frames": int(first_context if chunk_index == 0 else steady_context),
                         "decode_chunk_graph_frames": int(first_chunk if chunk_index == 0 else steady_chunk),
+                        "decode_input_frames": native_decode_input_frames,
+                        "decode_padded_frames": native_decode_padded_frames,
                         "decode_ms": decode_ms,
                         "fallback": False,
                         "codegen_ms": codegen_ms,
@@ -3996,6 +4004,35 @@ class OpenVINOQwen3TTS:
         padding = np.repeat(pad_frame, pad_count, axis=0)
         return np.concatenate([padding, window_codes], axis=0), target_context_frames
 
+    def _pad_static_stream_decoder_window(
+        self,
+        window_codes: np.ndarray,
+        context_frames: int,
+        target_context_frames: int,
+        target_chunk_frames: int,
+    ):
+        padded_window, effective_context = self._pad_stream_context(window_codes, context_frames, target_context_frames)
+        padded_frames = 0
+        if self.streaming_decoder_input_shape != "static":
+            return padded_window, effective_context, padded_frames
+
+        target_frames = int(target_context_frames) + int(target_chunk_frames)
+        current_frames = int(padded_window.shape[0])
+        if current_frames > target_frames:
+            raise ValueError(
+                f"static streaming decoder input expects at most {target_frames} frames, got {current_frames}; "
+                "export a larger chunk graph or use --stream-decoder-input-shape dynamic"
+            )
+        if current_frames < target_frames:
+            if current_frames <= 0:
+                pad_frame = np.zeros((1, self.num_code_groups), dtype=np.int64)
+            else:
+                pad_frame = padded_window[-1:]
+            padded_frames = target_frames - current_frames
+            padding = np.repeat(pad_frame, padded_frames, axis=0)
+            padded_window = np.concatenate([padded_window, padding], axis=0)
+        return padded_window, effective_context, padded_frames
+
     def decode_stream_window(
         self,
         window_codes: np.ndarray,
@@ -4016,9 +4053,14 @@ class OpenVINOQwen3TTS:
         last_stream_error = None
         for stream_key in stream_keys:
             target_context, target_chunk = stream_key
-            padded_window, effective_context = self._pad_stream_context(window_codes, context_frames, target_context)
             started = time.time()
             try:
+                padded_window, effective_context, padded_frames = self._pad_static_stream_decoder_window(
+                    window_codes,
+                    context_frames,
+                    target_context,
+                    target_chunk,
+                )
                 compiled, request = self._get_stream_decoder(target_context, target_chunk)
                 audio = run_request(
                     request,
@@ -4033,6 +4075,8 @@ class OpenVINOQwen3TTS:
                     "decode_path": f"stream:c{target_context}_t{target_chunk}",
                     "decode_context_frames": int(effective_context),
                     "decode_chunk_graph_frames": int(target_chunk),
+                    "decode_input_frames": int(padded_window.shape[0]),
+                    "decode_padded_frames": int(padded_frames),
                     "decode_ms": elapsed * 1000.0,
                     "fallback": False,
                 }
@@ -4057,6 +4101,8 @@ class OpenVINOQwen3TTS:
             "decode_path": "fallback:speech_decoder",
             "decode_context_frames": int(context_frames),
             "decode_chunk_graph_frames": None,
+            "decode_input_frames": int(window_codes.shape[0]),
+            "decode_padded_frames": 0,
             "decode_ms": elapsed * 1000.0,
             "fallback": True,
             "stream_decoder_error": str(last_stream_error) if last_stream_error is not None else None,

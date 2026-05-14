@@ -56,6 +56,8 @@ FASTEST_EXPORT_ARGS_PRODUCTION = (
     "8,12",
     "--stream-decoder-left-context",
     "25",
+    "--stream-decoder-input-shape",
+    "static",
 )
 
 FASTEST_EXPORT_ARGS_COMPAT = (
@@ -88,6 +90,8 @@ FASTEST_EXPORT_ARGS_COMPAT = (
     "6,8,12",
     "--stream-decoder-left-context",
     "25",
+    "--stream-decoder-input-shape",
+    "static",
 )
 
 

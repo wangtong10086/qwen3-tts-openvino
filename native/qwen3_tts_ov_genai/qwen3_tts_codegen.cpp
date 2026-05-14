@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cctype>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +39,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -90,8 +92,12 @@ struct NativeCodegen {
     int64_t codec_bos_id = 0;
     int64_t first_context_frames = 0;
     int64_t first_chunk_frames = 8;
+    bool first_stream_decoder_static_input = false;
+    int64_t first_stream_decoder_input_frames = 8;
     int64_t steady_context_frames = 25;
     int64_t steady_chunk_frames = 12;
+    bool steady_stream_decoder_static_input = false;
+    int64_t steady_stream_decoder_input_frames = 37;
     int64_t stream_num_code_groups = 16;
     int64_t decode_upsample_rate = 2000;
     bool last_remote_embed_used = false;
@@ -121,6 +127,8 @@ struct NativeCodegen {
         double decode_callback_ms = 0.0;
         double decode_queue_wait_ms = 0.0;
         int64_t decode_queue_depth_max = 0;
+        int64_t decode_input_frames = 0;
+        int64_t decode_padded_frames = 0;
         double host_copy_ms = 0.0;
         uint64_t host_copy_bytes = 0;
         int64_t host_copy_fallback_count = 0;
@@ -1066,6 +1074,8 @@ std::string native_timing_json(const NativeCodegen& runner) {
     json += ", \"decode_callback_ms\": " + std::to_string(item.decode_callback_ms);
     json += ", \"decode_queue_wait_ms\": " + std::to_string(item.decode_queue_wait_ms);
     json += ", \"decode_queue_depth_max\": " + std::to_string(item.decode_queue_depth_max);
+    json += ", \"decode_input_frames\": " + std::to_string(item.decode_input_frames);
+    json += ", \"decode_padded_frames\": " + std::to_string(item.decode_padded_frames);
     json += ", \"host_copy_ms\": " + std::to_string(item.host_copy_ms);
     json += ", \"host_copy_bytes\": " + std::to_string(item.host_copy_bytes);
     json += ", \"host_copy_fallback_count\": " + std::to_string(item.host_copy_fallback_count);
@@ -1221,12 +1231,25 @@ void append_sum_token(
     }
 }
 
+std::pair<bool, int64_t> stream_decoder_input_spec(const ov::CompiledModel& model, int64_t fallback_frames) {
+    try {
+        const auto pshape = model.input(0).get_partial_shape();
+        if (pshape.rank().is_static() && pshape.size() >= 2 && pshape[1].is_static()) {
+            return {true, static_cast<int64_t>(pshape[1].get_length())};
+        }
+    } catch (...) {
+    }
+    return {false, fallback_frames};
+}
+
 struct NativeDecodeTask {
     std::vector<int64_t> window;
     std::vector<int64_t> new_codes;
     int64_t new_frames = 0;
     int64_t num_code_groups = 0;
     int64_t chunk_index = 0;
+    int64_t decode_input_frames = 0;
+    int64_t decode_padded_frames = 0;
     bool is_final = false;
     double codegen_ms = 0.0;
     std::chrono::steady_clock::time_point queued_at;
@@ -1306,6 +1329,32 @@ NativeDecodeTask make_decode_task(NativeAudioStreamState& state, bool is_final) 
     const int64_t* window_end = state.all_codes.data() + static_cast<size_t>(total_frames * num_code_groups);
     task.window.insert(task.window.end(), window_begin, window_end);
 
+    const bool static_decoder_input =
+        first_chunk ? runner->first_stream_decoder_static_input : runner->steady_stream_decoder_static_input;
+    const int64_t target_input_frames =
+        first_chunk ? runner->first_stream_decoder_input_frames : runner->steady_stream_decoder_input_frames;
+    int64_t current_input_frames = static_cast<int64_t>(task.window.size() / static_cast<size_t>(num_code_groups));
+    if (static_decoder_input) {
+        if (current_input_frames > target_input_frames) {
+            throw std::runtime_error(
+                "static streaming decoder input is too small for the requested chunk; export a larger chunk graph");
+        }
+        if (current_input_frames < target_input_frames) {
+            const int64_t pad_count = target_input_frames - current_input_frames;
+            std::vector<int64_t> pad_frame(static_cast<size_t>(num_code_groups), 0);
+            if (!task.window.empty()) {
+                const auto begin = task.window.begin() + static_cast<std::ptrdiff_t>((current_input_frames - 1) * num_code_groups);
+                std::copy(begin, begin + static_cast<std::ptrdiff_t>(num_code_groups), pad_frame.begin());
+            }
+            for (int64_t i = 0; i < pad_count; ++i) {
+                task.window.insert(task.window.end(), pad_frame.begin(), pad_frame.end());
+            }
+            task.decode_padded_frames = pad_count;
+            current_input_frames = target_input_frames;
+        }
+    }
+    task.decode_input_frames = current_input_frames;
+
     const int64_t* new_codes = state.all_codes.data() + static_cast<size_t>(state.emitted_frames * num_code_groups);
     task.new_codes.assign(new_codes, new_codes + static_cast<size_t>(new_frames * num_code_groups));
     task.new_frames = new_frames;
@@ -1337,6 +1386,9 @@ void execute_decode_task(NativeAudioStreamState& state, const NativeDecodeTask& 
         }
         return;
     }
+
+    runner->last_timing.decode_input_frames += task.decode_input_frames;
+    runner->last_timing.decode_padded_frames += task.decode_padded_frames;
 
     ov::InferRequest& request = task.chunk_index == 0 ? runner->first_stream_decoder_request : runner->steady_stream_decoder_request;
 
@@ -2788,10 +2840,18 @@ public:
         m_runner.steady_stream_decoder_model = m_runner.core.compile_model(steady_decoder_xml, device, config);
         m_runner.first_stream_decoder_request = m_runner.first_stream_decoder_model.create_infer_request();
         m_runner.steady_stream_decoder_request = m_runner.steady_stream_decoder_model.create_infer_request();
+        const auto first_input_spec =
+            stream_decoder_input_spec(m_runner.first_stream_decoder_model, first_context_frames + first_chunk_frames);
+        const auto steady_input_spec =
+            stream_decoder_input_spec(m_runner.steady_stream_decoder_model, steady_context_frames + steady_chunk_frames);
         m_runner.first_context_frames = first_context_frames;
         m_runner.first_chunk_frames = first_chunk_frames;
+        m_runner.first_stream_decoder_static_input = first_input_spec.first;
+        m_runner.first_stream_decoder_input_frames = first_input_spec.second;
         m_runner.steady_context_frames = steady_context_frames;
         m_runner.steady_chunk_frames = steady_chunk_frames;
+        m_runner.steady_stream_decoder_static_input = steady_input_spec.first;
+        m_runner.steady_stream_decoder_input_frames = steady_input_spec.second;
         m_runner.stream_num_code_groups = num_code_groups;
         m_runner.decode_upsample_rate = decode_upsample_rate;
         m_runner.stream_decoders_ready = true;
