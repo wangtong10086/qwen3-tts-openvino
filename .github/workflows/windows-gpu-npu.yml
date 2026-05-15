@@ -51,6 +51,10 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: uv sync --extra native --extra server --extra release --extra dev
+      - name: Run static checks
+        run: |
+          uv run ruff check qwen3_tts_ov scripts tests
+          uv run ty check
       - name: Compile Python modules
         run: uv run python -m py_compile qwen3_tts_ov/*.py scripts/*.py
       - name: Run Windows GPU+NPU path unit tests

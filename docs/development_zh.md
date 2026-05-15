@@ -11,6 +11,17 @@ uv sync --extra native --extra server --extra export --extra dev
 uv run python -m qwen3_tts_ov --help
 ```
 
+提交前建议运行：
+
+```bash
+uv run ruff check qwen3_tts_ov scripts tests
+uv run ty check
+uv run python -m py_compile qwen3_tts_ov/*.py scripts/*.py
+uv run pytest -q
+```
+
+`ty` 当前覆盖 `pyproject.toml` 中声明的稳定辅助模块。`exporter.py`、`runtime.py`、`server.py` 和 native binding 仍包含大量 OpenVINO/PyTorch 动态对象、可选外部依赖和运行时构图逻辑，暂时由 `ruff`、`py_compile`、单元测试和端到端测试约束；扩大 `ty` 覆盖范围时应按模块逐步消除噪声。
+
 只做 runtime 打包时：
 
 ```bash
