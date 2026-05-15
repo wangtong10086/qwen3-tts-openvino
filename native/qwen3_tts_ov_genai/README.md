@@ -84,6 +84,9 @@ Low-level flags remain available for diagnostics:
 - `QWEN3_TTS_OV_NATIVE_SUBCODE_NEXT_EMBED_GRAPH=1` enables the optional
   `subcode_greedy_cached_next_embed.xml` split-subcode graph, when present,
   to move `sum_embed + tts_pad_embed` into OpenVINO.
+- `QWEN3_TTS_OV_NATIVE_PROMPT_EMBED_CACHE=0` disables the native prompt
+  invariant embedding cache. By default the native prompt path caches repeated
+  instruct, TTS special-token, and codec-prefill embeddings across requests.
 
 Use these flags only for A/B testing. Production should use `--realtime-profile fastest`.
 
@@ -111,6 +114,22 @@ uv run python scripts/benchmark_streaming_realtime.py \
   --runs 1 \
   --max-new-tokens 64 \
   --warmup-generations 1
+```
+
+The benchmark JSON includes `fast_path_ok` and `fast_path_failure_reason`.
+Treat a profile as invalid if it falls off native paged-KV, uses a decoder
+fallback, or reports host-copy fallback counts. For split-subcode hidden tensor
+handoff, use `split_subcode_hidden_direct_bind_count` and
+`split_subcode_hidden_bind_fallback_count`; `zero_copy_count` is broader and is
+not a reliable hidden-tensor verdict by itself.
+
+On Windows GPU+NPU packages, sweep the same profile aliases with:
+
+```powershell
+pwsh scripts/windows_gpu_npu_benchmark.ps1 `
+  -Profiles "fastest,graph_fused_int8_full,graph_fused_int8_selective,split_next_embed_graph,paged_split_static_decode,paged_split_dq32,paged_split_dq64,paged_split_block8" `
+  -Scenarios "gpu_only,npu_decoder,npu_audio" `
+  -CollectCounters
 ```
 
 On the current validation machine, `cachedsub` can improve short requests but is

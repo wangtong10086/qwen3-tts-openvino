@@ -927,6 +927,47 @@ class DynamicStatefulTalkerPagedGQASeedWrapper(DynamicStatefulTalkerPositionIdsB
         return (logits[-1:, :], last_hidden[-1:, :, :], *present_key_values)
 
 
+class DynamicStatefulTalkerPagedTop1SeedWrapper(torch.nn.Module):
+    def __init__(
+        self,
+        talker,
+        rms_export_mode: str = "default",
+        gqa_cache: bool = False,
+    ):
+        super().__init__()
+        wrapper_cls = DynamicStatefulTalkerPagedGQASeedWrapper if gqa_cache else DynamicStatefulTalkerPagedSeedWrapper
+        self.talker = wrapper_cls(talker, rms_export_mode=rms_export_mode)
+        vocab_size = talker.config.vocab_size
+        eos_id = talker.config.codec_eos_token_id
+        suppress_from = vocab_size - 1024
+        suppress_add = torch.zeros(vocab_size, dtype=torch.float32)
+        suppress_add[suppress_from:] = NEG_INF
+        suppress_add[eos_id] = 0.0
+        self.eos_id = int(eos_id)
+        self.register_buffer("suppress_add", suppress_add.view(1, -1), persistent=False)
+
+    def forward(self, inputs_embeds, position_ids, attention_mask, beam_idx, allow_eos, *past_key_values):
+        logits, last_hidden, *present_key_values = self.talker(
+            inputs_embeds,
+            position_ids,
+            attention_mask,
+            beam_idx,
+            *past_key_values,
+        )
+        scores = logits.to(torch.float32) + self.suppress_add
+        eos_score = torch.where(
+            allow_eos.view(1) > 0,
+            logits[:, self.eos_id].to(torch.float32),
+            torch.full_like(logits[:, self.eos_id].to(torch.float32), NEG_INF),
+        )
+        scores = torch.cat(
+            [scores[:, : self.eos_id], eos_score.view(1, 1), scores[:, self.eos_id + 1 :]],
+            dim=-1,
+        )
+        first_code = torch.argmax(scores, dim=-1, keepdim=True).to(torch.long)
+        return (first_code, last_hidden, *present_key_values)
+
+
 class DynamicFusedCacheCodecStepWrapper(torch.nn.Module):
     def __init__(
         self,
@@ -1782,6 +1823,55 @@ def save_paged_kv_seed_talker_model(
     ov.save_model(ov_model, path, compress_to_fp16=True)
     suffix = " gqa" if gqa_cache else ""
     print(f"saved paged-kv{suffix} seed talker {path} in {time.time() - started:.1f}s", flush=True)
+
+
+def save_paged_kv_seed_talker_top1_model(
+    talker,
+    path: Path,
+    example_seq_len: int,
+    rms_export_mode: str = "default",
+    gqa_cache: bool = False,
+    force: bool = False,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not force and path.exists() and path.with_suffix(".bin").exists():
+        return
+
+    started = time.time()
+    config = talker.config
+    kv_heads = config.num_key_value_heads if gqa_cache else config.num_attention_heads
+    head_dim = config.head_dim
+    past_shape = (1, kv_heads, 0, head_dim)
+    wrapper = DynamicStatefulTalkerPagedTop1SeedWrapper(
+        talker,
+        rms_export_mode=rms_export_mode,
+        gqa_cache=gqa_cache,
+    )
+    position_ids = torch.arange(example_seq_len, dtype=torch.long).view(1, -1, 1).expand(3, -1, 1)
+    example_inputs = (
+        torch.zeros((example_seq_len, 1, config.hidden_size), dtype=torch.float32),
+        position_ids,
+        torch.zeros((example_seq_len, 1, 1, 1), dtype=torch.float32),
+        torch.zeros((example_seq_len,), dtype=torch.long),
+        torch.ones((1,), dtype=torch.float32),
+        *[torch.zeros(past_shape, dtype=torch.float32) for _ in range(config.num_hidden_layers * 2)],
+    )
+    input_shapes = [
+        ov.PartialShape([-1, 1, config.hidden_size]),
+        ov.PartialShape([3, -1, 1]),
+        ov.PartialShape([-1, 1, 1, -1]),
+        ov.PartialShape([-1]),
+        ov.PartialShape([1]),
+        *[ov.PartialShape([1, kv_heads, -1, head_dim]) for _ in range(config.num_hidden_layers * 2)],
+    ]
+    ov_model = ov.convert_model(wrapper.eval(), example_input=example_inputs, input=input_shapes)
+    input_names, stateful_output_names, state_pairs = make_stateful_names(config.num_hidden_layers)
+    input_names = ["inputs_embeds", "position_ids", "attention_mask", "beam_idx", "allow_eos", *input_names[3:]]
+    output_names = ["first_code", "last_hidden", *stateful_output_names[2:]]
+    apply_stateful_names(ov_model, input_names, output_names, state_pairs)
+    ov.save_model(ov_model, path, compress_to_fp16=True)
+    suffix = " gqa" if gqa_cache else ""
+    print(f"saved paged-kv{suffix} top1 seed talker {path} in {time.time() - started:.1f}s", flush=True)
 
 
 def save_paged_kv_seed_fused_model(
@@ -2775,6 +2865,8 @@ def write_manifest(
                     "fused_cache_step": "fused_cache_step_sdpa_paged_seed.xml",
                     "talker_subcode_greedy": "fused_cache_step_sdpa_paged_seed.xml",
                     "talker_stateful_gqa": "talker_stateful_sdpa_paged_gqa_seed.xml",
+                    "talker_top1": "talker_top1_sdpa_paged_seed.xml",
+                    "talker_top1_gqa": "talker_top1_sdpa_paged_gqa_seed.xml",
                     "fused_cache_step_gqa": "fused_cache_step_sdpa_paged_gqa_seed.xml",
                     "talker_subcode_greedy_gqa": "fused_cache_step_sdpa_paged_gqa_seed.xml",
                     "fused_cache_step_subcode_exact": paged_kv_fused_seed_filename(subcode_attention_kernel="exact"),
@@ -3100,8 +3192,13 @@ def main() -> None:
     subcode_export_mode = normalize_subcode_export_mode(args.fused_subcode_mode)
     rms_suffix = rms_graph_suffix(rms_export_mode)
     fused_suffix = fused_codegen_graph_suffix(rms_export_mode, subcode_export_mode)
-    graph = lambda name: add_graph_suffix(name, rms_suffix)
-    fused_graph = lambda name: add_graph_suffix(name, fused_suffix)
+
+    def graph(name: str) -> str:
+        return add_graph_suffix(name, rms_suffix)
+
+    def fused_graph(name: str) -> str:
+        return add_graph_suffix(name, fused_suffix)
+
     skip_fixed_cache_graphs = bool(args.skip_fixed_cache_graphs)
     if skip_fixed_cache_graphs:
         cache_kernels = []
@@ -3228,6 +3325,8 @@ def main() -> None:
             [
                 out_dir / "talker_stateful_sdpa_paged_seed.xml",
                 out_dir / "talker_stateful_sdpa_paged_gqa_seed.xml",
+                out_dir / "talker_top1_sdpa_paged_seed.xml",
+                out_dir / "talker_top1_sdpa_paged_gqa_seed.xml",
             ]
         )
         if not skip_fixed_cache_graphs:
@@ -3307,6 +3406,21 @@ def main() -> None:
             save_paged_kv_seed_talker_model(
                 talker,
                 out_dir / "talker_stateful_sdpa_paged_gqa_seed.xml",
+                args.example_seq_len,
+                rms_export_mode=rms_export_mode,
+                gqa_cache=True,
+                force=force_paged_kv_seed,
+            )
+            save_paged_kv_seed_talker_top1_model(
+                talker,
+                out_dir / "talker_top1_sdpa_paged_seed.xml",
+                args.example_seq_len,
+                rms_export_mode=rms_export_mode,
+                force=force_paged_kv_seed,
+            )
+            save_paged_kv_seed_talker_top1_model(
+                talker,
+                out_dir / "talker_top1_sdpa_paged_gqa_seed.xml",
                 args.example_seq_len,
                 rms_export_mode=rms_export_mode,
                 gqa_cache=True,

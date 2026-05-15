@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -202,11 +203,14 @@ def test_windows_gpu_npu_benchmark_builds_scenario_commands(tmp_path):
         device="GPU",
         ov_cache_dir=tmp_path / "cache-npu",
         npu_offload="audio",
+        benchmark_profile="split_next_embed_graph",
     )
 
     assert "--npu-offload" in gpu_cmd
     assert gpu_cmd[gpu_cmd.index("--npu-offload") + 1] == "off"
     assert npu_cmd[npu_cmd.index("--npu-offload") + 1] == "audio"
+    assert "--benchmark-profile" in npu_cmd
+    assert npu_cmd[npu_cmd.index("--benchmark-profile") + 1] == "split_next_embed_graph"
     assert "--decoder-device" not in npu_cmd
 
 
@@ -218,6 +222,15 @@ def test_windows_gpu_npu_benchmark_parses_default_scenarios():
     assert benchmark.parse_scenarios("npu_all") == ["gpu_only", "npu_all"]
     with pytest.raises(ValueError, match="unknown scenarios"):
         benchmark.parse_scenarios("gpu_only,invalid")
+
+
+def test_windows_gpu_npu_benchmark_parses_runtime_profiles():
+    benchmark = load_script("benchmark_windows_gpu_npu_release.py")
+
+    assert benchmark.parse_profiles(None) == ["fastest"]
+    assert benchmark.parse_profiles("fastest,split_next_embed_graph") == ["fastest", "split_next_embed_graph"]
+    with pytest.raises(ValueError, match="unknown profiles"):
+        benchmark.parse_profiles("fastest,missing_profile")
 
 
 def test_windows_gpu_npu_benchmark_powershell_runs_probe_and_analyzer():
@@ -470,6 +483,51 @@ def test_release_server_loads_windows_npu_offload_summary(monkeypatch, tmp_path)
     assert captured["npu_offload"] == "all"
 
 
+def test_release_server_applies_hidden_benchmark_profile(monkeypatch, tmp_path):
+    from qwen3_tts_ov import release_server
+    from qwen3_tts_ov.model_download import ModelDownloadResult
+
+    captured = {}
+    monkeypatch.setattr(release_server, "configure_native_library_env", lambda: None)
+    monkeypatch.setattr(
+        release_server,
+        "ensure_release_model_root",
+        lambda model_root, **_: ModelDownloadResult(
+            model_root=Path(model_root),
+            status="local",
+            repo_id="repo",
+            revision="main",
+            subdir="openvino_realtime",
+            cache_dir=tmp_path / "cache",
+            message="local",
+        ),
+    )
+    monkeypatch.setattr(release_server, "serve", lambda **kwargs: captured.update(kwargs))
+    env_keys = list(release_server.BENCHMARK_PROFILE_ENV_KEYS.values())
+    previous_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        release_server.main(
+            [
+                "--model-root",
+                str(tmp_path / "openvino"),
+                "--no-auto-download-model",
+                "--benchmark-profile",
+                "split_next_embed_graph",
+                "--no-warmup",
+            ]
+        )
+    finally:
+        for key, value in previous_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    assert captured["mode"] == "no-cache"
+    assert captured["graph_variant"] == "int8_sym_paged_talker_split"
+    assert captured["realtime_profile"] == "fp16"
+
+
 def test_cli_applies_windows_npu_offload_summary(tmp_path):
     from qwen3_tts_ov import cli
 
@@ -541,6 +599,29 @@ def test_windows_gpu_npu_benchmark_metric_uses_audio_duration():
     assert metric["speaker_encoder_device"] is None
     assert metric["native_codegen_device"] == "GPU"
     assert metric["npu_offload_effective"] == "decoder"
+    assert metric["fast_path_ok"] is False
+
+
+def test_fast_path_helper_accepts_native_paged_kv_stream_path():
+    from qwen3_tts_ov.fast_path import evaluate_fast_path
+
+    verdict = evaluate_fast_path(
+        {
+            "native_audio_pipeline": True,
+            "paged_kv": True,
+            "paged_kv_backend": "native_paged_attention",
+            "decode_path": "native:stream:c0_t8/c25_t24",
+            "fallback": False,
+            "unroll_fallback": False,
+            "native_timing": {
+                "host_copy_fallback_count": 0,
+                "subcode_host_copy_fallback_count": 0,
+                "split_subcode_hidden_bind_fallback_count": 0,
+            },
+        }
+    )
+
+    assert verdict["fast_path_ok"] is True
 
 
 def test_windows_gpu_npu_result_analyzer_accepts_valid_artifacts(tmp_path):

@@ -50,6 +50,14 @@ def test_streaming_benchmark_keeps_experimental_profiles_in_devtools():
     assert "subprocess.TimeoutExpired" in source
     assert "--preferred-cache-bucket" in source
     assert "--profile-set" in source
+    assert '"native-ov-hotspots": "fastest"' in source
+    assert '"hidden-zero-copy": "fastest,fastest_hidden_remote_off,fastest_hidden_remote_on,fastest_hidden_remote_require"' in source
+    assert '"top1-seed": "fastest,talker_top1_seed_split_subcode"' in source
+    assert "QWEN3_TTS_OV_NATIVE_REQUIRE_SPLIT_SUBCODE_REMOTE_HIDDEN" in source
+    assert "QWEN3_TTS_OV_NATIVE_PAGED_KV_TOP1_SEED" in source
+    assert '"native_ov_profile_top_by_label"' in source
+    assert '"split_subcode_hidden_direct_bind_count"' in source
+    assert '"paged_seed_outputs_first_code"' in source
     assert "--max-new-tokens-set" in source
     assert "fastest-gate" in source
     assert '"accepted": accepted' in source
@@ -110,6 +118,10 @@ def test_python_cli_exposes_native_ov_profile_switch():
     assert "native_int8_sym_fused_cachedsub_norepeat_unroll8_bucket96" in profiles_source
     assert '"realtime_profile": "int8-sym-fused-cachedsub-norepeat"' in profiles_source
     assert "native_int8_sym_fused_cachedsub_rms_norepeat_bucket96" in profiles_source
+    assert "fastest_hidden_remote_require" in profiles_source
+    assert "talker_top1_seed_split_subcode" in profiles_source
+    assert "native_require_split_subcode_remote_hidden" in profiles_source
+    assert "native_paged_kv_top1_seed" in profiles_source
 
 
 def test_benchmark_summary_accepts_only_stable_p90_profiles():
@@ -169,6 +181,8 @@ def test_compression_script_can_use_source_graph_variant():
 
     assert "--source-variant" in source
     assert "merge_nested_graphs(graphs" in source
+    assert "fastest-top1-seed" in source
+    assert "talker_top1_gqa" in source
 
 
 def test_exporter_exposes_rms_variant_export_mode():
@@ -180,3 +194,5 @@ def test_exporter_exposes_rms_variant_export_mode():
     assert "--fused-subcode-mode" in source
     assert "SubcodeGreedyCachedWrapper if normalize_subcode_export_mode" in source
     assert 'features.append("cachedsub")' in source
+    assert "DynamicStatefulTalkerPagedTop1SeedWrapper" in source
+    assert "talker_top1_sdpa_paged_gqa_seed.xml" in source

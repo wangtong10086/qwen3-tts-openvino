@@ -192,6 +192,132 @@ uv run python scripts/benchmark_streaming_realtime.py \
 - 256 max tokens 下 `paged_split_block8` 明显更慢。
 - 不采纳 block size 8 作为默认。
 
+### 5. hidden zero-copy、OpenVINO profile 与 top1 seed 实验
+
+本轮补充三组实验：
+
+- `fastest + native OV profile`：建立 OpenVINO 内部算子热点基线。
+- `fastest + hidden remote on/off/require`：验证 split subcode hidden tensor 是否真正直连，是否存在 copy fallback。
+- `talker_top1_seed_split_subcode`：去掉 seed 图输出 logits 后的 host argmax，观察是否降低 codegen 时延。
+
+为了支持 `talker_top1_seed_split_subcode`，本地 IR 额外导出并压缩了：
+
+```text
+talker_top1_sdpa_paged_seed.xml
+talker_top1_sdpa_paged_gqa_seed.xml
+talker_top1_sdpa_paged_gqa_seed_int8_sym_paged_talker_top1_split.xml
+```
+
+导出和压缩命令：
+
+```bash
+PYTHONPATH=/home/wt/Qwen3-TTS uv run python -m qwen3_tts_ov export \
+  --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --model-type voice_design \
+  --out-dir openvino/voice_design \
+  --skip-fixed-cache-graphs \
+  --export-paged-kv-seed \
+  --paged-kv-unroll-steps '' \
+  --stream-decoder-chunks 24 \
+  --stream-decoder-first-chunks 12 \
+  --subcode-attention-kernels sdpa \
+  --paged-kv-subcode-attention-kernels sdpa
+
+uv run python scripts/compress_openvino_weights.py \
+  --ir-dir openvino/voice_design \
+  --preset fastest-top1-seed
+```
+
+48 token 热态主实验命令：
+
+```bash
+uv run python scripts/benchmark_streaming_realtime.py \
+  --ir-dir openvino/voice_design \
+  --device GPU \
+  --profiles fastest,fastest_hidden_remote_off,fastest_hidden_remote_on,fastest_hidden_remote_require,talker_top1_seed_split_subcode \
+  --runs 3 \
+  --max-new-tokens 48 \
+  --min-new-tokens 12 \
+  --warmup-generations 1 \
+  --chunk-strategy smooth \
+  --worker-timeout-sec 360 \
+  --output-json outputs/perf_validation/experiment_main_hot_48.json
+```
+
+结果：
+
+| profile | runs | p50 RTF | p50 compute RTF | p50 first audio | p50 TTFT | p50 TPS | hidden direct/fallback | sampling ms | fast_path_ok |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- |
+| `fastest` | 3 | 0.877048 | 0.912207 | 873.1 ms | 86.2 ms | 14.632 | 48 / 0 | 0.736 | true |
+| `fastest_hidden_remote_off` | 3 | 0.869894 | 0.904897 | 871.9 ms | 88.8 ms | 14.782 | 0 / 48 | 0.654 | false |
+| `fastest_hidden_remote_on` | 3 | 0.874993 | 0.910093 | 874.0 ms | 86.0 ms | 14.688 | 48 / 0 | 0.808 | true |
+| `fastest_hidden_remote_require` | 3 | 0.877461 | 0.913076 | 875.2 ms | 86.4 ms | 14.644 | 48 / 0 | 0.837 | true |
+| `talker_top1_seed_split_subcode` | 3 | 0.882548 | 0.916882 | 889.9 ms | 91.8 ms | 14.575 | 48 / 0 | 0.046 | true |
+
+结论：
+
+- `hidden_remote_on/require` 均确认 direct bind，fallback 为 0，可以保留为 fast-path 约束和诊断指标。
+- 强制 `hidden_remote_off` 会触发 `split_subcode_hidden_bind_fallback_count=48`，`fast_path_ok=false`；即使单次 RTF 接近，也不能作为默认路径。
+- `talker_top1_seed_split_subcode` 确实把 `sampling_ms` 从约 0.7 ms 降到约 0.05 ms，但端到端 RTF 没有改善，因为主耗时仍在 decode/subcode OpenVINO 图。
+
+OpenVINO perf count 命令：
+
+```bash
+uv run python scripts/benchmark_streaming_realtime.py \
+  --ir-dir openvino/voice_design \
+  --device GPU \
+  --profiles fastest \
+  --runs 1 \
+  --max-new-tokens 48 \
+  --min-new-tokens 12 \
+  --warmup-generations 1 \
+  --chunk-strategy smooth \
+  --native-ov-profile \
+  --worker-timeout-sec 360 \
+  --output-json outputs/perf_validation/experiment_native_ov_profile_hot_48.json
+```
+
+该结果只用于热点归因，perf count 本身会显著增加运行开销。内部热点如下：
+
+| scope/type | real time | 占比/说明 |
+| --- | ---: | --- |
+| `codegen_paged_kv_decode_dynamic` | 982.162 ms | 最大图级热点 |
+| `codegen_paged_kv_subcode` | 368.190 ms | 第二图级热点 |
+| `stream_decoder_steady` | 142.153 ms | audio decoder 稳态 |
+| `FullyConnected` | 859.417 ms | 55.7%，主要算子热点 |
+| `Rms` | 175.499 ms | 11.4%，小算子数量多 |
+| `ScaledDotProductAttention` | 82.778 ms | 5.4% |
+| `ArgMaxMin` | 78.320 ms | 5.1%，主要来自 subcode TopK |
+| `PagedAttention` | 54.800 ms | 3.5% |
+
+192 token 上限补充测试命令：
+
+```bash
+uv run python scripts/benchmark_streaming_realtime.py \
+  --ir-dir openvino/voice_design \
+  --device GPU \
+  --profiles fastest,talker_top1_seed_split_subcode \
+  --runs 1 \
+  --max-new-tokens 192 \
+  --min-new-tokens 48 \
+  --warmup-generations 1 \
+  --chunk-strategy smooth \
+  --worker-timeout-sec 480 \
+  --output-json outputs/perf_validation/experiment_long_hot_192.json
+```
+
+实际两组都在 80 frames 处 EOS：
+
+| profile | frames | RTF | compute RTF | first audio | TPS | codegen ms | subcode ms | sampling ms | fast_path_ok |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `fastest` | 80 | 0.878503 | 0.913864 | 877.6 ms | 14.520 | 5538.360 | 3489.569 | 1.118 | true |
+| `talker_top1_seed_split_subcode` | 80 | 0.863991 | 0.899662 | 864.7 ms | 14.764 | 5450.899 | 3409.661 | 0.079 | true |
+
+结论：
+
+- top1 seed 在更长一点的输出上有小幅正收益，但幅度仍很有限。
+- 可保留为实验 profile，不建议立即替换默认 `fastest`；是否进入默认需要 Windows 真机重复验证和音频一致性验证。
+
 ## 最终结论
 
 本次实验没有发现可以替代 `fastest` 的稳定加速配置。
@@ -213,6 +339,7 @@ uv run python scripts/benchmark_streaming_realtime.py \
 - `paged_split_u8_all`
 - `split_next_embed_graph`
 - `paged_split_static_decode`
+- `talker_top1_seed_split_subcode` 暂不采纳为默认，只保留实验 profile
 
 当前默认仍应保持：
 
@@ -235,10 +362,13 @@ outputs/perf_validation/prompt_cache_on_rerun.json
 outputs/perf_validation/prompt_cache_off.json
 outputs/perf_validation/profile_sweep_short.json
 outputs/perf_validation/block8_length_sweep.json
+outputs/perf_validation/experiment_main_hot_48.json
+outputs/perf_validation/experiment_native_ov_profile_hot_48.json
+outputs/perf_validation/experiment_long_hot_192.json
 ```
 
 ## 后续建议
 
-- 下一轮优化应继续集中在 subcode inference 单步耗时，而不是 prompt embedding cache。
+- 下一轮优化应继续集中在 `codegen_paged_kv_decode_dynamic` 和 `codegen_paged_kv_subcode`，尤其是 FullyConnected、Rms、ArgMaxMin/TopK，而不是 prompt embedding cache。
 - 所有性能报告必须带上 `fast_path_ok`、`fallback`、`host_copy_fallback_count`、`subcode_host_copy_fallback_count`。
 - 任何单次更快但 `fast_path_ok=false` 的结果都不能进入默认路径。

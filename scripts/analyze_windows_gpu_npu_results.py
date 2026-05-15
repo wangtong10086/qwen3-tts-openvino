@@ -36,11 +36,16 @@ def is_npu(value: object) -> bool:
 
 
 def scenario_results(summary: dict) -> dict[str, dict]:
-    return {
-        str(item.get("name")): item
-        for item in summary.get("results", [])
-        if isinstance(item, dict) and item.get("name")
-    }
+    results: dict[str, dict] = {}
+    for item in summary.get("results", []):
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        name = str(item.get("name"))
+        scenario = str(item.get("scenario") or name)
+        results[name] = item
+        if scenario not in results or item.get("profile") == "fastest":
+            results[scenario] = item
+    return results
 
 
 def metric(result: dict, key: str) -> object:
@@ -168,6 +173,8 @@ def validate_benchmark(
             continue
         if result.get("error"):
             failures.append(f"{scenario}: {result.get('error')}")
+        if metric(result, "fast_path_ok") is False:
+            failures.append(f"{scenario}: fast_path={metric(result, 'fast_path_failure_reasons')}")
         expected = EXPECTED_OFFLOAD.get(scenario)
         effective = metric(result, "npu_offload_effective")
         if expected and effective != expected:

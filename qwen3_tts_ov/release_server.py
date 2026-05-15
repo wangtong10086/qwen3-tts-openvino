@@ -13,8 +13,62 @@ from .model_download import (
 )
 from .native_codegen import native_library_candidates
 from .npu_offload_profile import NPU_OFFLOAD_POLICY_CHOICES, load_npu_offload_profile
-from .profiles import FASTEST_CHUNK_STRATEGY, FASTEST_PROFILE_NAME, KV_CACHE_PROFILE_CHOICES, NPU_OFFLOAD_CHOICES
+from .profiles import (
+    CODEGEN_SCHEDULE_CHOICES,
+    CODEGEN_UNROLL_CHOICES,
+    FASTEST_CHUNK_STRATEGY,
+    FASTEST_PROFILE_NAME,
+    KV_CACHE_PROFILE_CHOICES,
+    NPU_OFFLOAD_CHOICES,
+    REALTIME_BENCHMARK_PROFILE_OPTIONS,
+    RUNTIME_MODE_CHOICES,
+)
 from .server import serve
+
+
+BENCHMARK_PROFILE_ENV_KEYS = {
+    "native_codegen": "QWEN3_TTS_OV_NATIVE_CODEGEN",
+    "native_pipeline": "QWEN3_TTS_OV_NATIVE_PIPELINE",
+    "native_prompt": "QWEN3_TTS_OV_NATIVE_PROMPT",
+    "native_prompt_device": "QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE",
+    "native_latency_high": "QWEN3_TTS_OV_NATIVE_LATENCY_HIGH",
+    "native_precision_hint": "QWEN3_TTS_OV_NATIVE_PRECISION_HINT",
+    "native_large_allocations": "QWEN3_TTS_OV_NATIVE_GPU_LARGE_ALLOCATIONS",
+    "native_performance_hint": "QWEN3_TTS_OV_NATIVE_PERFORMANCE_HINT",
+    "native_num_streams": "QWEN3_TTS_OV_NATIVE_NUM_STREAMS",
+    "native_model_priority": "QWEN3_TTS_OV_NATIVE_MODEL_PRIORITY",
+    "native_gpu_queue_priority": "QWEN3_TTS_OV_NATIVE_GPU_QUEUE_PRIORITY",
+    "native_gpu_host_task_priority": "QWEN3_TTS_OV_NATIVE_GPU_HOST_TASK_PRIORITY",
+    "native_gpu_queue_throttle": "QWEN3_TTS_OV_NATIVE_GPU_QUEUE_THROTTLE",
+    "native_async_decode": "QWEN3_TTS_OV_NATIVE_ASYNC_DECODE",
+    "native_split_subcode_remote_hidden": "QWEN3_TTS_OV_NATIVE_SPLIT_SUBCODE_REMOTE_HIDDEN",
+    "native_require_split_subcode_remote_hidden": "QWEN3_TTS_OV_NATIVE_REQUIRE_SPLIT_SUBCODE_REMOTE_HIDDEN",
+    "native_paged_kv_top1_seed": "QWEN3_TTS_OV_NATIVE_PAGED_KV_TOP1_SEED",
+    "native_dynamic_quantization_group_size": "QWEN3_TTS_OV_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE",
+    "native_activations_scale_factor": "QWEN3_TTS_OV_NATIVE_ACTIVATIONS_SCALE_FACTOR",
+    "native_paged_kv_static_decode": "QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE",
+    "native_paged_kv_static_blocks": "QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_BLOCKS",
+    "native_paged_kv_static_decode_mode": "QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE_MODE",
+    "native_paged_kv_score_aggregation": "QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION",
+    "native_paged_kv_split_subcode": "QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE",
+    "native_paged_kv_subcode_attention": "QWEN3_TTS_OV_NATIVE_PAGED_KV_SUBCODE_ATTENTION",
+    "native_codegen_fusion": "QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION",
+    "native_paged_kv_split_subcode_mode": "QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE_MODE",
+    "native_paged_kv_unroll": "QWEN3_TTS_OV_NATIVE_PAGED_KV_UNROLL",
+    "native_paged_kv_experimental_unroll": "QWEN3_TTS_OV_NATIVE_PAGED_KV_EXPERIMENTAL_UNROLL",
+    "native_paged_kv_hybrid": "QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID",
+    "native_paged_kv_hybrid_prefix_frames": "QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID_PREFIX_FRAMES",
+    "native_subcode_device": "QWEN3_TTS_OV_NATIVE_SUBCODE_DEVICE",
+    "native_subcode_next_embed_graph": "QWEN3_TTS_OV_NATIVE_SUBCODE_NEXT_EMBED_GRAPH",
+    "native_remote_embed": "QWEN3_TTS_OV_NATIVE_REMOTE_EMBED",
+    "native_buffer_reuse": "QWEN3_TTS_OV_NATIVE_BUFFER_REUSE",
+    "native_paged_kv": "QWEN3_TTS_OV_NATIVE_PAGED_KV",
+    "native_paged_kv_gqa": "QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA",
+    "native_paged_kv_precision": "QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION",
+    "native_paged_kv_cache_input_precision": "QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_INPUT_PRECISION",
+    "native_paged_kv_block_size": "QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE",
+    "native_codegen_device": "QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE",
+}
 
 
 def bundle_roots() -> list[Path]:
@@ -100,6 +154,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=17860)
     parser.add_argument("--realtime-profile", default=FASTEST_PROFILE_NAME, choices=[FASTEST_PROFILE_NAME, "auto"])
+    parser.add_argument(
+        "--benchmark-profile",
+        default=None,
+        choices=sorted(REALTIME_BENCHMARK_PROFILE_OPTIONS),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--mode", default="cache", choices=RUNTIME_MODE_CHOICES, help=argparse.SUPPRESS)
+    parser.add_argument("--cache-kernel", default="exact", choices=["exact", "sdpa"], help=argparse.SUPPRESS)
+    parser.add_argument("--cache-step", default="fused", choices=["fused", "split"], help=argparse.SUPPRESS)
+    parser.add_argument("--graph-variant", default="fp16", help=argparse.SUPPRESS)
+    parser.add_argument("--codegen-unroll", default="profile", choices=CODEGEN_UNROLL_CHOICES, help=argparse.SUPPRESS)
+    parser.add_argument("--codegen-schedule", default="current", choices=CODEGEN_SCHEDULE_CHOICES, help=argparse.SUPPRESS)
+    parser.add_argument("--codegen-decode-unroll", default="off", choices=["off", "auto", "on"], help=argparse.SUPPRESS)
+    parser.add_argument("--preferred-cache-bucket", default=112, help=argparse.SUPPRESS)
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--preload-modes", default="voice_design")
     parser.add_argument("--preload-buckets", default="warmup")
@@ -150,10 +218,31 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def apply_benchmark_profile(args: argparse.Namespace) -> None:
+    if not args.benchmark_profile:
+        return
+    option = REALTIME_BENCHMARK_PROFILE_OPTIONS[args.benchmark_profile]
+    if option.get("mode"):
+        args.realtime_profile = str(option.get("realtime_profile") or "fp16")
+        args.mode = str(option["mode"])
+        args.cache_kernel = str(option.get("cache_kernel", args.cache_kernel))
+        args.cache_step = str(option.get("cache_step", args.cache_step))
+        args.graph_variant = str(option.get("graph_variant", args.graph_variant))
+    else:
+        args.realtime_profile = str(option.get("realtime_profile") or args.realtime_profile)
+    for key in ("codegen_unroll", "codegen_schedule", "codegen_decode_unroll", "preferred_cache_bucket"):
+        if key in option:
+            setattr(args, key, str(option[key]))
+    for key, env_name in BENCHMARK_PROFILE_ENV_KEYS.items():
+        if key in option:
+            os.environ[env_name] = str(option[key])
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     configure_native_library_env()
+    apply_benchmark_profile(args)
     if args.npu_offload_summary:
         profile = load_npu_offload_profile(args.npu_offload_summary, policy=args.npu_offload_policy)
         args.npu_offload = profile["npu_offload"]
@@ -185,6 +274,14 @@ def main(argv: list[str] | None = None) -> None:
         prompt_device=args.prompt_device,
         npu_offload=args.npu_offload,
         allow_cpu_fallback=args.allow_cpu_fallback,
+        mode=args.mode,
+        cache_kernel=args.cache_kernel,
+        cache_step=args.cache_step,
+        graph_variant=args.graph_variant,
+        codegen_unroll=args.codegen_unroll,
+        codegen_schedule=args.codegen_schedule,
+        codegen_decode_unroll=args.codegen_decode_unroll,
+        preferred_cache_bucket=args.preferred_cache_bucket,
         realtime_profile=args.realtime_profile,
         ov_cache_dir=args.ov_cache_dir,
         disable_ov_cache=args.disable_ov_cache,

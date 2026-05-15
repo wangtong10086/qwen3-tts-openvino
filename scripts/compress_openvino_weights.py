@@ -70,6 +70,7 @@ def main() -> None:
             "fastest-selective-cachedsub",
             "fastest-fused-seed",
             "fastest-fused-seed-selective",
+            "fastest-top1-seed",
         ],
         help=(
             "Convenience graph selection. 'fastest' creates the production "
@@ -78,7 +79,8 @@ def main() -> None:
             "'fastest-selective-cachedsub' compresses cached subcode while excluding fragile layers; "
             "'fastest-fused-seed' creates an experimental graph-fused seed variant; "
             "'fastest-fused-seed-selective' compresses the graph-fused seed while keeping subcode-sensitive "
-            "nodes in FP precision for correctness testing."
+            "nodes in FP precision for correctness testing; "
+            "'fastest-top1-seed' compresses the experimental top1 seed graph for split-subcode tests."
         ),
     )
     parser.add_argument("--variant", default="int8_fused")
@@ -208,6 +210,20 @@ def main() -> None:
         ]
         existing_patterns = parse_csv(args.ignore_patterns)
         args.ignore_patterns = ",".join([*existing_patterns, *selective_patterns])
+    elif args.preset == "fastest-top1-seed":
+        if args.variant == parser.get_default("variant"):
+            args.variant = "int8_sym_paged_talker_top1_split"
+        if args.mode == parser.get_default("mode"):
+            args.mode = "int8_sym"
+        args.include_no_cache = False
+        args.include_subcode = False
+        args.include_cached_subcode = False
+        args.include_sdpa_cache = False
+        args.include_fused_cache = False
+        args.include_fused_unroll = False
+        args.include_fused_decode_unroll = False
+        args.include_paged_kv_seed = True
+        args.paged_kv_seed_keys = "talker_top1_gqa"
 
     ir_dir = resolve_ir_dir(args.ir_dir, fallback_to_local_voice_design=True, warn=True)
     manifest_path = ir_dir / "manifest.json"

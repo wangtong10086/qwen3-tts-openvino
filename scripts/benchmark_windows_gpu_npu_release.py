@@ -12,6 +12,9 @@ import sys
 import time
 from pathlib import Path
 
+from qwen3_tts_ov.fast_path import evaluate_fast_path
+from qwen3_tts_ov.profiles import REALTIME_BENCHMARK_PROFILE_OPTIONS
+
 from smoke_release_package import extract_archive, find_executable, read_health, tail, terminate_process
 from smoke_release_tts import (
     exercised_runtime_stages,
@@ -43,6 +46,18 @@ def parse_scenarios(value: str | None) -> list[str]:
     return result
 
 
+def parse_profiles(value: str | None) -> list[str]:
+    raw = value or "fastest"
+    result = [item.strip() for item in str(raw).split(",") if item.strip()]
+    unknown = [item for item in result if item not in REALTIME_BENCHMARK_PROFILE_OPTIONS]
+    if unknown:
+        raise ValueError(
+            f"unknown profiles: {', '.join(unknown)}; "
+            f"available: {', '.join(sorted(REALTIME_BENCHMARK_PROFILE_OPTIONS))}"
+        )
+    return result or ["fastest"]
+
+
 def build_server_command(
     *,
     exe: Path,
@@ -53,6 +68,7 @@ def build_server_command(
     ov_cache_dir: Path,
     npu_offload: str = "off",
     decoder_device: str | None = None,
+    benchmark_profile: str = "fastest",
     no_warmup: bool = False,
 ) -> list[str]:
     cmd = [
@@ -71,6 +87,8 @@ def build_server_command(
         str(ov_cache_dir),
         "--npu-offload",
         npu_offload,
+        "--benchmark-profile",
+        benchmark_profile,
     ]
     if decoder_device:
         cmd.extend(["--decoder-device", decoder_device])
@@ -109,7 +127,7 @@ def metric_from_stream(stream: dict, health: dict, wall_elapsed: float) -> dict:
         server_rtf = None if server_rtf is None else float(server_rtf)
     except (TypeError, ValueError):
         server_rtf = None
-    return {
+    metric = {
         "audio_bytes": audio_bytes,
         "audio_seconds": audio_seconds,
         "elapsed": elapsed,
@@ -131,6 +149,8 @@ def metric_from_stream(stream: dict, health: dict, wall_elapsed: float) -> dict:
         "npu_offload_reason": first_stream_or_health_value(stream, health, "npu_offload_reason", None),
         "timings": timings,
     }
+    metric.update(evaluate_fast_path(metric))
+    return metric
 
 
 def aggregate_metrics(metrics: list[dict]) -> dict:
@@ -145,6 +165,13 @@ def aggregate_metrics(metrics: list[dict]) -> dict:
     computed_rtf = values("computed_rtf")
     server_rtf = values("server_rtf")
     elapsed = values("elapsed")
+    fast_path_reasons = sorted(
+        {
+            str(metric.get("fast_path_failure_reason"))
+            for metric in metrics
+            if not metric.get("fast_path_ok") and metric.get("fast_path_failure_reason")
+        }
+    )
     return {
         "runs": metrics,
         "median_computed_rtf": statistics.median(computed_rtf) if computed_rtf else None,
@@ -159,6 +186,8 @@ def aggregate_metrics(metrics: list[dict]) -> dict:
         "native_codegen_device": metrics[-1].get("native_codegen_device") if metrics else None,
         "npu_offload_effective": metrics[-1].get("npu_offload_effective") if metrics else None,
         "npu_offload_reason": metrics[-1].get("npu_offload_reason") if metrics else None,
+        "fast_path_ok": bool(metrics) and all(bool(metric.get("fast_path_ok")) for metric in metrics),
+        "fast_path_failure_reasons": fast_path_reasons,
     }
 
 
@@ -300,16 +329,24 @@ def expected_offload_for_scenario(name: str, npu_offload: str) -> str | None:
 
 def compare_to_gpu_baseline(results: list[dict]) -> dict:
     by_name = {item["name"]: item for item in results}
-    gpu_rtf = ((by_name.get("gpu_only") or {}).get("summary") or {}).get("median_computed_rtf")
-    gpu_util = accelerator_utilization_average(by_name.get("gpu_only"), "gpu")
+    by_profile_scenario = {
+        (str(item.get("profile") or "fastest"), str(item.get("scenario") or item.get("name"))): item
+        for item in results
+    }
     comparison = {}
     for name, result in by_name.items():
-        if name == "gpu_only":
+        profile = str(result.get("profile") or "fastest")
+        scenario = str(result.get("scenario") or name)
+        if scenario == "gpu_only":
             continue
+        baseline = by_profile_scenario.get((profile, "gpu_only")) or by_name.get("gpu_only")
+        gpu_rtf = ((baseline or {}).get("summary") or {}).get("median_computed_rtf")
+        gpu_util = accelerator_utilization_average(baseline, "gpu")
         npu_rtf = (result.get("summary") or {}).get("median_computed_rtf")
         scenario_gpu_util = accelerator_utilization_average(result, "gpu")
         scenario_npu_util = accelerator_utilization_average(result, "npu")
         comparison[name] = {
+            "baseline": None if baseline is None else baseline.get("name"),
             "computed_rtf_delta": None if gpu_rtf is None or npu_rtf is None else npu_rtf - gpu_rtf,
             "computed_rtf_speedup": None if gpu_rtf is None or not npu_rtf else gpu_rtf / npu_rtf,
             "gpu_utilization_average": scenario_gpu_util,
@@ -380,6 +417,8 @@ def recommend_offload(results: list[dict], comparison: dict, *, max_rtf_regressi
         if name == "gpu_only" or result.get("error"):
             continue
         summary = result.get("summary") or {}
+        if summary.get("fast_path_ok") is False:
+            continue
         effective = summary.get("npu_offload_effective")
         if not effective or effective == "off":
             continue
@@ -398,6 +437,7 @@ def recommend_offload(results: list[dict], comparison: dict, *, max_rtf_regressi
                 "computed_rtf_speedup": metrics.get("computed_rtf_speedup"),
                 "gpu_utilization_reduction": metrics.get("gpu_utilization_reduction"),
                 "npu_utilization_average": metrics.get("npu_utilization_average"),
+                "fast_path_ok": summary.get("fast_path_ok"),
             }
         )
 
@@ -453,6 +493,8 @@ def recommend_offload(results: list[dict], comparison: dict, *, max_rtf_regressi
 def run_scenario(
     *,
     name: str,
+    scenario_name: str,
+    benchmark_profile: str,
     exe: Path,
     model_root: Path,
     work_dir: Path,
@@ -482,6 +524,7 @@ def run_scenario(
         ov_cache_dir=scenario_dir / "ov-cache",
         npu_offload=npu_offload,
         decoder_device=decoder_device,
+        benchmark_profile=benchmark_profile,
         no_warmup=no_warmup,
     )
     with log_path.open("w", encoding="utf-8") as log:
@@ -513,10 +556,12 @@ def run_scenario(
         summary["npu_offload_coverage"] = npu_offload_coverage(npu_offload, exercised_stages)
         if counter_summary is not None:
             summary["accelerator_counters"] = counter_summary
-        expected_offload = expected_offload_for_scenario(name, npu_offload)
+        expected_offload = expected_offload_for_scenario(scenario_name, npu_offload)
         if expected_offload and summary.get("npu_offload_effective") != expected_offload:
             return {
                 "name": name,
+                "scenario": scenario_name,
+                "profile": benchmark_profile,
                 "cmd": cmd,
                 "error": (
                     f"expected npu_offload_effective={expected_offload}, "
@@ -528,6 +573,8 @@ def run_scenario(
             }
         return {
             "name": name,
+            "scenario": scenario_name,
+            "profile": benchmark_profile,
             "cmd": cmd,
             "health": {"ok": health.get("ok"), "warmup": health.get("warmup", {})},
             "summary": summary,
@@ -535,6 +582,8 @@ def run_scenario(
     except Exception as exc:
         return {
             "name": name,
+            "scenario": scenario_name,
+            "profile": benchmark_profile,
             "cmd": cmd,
             "error": str(exc),
             "server_log_tail": tail(log_path),
@@ -559,6 +608,15 @@ def main() -> None:
         "--scenarios",
         default="gpu_only,npu_decoder,npu_audio",
         help="Comma-separated benchmark scenarios: gpu_only,npu_decoder,npu_audio,npu_all.",
+    )
+    parser.add_argument(
+        "--profiles",
+        default="fastest",
+        help=(
+            "Comma-separated runtime profile aliases from qwen3_tts_ov.profiles, for example "
+            "fastest,graph_fused_int8_full,graph_fused_int8_selective,split_next_embed_graph,"
+            "paged_split_static_decode,paged_split_dq32,paged_split_dq64,paged_split_block8."
+        ),
     )
     parser.add_argument("--require-devices", default="GPU,NPU")
     parser.add_argument("--skip-if-missing-devices", action="store_true")
@@ -639,6 +697,7 @@ def main() -> None:
     if not manifest.exists():
         raise FileNotFoundError(f"voice_design manifest not found under model root: {manifest}")
     scenario_names = parse_scenarios(args.scenarios)
+    profile_names = parse_profiles(args.profiles)
     if args.mode == "voice_clone" and not args.ref_audio:
         raise ValueError("--mode voice_clone requires --ref-audio")
     exercised_stages = exercised_runtime_stages(args.mode, x_vector_only=bool(args.x_vector_only))
@@ -664,21 +723,28 @@ def main() -> None:
         request_payload["ref_text"] = args.ref_text
         request_payload["x_vector_only"] = bool(args.x_vector_only)
     scenarios = []
-    for offset, scenario_name in enumerate(scenario_names):
-        scenario = SCENARIOS[scenario_name]
-        scenarios.append(
-            {
-                "name": scenario_name,
-                "port": args.base_port + offset,
-                "npu_offload": scenario["npu_offload"],
-                "decoder_device": None,
-            }
-        )
+    offset = 0
+    for profile_name in profile_names:
+        for scenario_name in scenario_names:
+            scenario = SCENARIOS[scenario_name]
+            scenarios.append(
+                {
+                    "name": scenario_name if len(profile_names) == 1 else f"{scenario_name}__{profile_name}",
+                    "scenario_name": scenario_name,
+                    "profile": profile_name,
+                    "port": args.base_port + offset,
+                    "npu_offload": scenario["npu_offload"],
+                    "decoder_device": None,
+                }
+            )
+            offset += 1
     results = []
     for scenario in scenarios:
         results.append(
             run_scenario(
                 name=scenario["name"],
+                scenario_name=scenario["scenario_name"],
+                benchmark_profile=scenario["profile"],
                 exe=exe,
                 model_root=model_root,
                 work_dir=work_dir,
@@ -706,6 +772,12 @@ def main() -> None:
         max_rtf_regression=args.max_rtf_regression,
         min_gpu_utilization_reduction=args.min_gpu_utilization_reduction,
     )
+    for result in results:
+        summary_item = result.get("summary") or {}
+        if summary_item.get("fast_path_ok") is False:
+            acceptance_failures.append(
+                f"{result.get('name')}: fast_path={summary_item.get('fast_path_failure_reasons')}"
+            )
     status = "ok" if all("error" not in item for item in results) else "failed"
     if acceptance_failures:
         status = "failed"
@@ -721,6 +793,7 @@ def main() -> None:
             "chunk_strategy": args.chunk_strategy,
             "runs": args.runs,
             "scenarios": scenario_names,
+            "profiles": profile_names,
             "collect_accelerator_counters": args.collect_accelerator_counters,
             "counter_interval_ms": args.counter_interval_ms,
             "counter_scope": args.counter_scope,

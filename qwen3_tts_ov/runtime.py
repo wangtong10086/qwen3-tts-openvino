@@ -180,12 +180,16 @@ def select_paged_kv_seed_key(
     split_subcode: bool = False,
     requested_unroll: int = 1,
     subcode_attention: str = "auto",
+    top1_seed: bool = False,
 ) -> tuple[str, str, bool]:
     """Select the paged-KV seed graph key, effective subcode mode, and fallback flag."""
     subcode_mode = str(subcode_attention or "auto").strip().lower().replace("-", "_")
     if subcode_mode not in {"auto", "sdpa", "exact"}:
         raise ValueError("QWEN3_TTS_OV_NATIVE_PAGED_KV_SUBCODE_ATTENTION must be one of: auto, sdpa, exact")
     seed_key = (
+        ("talker_top1_gqa" if prefer_gqa else "talker_top1")
+        if split_subcode and top1_seed
+        else
         ("talker_stateful_gqa" if prefer_gqa else "talker_stateful")
         if split_subcode
         else ("fused_cache_step_gqa" if prefer_gqa else "fused_cache_step")
@@ -649,6 +653,7 @@ class OpenVINOQwen3TTS:
         self.streaming_decoder_graphs = self.streaming_decoder_graphs_by_context.get(self.streaming_decoder_left_context, {})
         self.streaming_decoders = {}
         self.streaming_decoder_requests = {}
+        self.decoder_requests = {}
         self.last_stream_decode_info = {}
         self.stream_pipeline_decode = True
         self.native_codegen_override = None if native_codegen is None else str(native_codegen).strip().lower()
@@ -1643,7 +1648,7 @@ class OpenVINOQwen3TTS:
                 )
                 if append_prefix_codes_to_prompt:
                     sequence = self.append_prefix_code_frames_to_prompt(sequence, tts_pad_embed, prefix_codes)
-            prompt_len = int(sequence.shape[1])
+                prompt_len = int(sequence.shape[1])
             unroll_required_len = self.unroll_required_cache_len(prompt_len, max_new_tokens, initial_unroll)
             if paged_kv_requested:
                 paged_seed_graphs = dict((self.manifest.get("graphs", {}) or {}).get("paged_kv_seed", {}) or {})
@@ -1688,9 +1693,18 @@ class OpenVINOQwen3TTS:
                     .lower()
                     .replace("-", "_")
                 )
+                top1_seed_requested = env_flag_enabled(os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_TOP1_SEED"))
+                top1_seed_effective = bool(top1_seed_requested and paged_split_subcode)
+                if top1_seed_requested and not paged_split_subcode:
+                    raise RuntimeError("native paged-KV top1 seed requires split-subcode mode")
+                if top1_seed_requested and do_sample:
+                    raise RuntimeError("native paged-KV top1 seed supports greedy do_sample=false only")
+                if top1_seed_requested and abs(float(repetition_penalty) - 1.0) > 1e-6:
+                    raise RuntimeError("native paged-KV top1 seed supports repetition_penalty=1.0 only")
                 if paged_split_subcode and requested_codegen_fusion in {"auto", "graph"}:
                     can_graph_fuse = (
                         not do_sample
+                        and not top1_seed_requested
                         and abs(float(repetition_penalty) - 1.0) <= 1e-6
                         and int(requested_paged_unroll or 1) == 1
                     )
@@ -1725,6 +1739,8 @@ class OpenVINOQwen3TTS:
                             codegen_fusion_reason = "sampling_requires_split_subcode"
                         elif abs(float(repetition_penalty) - 1.0) > 1e-6:
                             codegen_fusion_reason = "repetition_penalty_requires_split_subcode"
+                        elif top1_seed_requested:
+                            codegen_fusion_reason = "top1_seed_requires_split_subcode"
                         else:
                             codegen_fusion_reason = "paged_unroll_requires_split_subcode"
                         if requested_codegen_fusion == "graph":
@@ -1739,12 +1755,18 @@ class OpenVINOQwen3TTS:
                     split_subcode=paged_split_subcode,
                     requested_unroll=requested_paged_unroll,
                     subcode_attention=subcode_attention,
+                    top1_seed=top1_seed_effective,
                 )
                 if selected_graph_fusion_key:
                     paged_seed_key = selected_graph_fusion_key
                     selected_subcode_attention = selected_graph_fusion_attention
                     paged_subcode_attention_fallback = selected_graph_fusion_fallback
                 paged_seed_graph = paged_seed_graphs.get(paged_seed_key)
+                if top1_seed_requested and not paged_seed_graph:
+                    raise RuntimeError(
+                        "native paged-KV top1 seed requires graphs.paged_kv_seed.talker_top1_gqa "
+                        "or talker_top1; re-export with --export-paged-kv-seed"
+                    )
                 if not paged_seed_graph:
                     raise RuntimeError(
                         "native paged-KV pipeline requires graphs.paged_kv_seed.fused_cache_step[_gqa] "
@@ -2013,6 +2035,8 @@ class OpenVINOQwen3TTS:
                 "paged_kv_subcode_attention_fallback": bool(
                     paged_kv_requested and paged_subcode_attention_fallback
                 ),
+                "paged_kv_top1_seed_requested": bool(top1_seed_requested) if paged_kv_requested else None,
+                "paged_kv_top1_seed": bool(top1_seed_effective) if paged_kv_requested else None,
                 "paged_kv_unroll": int(requested_paged_unroll) if paged_kv_requested else None,
                 "paged_kv_unroll_experimental": bool(paged_kv_requested and requested_paged_unroll > 1),
                 "paged_kv_heads": int(effective_paged_kv_heads) if paged_kv_requested else None,
@@ -5052,10 +5076,14 @@ class OpenVINOQwen3TTS:
             )
             if not self.allow_cpu_fallback and self.decoder_device == "GPU":
                 self.assert_gpu_execution([self.decoders[bucket]])
+            self.decoder_requests[bucket] = self.decoders[bucket].create_infer_request()
         padded = np.full((1, bucket, self.num_code_groups), -1, dtype=np.int64)
         padded[0, :token_count, :] = codes
         started = time.time()
-        decoder_request = self.decoders[bucket].create_infer_request()
+        decoder_request = self.decoder_requests.get(bucket)
+        if decoder_request is None:
+            decoder_request = self.decoders[bucket].create_infer_request()
+            self.decoder_requests[bucket] = decoder_request
         audio = run_request(
             decoder_request,
             self.decoders[bucket],

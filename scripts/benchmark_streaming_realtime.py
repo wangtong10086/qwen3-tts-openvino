@@ -6,6 +6,7 @@ import sys
 import time
 from pathlib import Path
 
+from qwen3_tts_ov.fast_path import evaluate_fast_path
 from qwen3_tts_ov.profiles import (
     REALTIME_BENCHMARK_PROFILE_OPTIONS,
     apply_realtime_profile,
@@ -27,6 +28,8 @@ NATIVE_COMPILE_ENV_KEYS = {
     "native_gpu_queue_throttle": "QWEN3_TTS_OV_NATIVE_GPU_QUEUE_THROTTLE",
     "native_async_decode": "QWEN3_TTS_OV_NATIVE_ASYNC_DECODE",
     "native_split_subcode_remote_hidden": "QWEN3_TTS_OV_NATIVE_SPLIT_SUBCODE_REMOTE_HIDDEN",
+    "native_require_split_subcode_remote_hidden": "QWEN3_TTS_OV_NATIVE_REQUIRE_SPLIT_SUBCODE_REMOTE_HIDDEN",
+    "native_paged_kv_top1_seed": "QWEN3_TTS_OV_NATIVE_PAGED_KV_TOP1_SEED",
     "native_dynamic_quantization_group_size": "QWEN3_TTS_OV_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE",
     "native_activations_scale_factor": "QWEN3_TTS_OV_NATIVE_ACTIVATIONS_SCALE_FACTOR",
     "native_paged_kv_static_decode": "QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE",
@@ -42,9 +45,13 @@ NATIVE_COMPILE_ENV_KEYS = {
 PROFILE_SETS = {
     "fastest-gate": "fastest",
     "rtf-p90-gate": "fastest",
+    "native-ov-hotspots": "fastest",
+    "hidden-zero-copy": "fastest,fastest_hidden_remote_off,fastest_hidden_remote_on,fastest_hidden_remote_require",
+    "top1-seed": "fastest,talker_top1_seed_split_subcode",
     "paged-kv-step-ablation": ",".join(
         [
             "fastest",
+            "fastest_native_prompt_cache",
             "paged_split_static_decode",
             "paged_split_block8",
             "paged_split_u8_all",
@@ -1465,6 +1472,14 @@ def summarize_results(results: list[dict]) -> list[dict]:
         compute = [float(row["stream_compute_rtf"]) for row in rows if row.get("stream_compute_rtf") is not None]
         fallback = any(bool(row.get("fallback")) for row in rows)
         unroll_fallback = any(bool(row.get("unroll_fallback")) for row in rows)
+        fast_path_ok = all(row.get("fast_path_ok", True) is not False for row in rows)
+        fast_path_reasons = sorted(
+            {
+                str(row.get("fast_path_failure_reason"))
+                for row in rows
+                if not row.get("fast_path_ok") and row.get("fast_path_failure_reason")
+            }
+        )
         bad_exit = any(row.get("worker_exit_code") not in (None, 0) for row in rows)
         underrun_count = sum(1 for row in rows if row.get("underrun_risk"))
         p90_rtf = percentile(rtfs, 90)
@@ -1476,6 +1491,7 @@ def summarize_results(results: list[dict]) -> list[dict]:
             and (p90_first is None or p90_first < 1000.0)
             and not fallback
             and not unroll_fallback
+            and fast_path_ok
             and not bad_exit
             and underrun_count == 0
         )
@@ -1488,6 +1504,8 @@ def summarize_results(results: list[dict]) -> list[dict]:
             reasons.append("fallback")
         if unroll_fallback:
             reasons.append("unroll_fallback")
+        if not fast_path_ok:
+            reasons.append("fast_path:" + "|".join(fast_path_reasons or ["unknown"]))
         if bad_exit:
             reasons.append("worker_exit")
         if underrun_count:
@@ -1519,6 +1537,8 @@ def summarize_results(results: list[dict]) -> list[dict]:
                 "p50_sampling_step_mean_ms": percentile(sampling_step_mean, 50),
                 "fallback": fallback,
                 "unroll_fallback": unroll_fallback,
+                "fast_path_ok": fast_path_ok,
+                "fast_path_failure_reasons": fast_path_reasons,
                 "underrun_count": underrun_count,
                 "accepted": accepted,
                 "acceptance_reason": "ok" if accepted else ",".join(reasons),
@@ -1536,8 +1556,6 @@ def run_profile(name: str, args: argparse.Namespace) -> dict:
 
     if name not in PROFILES:
         raise ValueError(f"unknown profile {name!r}; available: {', '.join(PROFILES)}")
-
-    import numpy as np
 
     from qwen3_tts_ov.runtime import OpenVINOQwen3TTS
 
@@ -1836,7 +1854,7 @@ def run_profile(name: str, args: argparse.Namespace) -> dict:
         if codegen_total > 0.0
         else None
     )
-    return {
+    result = {
         "case_name": args.case_name,
         "profile": name,
         "status": "error" if error else "ok",
@@ -1894,6 +1912,9 @@ def run_profile(name: str, args: argparse.Namespace) -> dict:
         "native_codegen_ms": final_timings.get("native_codegen_ms"),
         "native_pipeline_ms": final_timings.get("native_pipeline_ms"),
         "native_ov_profile": final_timings.get("native_ov_profile"),
+        "native_ov_profile_top_by_label": (final_timings.get("native_ov_profile") or {}).get("top_by_label")
+        if isinstance(final_timings.get("native_ov_profile"), dict)
+        else None,
         "native_timing": native_timing or None,
         "host_copy_ms": native_timing.get("host_copy_ms"),
         "host_copy_bytes": native_timing.get("host_copy_bytes"),
@@ -1910,6 +1931,8 @@ def run_profile(name: str, args: argparse.Namespace) -> dict:
         "paged_kv": bool(audio_timings.get("paged_kv", False)),
         "paged_kv_backend": audio_timings.get("paged_kv_backend"),
         "paged_kv_seed_key": audio_timings.get("paged_kv_seed_key"),
+        "paged_kv_top1_seed_requested": audio_timings.get("paged_kv_top1_seed_requested"),
+        "paged_kv_top1_seed": audio_timings.get("paged_kv_top1_seed"),
         "paged_kv_gqa": audio_timings.get("paged_kv_gqa"),
         "paged_kv_unroll": audio_timings.get("paged_kv_unroll"),
         "paged_kv_heads": audio_timings.get("paged_kv_heads"),
@@ -1945,7 +1968,11 @@ def run_profile(name: str, args: argparse.Namespace) -> dict:
         "subcode_next_embed_ms": native_timing.get("subcode_next_embed_ms"),
         "subcode_host_copy_bytes": native_timing.get("subcode_host_copy_bytes"),
         "subcode_host_copy_fallback_count": native_timing.get("subcode_host_copy_fallback_count"),
+        "split_subcode_hidden_direct_bind_count": native_timing.get("split_subcode_hidden_direct_bind_count"),
+        "split_subcode_hidden_bind_fallback_count": native_timing.get("split_subcode_hidden_bind_fallback_count"),
+        "split_subcode_hidden_copy_bytes": native_timing.get("split_subcode_hidden_copy_bytes"),
         "subcode_outputs_next_embed": native_timing.get("subcode_outputs_next_embed"),
+        "paged_seed_outputs_first_code": native_timing.get("paged_seed_outputs_first_code"),
         "codegen_prefill_count": native_timing.get("codegen_prefill_count"),
         "codegen_decode_count": native_timing.get("codegen_decode_count"),
         "codegen_subcode_count": native_timing.get("codegen_subcode_count"),
@@ -1957,6 +1984,8 @@ def run_profile(name: str, args: argparse.Namespace) -> dict:
         "final_timings": final_timings,
         "chunk_timings": chunk_timings,
     }
+    result.update(evaluate_fast_path(result))
+    return result
 
 
 def worker_command(args: argparse.Namespace, profile: str) -> list[str]:

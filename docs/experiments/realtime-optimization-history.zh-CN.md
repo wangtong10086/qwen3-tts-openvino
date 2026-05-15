@@ -137,6 +137,7 @@
 - `u8-all` KV/input 全 U8 路径，当前实测更慢。
 - `fastest_native_prompt_cache`，cache 命中但没有稳定降低 TTFT 或 RTF。
 - `paged_split_block8`，短样本偶尔 compute RTF 低，但端到端和较长输出不优于默认 block size 16。
+- `talker_top1_seed_split_subcode`，只在 80-frame 补测中有小幅收益，尚未完成 Windows 真机复测和音频一致性验证。
 
 ## 后续优化方向
 

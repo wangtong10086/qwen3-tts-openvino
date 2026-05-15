@@ -10,11 +10,13 @@
 - 最近一次 profile sweep 没有发现可以替代 `fastest` 的稳定加速配置。
 - `paged_split_static_decode` 单次指标看起来快，但 native static decode 编译失败，`fast_path_ok=false`，不能采纳。
 - `fastest_native_prompt_cache`、`split_next_embed_graph`、`paged_split_dq64`、`paged_split_u8_all`、`paged_split_block8` 在当前 Linux GPU 验证中没有稳定超过默认路径。
+- `hidden_remote_on/require` 已验证 split-subcode hidden direct bind 正常，当前默认路径没有 hidden copy fallback。
+- `talker_top1_seed_split_subcode` 可以显著降低 seed sampling 计时，但端到端 RTF 收益很小，暂时只保留为实验 profile。
 
 ## 文档列表
 
 - [实时推理优化历程](realtime-optimization-history.zh-CN.md): 按阶段记录从 Python/OpenVINO runtime 到 native paged-KV fastest path 的实验目标、过程和结论。
-- [2026-05-15 fast-path 与 profile sweep](2026-05-15-fast-path-profile-sweep.zh-CN.md): 记录最近一次 fast-path hard metrics、native prompt cache、block size/profile sweep 的验证数据。
+- [2026-05-15 fast-path 与 profile sweep](2026-05-15-fast-path-profile-sweep.zh-CN.md): 记录最近一次 fast-path hard metrics、native prompt cache、block size/profile sweep、hidden zero-copy、OpenVINO perf count 和 top1 seed 的验证数据。
 
 ## 新增实验记录模板
 

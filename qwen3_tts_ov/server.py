@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from .fast_path import evaluate_fast_path
 from .manifest import (
     AUTO_IR_DIR,
     DEFAULT_VOICE_DESIGN_IR_DIR,
@@ -51,7 +52,6 @@ from .profiles import (
     FASTEST_PREFERRED_CACHE_BUCKET,
     FASTEST_PROFILE_NAME,
     FASTEST_REPETITION_PENALTY,
-    KV_CACHE_PROFILE_CHOICES,
     NPU_OFFLOAD_CHOICES,
     REALTIME_BENCHMARK_PROFILE_OPTIONS,
     REALTIME_PROFILE_CHOICES,
@@ -3328,9 +3328,7 @@ def create_app(
             if next_prefix is not None:
                 prefix_codes = next_prefix
             if bool(request.get("auto_segment_isolate_native_runner", True)):
-                close_runners = getattr(runtime, "close_native_audio_runners", None)
-                if close_runners is not None:
-                    close_runners()
+                release_native_runtime_resources()
 
     def stream_chunks(request: dict):
         with tts_request_slot():
@@ -3549,7 +3547,7 @@ def create_app(
                     fused_variant_active = bool(variant_fused_buckets[cache_kernel])
                 elif all(str(bucket).isdigit() for bucket in variant_fused_buckets):
                     fused_variant_active = bool(variant_fused_buckets)
-            runtime_status[runtime_id] = {
+            status_item = {
                 "ir_dir": ir_dir,
                 "cache_step": getattr(runtime, "cache_step", None),
                 "mode": getattr(runtime, "mode", None),
@@ -3649,6 +3647,8 @@ def create_app(
                 "fused_cache_variant_active": fused_variant_active,
                 "compiled_stateful_buckets": sorted(getattr(runtime, "talker_stateful_by_bucket", {})),
             }
+            status_item.update(evaluate_fast_path(status_item, require_request_metrics=False))
+            runtime_status[runtime_id] = status_item
         return {
             "ok": True,
             "model_root": str(model_root),

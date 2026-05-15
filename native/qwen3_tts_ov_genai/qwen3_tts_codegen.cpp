@@ -72,9 +72,11 @@ struct NativeCodegen {
     int64_t unroll = 4;
     bool stream_decoders_ready = false;
     bool voice_design_prompt_ready = false;
+    bool prompt_embedding_cache_enabled = false;
     bool profile_enabled = false;
     bool paged_kv_enabled = false;
     bool paged_split_subcode = false;
+    bool paged_seed_outputs_first_code = false;
     bool subcode_outputs_next_embed = false;
     bool paged_static_decode_enabled = false;
     bool paged_static_decode_requested = false;
@@ -139,6 +141,9 @@ struct NativeCodegen {
         double subcode_next_embed_ms = 0.0;
         uint64_t subcode_host_copy_bytes = 0;
         int64_t subcode_host_copy_fallback_count = 0;
+        int64_t split_subcode_hidden_direct_bind_count = 0;
+        int64_t split_subcode_hidden_bind_fallback_count = 0;
+        uint64_t split_subcode_hidden_copy_bytes = 0;
         double sampling_ms = 0.0;
         double decode_infer_ms = 0.0;
         double callback_ms = 0.0;
@@ -184,6 +189,9 @@ struct NativeCodegen {
         std::vector<float> subcode_past_hidden;
     };
     std::unordered_map<std::string, ProfileEntry> profile_ops;
+    std::unordered_map<std::string, std::vector<float>> prompt_embedding_cache;
+    int64_t prompt_embedding_cache_hits = 0;
+    int64_t prompt_embedding_cache_misses = 0;
     std::vector<CodegenTraceFrame> codegen_trace;
     RunTiming last_timing;
     ScratchBuffers scratch;
@@ -752,6 +760,22 @@ bool compiled_model_has_input(const ov::CompiledModel& model, const std::string&
     return false;
 }
 
+bool compiled_model_output_has_name(const ov::CompiledModel& model, size_t index, const std::string& name) {
+    if (index >= model.outputs().size()) {
+        return false;
+    }
+    const auto names = model.output(index).get_names();
+    return names.find(name) != names.end();
+}
+
+bool compiled_model_first_output_is_first_code(const ov::CompiledModel& model) {
+    if (model.outputs().empty()) {
+        return false;
+    }
+    return compiled_model_output_has_name(model, 0, "first_code") ||
+           model.output(0).get_element_type() == ov::element::i64;
+}
+
 int64_t compiled_model_static_input_size(const ov::CompiledModel& model, const std::string& name) {
     for (const auto& input : model.inputs()) {
         const auto names = input.get_names();
@@ -913,6 +937,17 @@ std::vector<float> tensor_to_host_f32_vector(NativeCodegen* runner, const ov::Te
         return {};
     }
     return std::vector<float>(view.data, view.data + view.size);
+}
+
+int64_t tensor_to_host_i64_scalar(NativeCodegen* runner, const ov::Tensor& tensor, const char* label) {
+    const auto view = tensor_to_host_view<int64_t>(runner, tensor, label);
+    if (!view.data || view.size == 0) {
+        std::ostringstream msg;
+        msg << (label ? label : "tensor") << " must contain at least one i64 value ("
+            << tensor_debug_string(tensor) << ")";
+        throw std::runtime_error(msg.str());
+    }
+    return view.data[0];
 }
 
 bool env_enabled(const char* name, bool default_value) {
@@ -1108,7 +1143,34 @@ std::string native_profile_json(const NativeCodegen& runner) {
                 ", \"count\": " + std::to_string(item.count) + "}";
         json += (i + 1 == limit) ? "\n" : ",\n";
     }
-    json += "  ]\n";
+    json += "  ],\n";
+    std::map<std::string, std::vector<NativeCodegen::ProfileEntry>> entries_by_label;
+    for (const auto& item : entries) {
+        entries_by_label[item.label].push_back(item);
+    }
+    json += "  \"top_by_label\": {\n";
+    size_t label_index = 0;
+    for (auto& kv : entries_by_label) {
+        auto& items = kv.second;
+        std::sort(items.begin(), items.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.real_time_ms > rhs.real_time_ms;
+        });
+        json += "    \"" + json_escape_native(kv.first) + "\": [\n";
+        const size_t label_limit = std::min<size_t>(20, items.size());
+        for (size_t i = 0; i < label_limit; ++i) {
+            const auto& item = items[i];
+            json += "      {\"node_name\": \"" + json_escape_native(item.node_name) +
+                    "\", \"node_type\": \"" + json_escape_native(item.node_type) +
+                    "\", \"exec_type\": \"" + json_escape_native(item.exec_type) +
+                    "\", \"real_time_ms\": " + std::to_string(item.real_time_ms) +
+                    ", \"cpu_time_ms\": " + std::to_string(item.cpu_time_ms) +
+                    ", \"count\": " + std::to_string(item.count) + "}";
+            json += (i + 1 == label_limit) ? "\n" : ",\n";
+        }
+        json += "    ]";
+        json += (++label_index == entries_by_label.size()) ? "\n" : ",\n";
+    }
+    json += "  }\n";
     json += "}";
     return json;
 }
@@ -1201,6 +1263,13 @@ std::string native_timing_json(const NativeCodegen& runner) {
     json += ", \"paged_kv_cache_input_precision\": \"" + json_escape_native(runner.paged_kv_cache_input_precision) + "\"";
     json += ", \"paged_split_subcode\": ";
     json += runner.paged_split_subcode ? "true" : "false";
+    json += ", \"paged_seed_outputs_first_code\": ";
+    json += runner.paged_seed_outputs_first_code ? "true" : "false";
+    json += ", \"prompt_embedding_cache_enabled\": ";
+    json += runner.prompt_embedding_cache_enabled ? "true" : "false";
+    json += ", \"prompt_embedding_cache_size\": " + std::to_string(runner.prompt_embedding_cache.size());
+    json += ", \"prompt_embedding_cache_hits\": " + std::to_string(runner.prompt_embedding_cache_hits);
+    json += ", \"prompt_embedding_cache_misses\": " + std::to_string(runner.prompt_embedding_cache_misses);
     json += ", \"async_decode\": ";
     json += runner.last_async_decode ? "true" : "false";
     json += ", \"paged_static_decode_enabled\": ";
@@ -1220,6 +1289,9 @@ std::string native_timing_json(const NativeCodegen& runner) {
     json += ", \"subcode_next_embed_ms\": " + std::to_string(item.subcode_next_embed_ms);
     json += ", \"subcode_host_copy_bytes\": " + std::to_string(item.subcode_host_copy_bytes);
     json += ", \"subcode_host_copy_fallback_count\": " + std::to_string(item.subcode_host_copy_fallback_count);
+    json += ", \"split_subcode_hidden_direct_bind_count\": " + std::to_string(item.split_subcode_hidden_direct_bind_count);
+    json += ", \"split_subcode_hidden_bind_fallback_count\": " + std::to_string(item.split_subcode_hidden_bind_fallback_count);
+    json += ", \"split_subcode_hidden_copy_bytes\": " + std::to_string(item.split_subcode_hidden_copy_bytes);
     json += ", \"subcode_outputs_next_embed\": ";
     json += runner.subcode_outputs_next_embed ? "true" : "false";
     json += ", \"sampling_ms\": " + std::to_string(item.sampling_ms);
@@ -1373,6 +1445,53 @@ std::vector<float> embed_ids(
     }
     const float* data = output.data<const float>();
     return std::vector<float>(data, data + output.get_size());
+}
+
+std::string embedding_cache_key(const std::string& label, const std::vector<int64_t>& ids) {
+    std::string key = label;
+    key.reserve(key.size() + ids.size() * 6);
+    key.push_back(':');
+    for (int64_t id : ids) {
+        key += std::to_string(id);
+        key.push_back(',');
+    }
+    return key;
+}
+
+std::vector<float> embed_ids_cached(
+    NativeCodegen* runner,
+    ov::InferRequest& request,
+    const std::string& profile_label,
+    const std::string& cache_label,
+    const std::vector<int64_t>& ids,
+    int64_t* hidden_size) {
+    if (!runner || !env_enabled("QWEN3_TTS_OV_NATIVE_PROMPT_EMBED_CACHE", true)) {
+        if (runner) {
+            runner->prompt_embedding_cache_enabled = false;
+        }
+        return embed_ids(runner, request, profile_label, ids, hidden_size);
+    }
+    runner->prompt_embedding_cache_enabled = true;
+    const std::string key = embedding_cache_key(cache_label, ids);
+    auto it = runner->prompt_embedding_cache.find(key);
+    if (it != runner->prompt_embedding_cache.end()) {
+        const int64_t hidden = ids.empty() ? 0 : static_cast<int64_t>(it->second.size() / ids.size());
+        if (hidden > 0 && static_cast<size_t>(hidden * ids.size()) == it->second.size()) {
+            if (hidden_size) {
+                if (*hidden_size != 0 && *hidden_size != hidden) {
+                    throw std::runtime_error("cached embedding hidden sizes do not match");
+                }
+                *hidden_size = hidden;
+            }
+            runner->prompt_embedding_cache_hits += 1;
+            return it->second;
+        }
+        runner->prompt_embedding_cache.erase(it);
+    }
+    runner->prompt_embedding_cache_misses += 1;
+    auto embedded = embed_ids(runner, request, profile_label, ids, hidden_size);
+    runner->prompt_embedding_cache.emplace(key, embedded);
+    return embedded;
 }
 
 void append_embedding_slice(
@@ -2059,6 +2178,7 @@ void run_paged_split_subcode_step(
     NativeCodegen* runner,
     const ov::Tensor& last_hidden_tensor,
     int64_t first_code,
+    const ov::Tensor* first_code_tensor,
     const float* tts_pad_embed,
     int64_t hidden_size,
     int64_t num_code_groups,
@@ -2080,6 +2200,8 @@ void run_paged_split_subcode_step(
         bool direct_hidden_bound = false;
         const auto hidden_shape = last_hidden_tensor.get_shape();
         const bool direct_hidden_enabled = env_enabled("QWEN3_TTS_OV_NATIVE_SPLIT_SUBCODE_REMOTE_HIDDEN", true);
+        const bool require_direct_hidden = env_enabled("QWEN3_TTS_OV_NATIVE_REQUIRE_SPLIT_SUBCODE_REMOTE_HIDDEN", false);
+        std::string direct_hidden_failure;
         if (
             direct_hidden_enabled &&
             last_hidden_tensor.get_element_type() == ov::element::f32 &&
@@ -2090,12 +2212,28 @@ void run_paged_split_subcode_step(
             try {
                 request.set_tensor("past_hidden", last_hidden_tensor);
                 direct_hidden_bound = true;
+                runner->last_timing.split_subcode_hidden_direct_bind_count += 1;
                 runner->last_timing.zero_copy_count += 1;
+            } catch (const std::exception& exc) {
+                direct_hidden_bound = false;
+                direct_hidden_failure = exc.what();
             } catch (...) {
                 direct_hidden_bound = false;
+                direct_hidden_failure = "unknown set_tensor failure";
             }
+        } else if (!direct_hidden_enabled) {
+            direct_hidden_failure = "QWEN3_TTS_OV_NATIVE_SPLIT_SUBCODE_REMOTE_HIDDEN=0";
+        } else {
+            direct_hidden_failure = "last_hidden tensor is not directly bindable: " + tensor_debug_string(last_hidden_tensor);
         }
         if (!direct_hidden_bound) {
+            runner->last_timing.split_subcode_hidden_bind_fallback_count += 1;
+            runner->last_timing.split_subcode_hidden_copy_bytes +=
+                static_cast<uint64_t>(std::max<int64_t>(0, hidden_size)) * sizeof(float);
+            if (require_direct_hidden) {
+                throw std::runtime_error(
+                    "required split-subcode remote hidden bind failed: " + direct_hidden_failure);
+            }
             copy_last_hidden_vector(runner, last_hidden_tensor, hidden_size, runner->scratch.subcode_past_hidden);
             request.set_tensor(
                 "past_hidden",
@@ -2104,9 +2242,24 @@ void run_paged_split_subcode_step(
                     ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
                     runner->scratch.subcode_past_hidden.data()));
         }
-        request.set_tensor(
-            "first_code",
-            ov::Tensor(ov::element::i64, ov::Shape{1, 1}, runner->scratch.subcode_first_code.data()));
+        bool first_code_bound = false;
+        if (
+            first_code_tensor &&
+            first_code_tensor->get_element_type() == ov::element::i64 &&
+            first_code_tensor->get_size() >= 1) {
+            try {
+                request.set_tensor("first_code", *first_code_tensor);
+                first_code_bound = true;
+                runner->last_timing.zero_copy_count += 1;
+            } catch (...) {
+                first_code_bound = false;
+            }
+        }
+        if (!first_code_bound) {
+            request.set_tensor(
+                "first_code",
+                ov::Tensor(ov::element::i64, ov::Shape{1, 1}, runner->scratch.subcode_first_code.data()));
+        }
         if (runner->subcode_outputs_next_embed && compiled_model_has_input(runner->subcode_model, "tts_pad_embed")) {
             request.set_tensor(
                 "tts_pad_embed",
@@ -2407,25 +2560,33 @@ void run_paged_kv_impl(
 	        }
         record_request_profile(runner, step_request_label, step_request);
         if (runner->paged_split_subcode) {
-            auto logits_tensor = step_request.get_output_tensor(0);
-	            auto last_hidden_tensor = step_request.get_output_tensor(1);
-	            int64_t first_code = 0;
-	            double sampling_ms = 0.0;
-	            measure_ms(sampling_ms, [&]() {
-	                first_code = select_first_code_from_logits(
-	                    runner,
-                    logits_tensor,
-                    generated,
-                    min_new_tokens,
-                    vocab_size,
-                    eos_token_id,
-                    use_repetition_penalty ? &repeated_first_codes : nullptr,
-                    repetition_penalty,
-	                    &sampling,
-	                    &rng);
-	            });
-	            runner->last_timing.sampling_ms += sampling_ms;
-	            runner->last_timing.codegen_sampling_step_ms.push_back(sampling_ms);
+            auto first_output_tensor = step_request.get_output_tensor(0);
+            auto last_hidden_tensor = step_request.get_output_tensor(1);
+            int64_t first_code = 0;
+            double sampling_ms = 0.0;
+            measure_ms(sampling_ms, [&]() {
+                if (runner->paged_seed_outputs_first_code) {
+                    if (sampling.do_sample || use_repetition_penalty) {
+                        throw std::runtime_error(
+                            "paged top1 seed split-subcode supports greedy repetition_penalty=1.0 only");
+                    }
+                    first_code = tensor_to_host_i64_scalar(runner, first_output_tensor, "paged top1 first_code");
+                } else {
+                    first_code = select_first_code_from_logits(
+                        runner,
+                        first_output_tensor,
+                        generated,
+                        min_new_tokens,
+                        vocab_size,
+                        eos_token_id,
+                        use_repetition_penalty ? &repeated_first_codes : nullptr,
+                        repetition_penalty,
+                        &sampling,
+                        &rng);
+                }
+            });
+            runner->last_timing.sampling_ms += sampling_ms;
+            runner->last_timing.codegen_sampling_step_ms.push_back(sampling_ms);
             if (first_code == eos_token_id && generated >= min_new_tokens) {
                 stop = true;
                 return;
@@ -2434,6 +2595,7 @@ void run_paged_kv_impl(
                 runner,
                 last_hidden_tensor,
                 first_code,
+                runner->paged_seed_outputs_first_code ? &first_output_tensor : nullptr,
                 tts_pad_embed,
                 hidden_size,
                 num_code_groups,
@@ -2905,6 +3067,8 @@ public:
             }
         }
         m_runner.prefill_model = m_runner.core.compile_model(model, device, config);
+        m_runner.paged_seed_outputs_first_code =
+            split_subcode && compiled_model_first_output_is_first_code(m_runner.prefill_model);
         m_runner.prefill_request = m_runner.prefill_model.create_infer_request();
         if (static_decode_ready) {
             try {
@@ -2979,6 +3143,9 @@ public:
         m_runner.codec_embedding_model = m_runner.core.compile_model(codec_embedding_xml, device, config);
         m_runner.text_embedding_request = m_runner.text_embedding_model.create_infer_request();
         m_runner.codec_embedding_request = m_runner.codec_embedding_model.create_infer_request();
+        m_runner.prompt_embedding_cache.clear();
+        m_runner.prompt_embedding_cache_hits = 0;
+        m_runner.prompt_embedding_cache_misses = 0;
         m_runner.tts_bos_token_id = tts_bos_token_id;
         m_runner.tts_eos_token_id = tts_eos_token_id;
         m_runner.tts_pad_token_id = tts_pad_token_id;
@@ -3021,14 +3188,21 @@ public:
         int64_t hidden_size = 0;
         std::vector<float> output;
         if (!instruct_ids.empty()) {
-            auto instruct_embed = embed_ids(&m_runner, m_runner.text_embedding_request, "text_embedding", instruct_ids, &hidden_size);
+            auto instruct_embed = embed_ids_cached(
+                &m_runner,
+                m_runner.text_embedding_request,
+                "text_embedding",
+                "text_embedding:instruct",
+                instruct_ids,
+                &hidden_size);
             output.insert(output.end(), instruct_embed.begin(), instruct_embed.end());
         }
 
-        auto tts_special = embed_ids(
+        auto tts_special = embed_ids_cached(
             &m_runner,
             m_runner.text_embedding_request,
             "text_embedding",
+            "text_embedding:tts_special",
             {m_runner.tts_bos_token_id, m_runner.tts_eos_token_id, m_runner.tts_pad_token_id},
             &hidden_size);
         const float* tts_bos = tts_special.data();
@@ -3038,7 +3212,13 @@ public:
         std::vector<int64_t> codec_ids(codec_prefill, codec_prefill + codec_prefill_len);
         codec_ids.push_back(m_runner.codec_pad_id);
         codec_ids.push_back(m_runner.codec_bos_id);
-        auto codec_embed = embed_ids(&m_runner, m_runner.codec_embedding_request, "codec_embedding", codec_ids, &hidden_size);
+        auto codec_embed = embed_ids_cached(
+            &m_runner,
+            m_runner.codec_embedding_request,
+            "codec_embedding",
+            "codec_embedding:prefill",
+            codec_ids,
+            &hidden_size);
         auto input_embed = embed_ids(&m_runner, m_runner.text_embedding_request, "text_embedding", input_ids, &hidden_size);
 
         append_embedding_slice(output, input_embed, 0, 3, hidden_size);

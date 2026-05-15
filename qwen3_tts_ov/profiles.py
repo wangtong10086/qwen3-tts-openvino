@@ -154,6 +154,31 @@ REALTIME_BENCHMARK_PROFILE_OPTIONS = {
         "preferred_cache_bucket": str(FASTEST_PREFERRED_CACHE_BUCKET),
         "repetition_penalty": FASTEST_REPETITION_PENALTY,
     },
+    "fastest_native_prompt_cache": {
+        "mode": FASTEST_MODE,
+        "cache_kernel": FASTEST_CACHE_KERNEL,
+        "cache_step": FASTEST_CACHE_STEP,
+        "graph_variant": FASTEST_GRAPH_VARIANT,
+        "codegen_unroll": str(FASTEST_CODEGEN_UNROLL),
+        "codegen_schedule": FASTEST_CODEGEN_SCHEDULE,
+        "codegen_decode_unroll": FASTEST_CODEGEN_DECODE_UNROLL,
+        "preferred_cache_bucket": str(FASTEST_PREFERRED_CACHE_BUCKET),
+        "repetition_penalty": FASTEST_REPETITION_PENALTY,
+        "native_pipeline": FASTEST_NATIVE_PIPELINE,
+        "native_buffer_reuse": FASTEST_NATIVE_BUFFER_REUSE,
+        "native_paged_kv": FASTEST_NATIVE_PAGED_KV,
+        "native_paged_kv_gqa": "1",
+        "native_paged_kv_precision": FASTEST_NATIVE_PAGED_KV_PRECISION,
+        "native_paged_kv_cache_input_precision": "f32",
+        "native_paged_kv_block_size": str(FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE),
+        "native_paged_kv_split_subcode": "1",
+        "native_paged_kv_score_aggregation": "1",
+        "native_codegen_fusion": FASTEST_NATIVE_CODEGEN_FUSION,
+        "native_codegen_device": FASTEST_NATIVE_CODEGEN_DEVICE,
+        "native_dynamic_quantization_group_size": str(FASTEST_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE),
+        "native_prompt": "1",
+        "native_prompt_device": "CPU",
+    },
     "fp16_fused": {"realtime_profile": "fp16", "codegen_unroll": "1", "codegen_schedule": "current"},
     "int8_fused": {"realtime_profile": "int8", "codegen_unroll": "1", "codegen_schedule": "current"},
     "int8_sym_unroll4": {"realtime_profile": "int8-sym", "codegen_unroll": "4", "codegen_schedule": "current"},
@@ -750,6 +775,56 @@ REALTIME_BENCHMARK_PROFILE_OPTIONS = {
         "native_codegen_device": "GPU",
     },
 }
+
+
+def _fastest_paged_split_experiment_profile(**overrides) -> dict:
+    profile = {
+        "mode": FASTEST_MODE,
+        "cache_kernel": FASTEST_CACHE_KERNEL,
+        "cache_step": FASTEST_CACHE_STEP,
+        "graph_variant": FASTEST_GRAPH_VARIANT,
+        "codegen_unroll": str(FASTEST_CODEGEN_UNROLL),
+        "codegen_schedule": FASTEST_CODEGEN_SCHEDULE,
+        "codegen_decode_unroll": FASTEST_CODEGEN_DECODE_UNROLL,
+        "preferred_cache_bucket": str(FASTEST_PREFERRED_CACHE_BUCKET),
+        "repetition_penalty": FASTEST_REPETITION_PENALTY,
+        "native_pipeline": FASTEST_NATIVE_PIPELINE,
+        "native_buffer_reuse": FASTEST_NATIVE_BUFFER_REUSE,
+        "native_paged_kv": FASTEST_NATIVE_PAGED_KV,
+        "native_paged_kv_gqa": "1",
+        "native_paged_kv_precision": FASTEST_NATIVE_PAGED_KV_PRECISION,
+        "native_paged_kv_cache_input_precision": "f32",
+        "native_paged_kv_block_size": str(FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE),
+        "native_paged_kv_split_subcode": "1",
+        "native_paged_kv_score_aggregation": "1",
+        "native_codegen_fusion": "split",
+        "native_dynamic_quantization_group_size": str(FASTEST_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE),
+        "native_codegen_device": FASTEST_NATIVE_CODEGEN_DEVICE,
+    }
+    profile.update(overrides)
+    return profile
+
+
+REALTIME_BENCHMARK_PROFILE_OPTIONS.update(
+    {
+        "fastest_hidden_remote_off": _fastest_paged_split_experiment_profile(
+            native_split_subcode_remote_hidden="0",
+        ),
+        "fastest_hidden_remote_on": _fastest_paged_split_experiment_profile(
+            native_split_subcode_remote_hidden="1",
+        ),
+        "fastest_hidden_remote_require": _fastest_paged_split_experiment_profile(
+            native_split_subcode_remote_hidden="1",
+            native_require_split_subcode_remote_hidden="1",
+        ),
+        "talker_top1_seed_split_subcode": _fastest_paged_split_experiment_profile(
+            graph_variant="int8_sym_paged_talker_top1_split",
+            native_paged_kv_top1_seed="1",
+            native_paged_kv_split_subcode_mode="cached",
+            repetition_penalty=1.0,
+        ),
+    }
+)
 
 
 def effective_runtime_options(

@@ -264,6 +264,24 @@ def test_paged_kv_split_subcode_prefers_talker_stateful_gqa_seed():
     assert fallback is False
 
 
+def test_paged_kv_split_subcode_top1_seed_prefers_talker_top1_gqa():
+    graphs = {
+        "talker_stateful_gqa": "talker_stateful_sdpa_paged_gqa_seed.xml",
+        "talker_top1_gqa": "talker_top1_sdpa_paged_gqa_seed.xml",
+    }
+
+    key, subcode_attention, fallback = select_paged_kv_seed_key(
+        graphs,
+        prefer_gqa=True,
+        split_subcode=True,
+        top1_seed=True,
+    )
+
+    assert key == "talker_top1_gqa"
+    assert subcode_attention == "split"
+    assert fallback is False
+
+
 def test_fastest_profile_resolves_to_paged_kv_split_talker_variant():
     assert effective_runtime_options(FASTEST_PROFILE_NAME, "exact", "fused", "fp16") == (
         "no-cache",

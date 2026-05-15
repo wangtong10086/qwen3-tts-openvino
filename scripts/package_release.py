@@ -80,7 +80,7 @@ def find_native_library(target: str, override: str | None = None) -> Path:
     for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()
-    raise FileNotFoundError(f"native library not found; build it first with `uv run python scripts/build_native_codegen.py`")
+    raise FileNotFoundError("native library not found; build it first with `uv run python scripts/build_native_codegen.py`")
 
 
 def add_data_arg(source: Path, dest: str) -> str:
