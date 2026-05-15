@@ -123,6 +123,7 @@ uv run python -m qwen3_tts_ov serve \
 - [运行接口](docs/runtime_zh.md): CLI、Python API、sidecar、OpenAI-compatible API。
 - [导出与压缩](docs/export_zh.md): 手动导出 IR 和生成 fastest variant。
 - [流式与长文本](docs/streaming_zh.md): 流式协议、长文本 full-AR、质量门禁。
+- [实验记录](docs/experiments/README.zh-CN.md): 性能优化实验目标、过程、结果和未采纳路径。
 - [OpenVINO 编译缓存](docs/cache_zh.md): cache warmup 和缓存目录。
 - [大文件与产物策略](docs/artifacts_zh.md): 模型、IR、outputs、native build 的处理规则。
 - [安全说明](docs/security_zh.md): token、`.env`、凭据和提交检查。

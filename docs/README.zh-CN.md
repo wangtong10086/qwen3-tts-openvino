@@ -10,6 +10,7 @@
 | 源码开发者 | [Quick Start](quick_start_zh.md) | 从 PyTorch 模型导出最快 OpenVINO IR，并启动 Web Demo |
 | 发布维护者 | [开发说明](development_zh.md) | 构建 native、打包 runtime、触发 `release-runtime` |
 | 性能/质量调试 | [流式与长文本](streaming_zh.md) | 理解 full-AR 长文本、流式输出和质量门禁 |
+| 性能实验复盘 | [实验记录](experiments/README.zh-CN.md) | 查看历史优化目标、过程、结果和未采纳路径 |
 | Windows 异构测试 | [Windows GPU+NPU 测试路径](windows_gpu_npu_zh.md) | 在 Windows 原生 NPU 机器上验证 `GPU codegen + NPU decoder` |
 
 ## 入门与部署
@@ -29,6 +30,7 @@
 ## 参考
 
 - [流式与长文本](streaming_zh.md): 流式协议、浏览器播放、长文本 full-AR、质量门禁。
+- [实验记录](experiments/README.zh-CN.md): 性能优化实验目标、过程、结果和当前结论。
 - [示例请求](../examples/README.zh-CN.md): JSON、JSONL、OpenAI-compatible 请求样例。
 - [安全说明](security_zh.md): token、`.env`、凭据和提交检查。
 - [辅助脚本](../scripts/README.zh-CN.md): 构建、压缩、benchmark、质量评测脚本说明。
