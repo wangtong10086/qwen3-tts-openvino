@@ -526,6 +526,12 @@ class SubcodeGreedyCachedWrapper(torch.nn.Module):
         return codes, sum_embed
 
 
+class SubcodeGreedyCachedNextEmbedWrapper(SubcodeGreedyCachedWrapper):
+    def forward(self, past_hidden, first_code, tts_pad_embed):
+        codes, sum_embed = super().forward(past_hidden, first_code)
+        return codes, sum_embed + tts_pad_embed
+
+
 def make_subcode_wrapper(
     talker,
     subcode_export_mode: str,
@@ -1580,6 +1586,40 @@ def apply_io_names(ov_model, input_names, output_names):
         ov_output.get_tensor().set_names({name})
 
 
+def save_subcode_cached_next_embed_model(
+    talker,
+    path: Path,
+    attention_kernel: str = "sdpa",
+    rms_export_mode: str = "default",
+    force: bool = False,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not force and path.exists() and path.with_suffix(".bin").exists():
+        return
+
+    started = time.time()
+    config = talker.config
+    wrapper = SubcodeGreedyCachedNextEmbedWrapper(
+        talker,
+        attention_kernel=attention_kernel,
+        rms_export_mode=rms_export_mode,
+    )
+    example_inputs = (
+        torch.zeros((1, 1, config.hidden_size), dtype=torch.float32),
+        torch.zeros((1, 1), dtype=torch.long),
+        torch.zeros((1, 1, config.hidden_size), dtype=torch.float32),
+    )
+    input_shapes = [
+        ov.PartialShape([1, 1, config.hidden_size]),
+        ov.PartialShape([1, 1]),
+        ov.PartialShape([1, 1, config.hidden_size]),
+    ]
+    ov_model = ov.convert_model(wrapper.eval(), example_input=example_inputs, input=input_shapes)
+    apply_io_names(ov_model, ["past_hidden", "first_code", "tts_pad_embed"], ["codes", "next_embed"])
+    ov.save_model(ov_model, path, compress_to_fp16=True)
+    print(f"saved cached subcode next-embed {attention_kernel} {path} in {time.time() - started:.1f}s", flush=True)
+
+
 def save_stateful_talker_model(
     talker,
     path: Path,
@@ -2311,6 +2351,7 @@ def update_manifest_subcode_graphs(out_dir: Path) -> None:
     for key, graph in {
         "subcode_greedy": "subcode_greedy.xml",
         "subcode_greedy_cached": "subcode_greedy_cached.xml",
+        "subcode_greedy_cached_next_embed": "subcode_greedy_cached_next_embed.xml",
         "subcode_greedy_exact": "subcode_greedy_exact.xml",
         "subcode_greedy_cached_exact": "subcode_greedy_cached_exact.xml",
     }.items():
@@ -2429,6 +2470,9 @@ def build_codegen_variant_graphs(
                 },
                 "subcode_greedy": maybe_graph(add_graph_suffix("subcode_greedy.xml", rms_suffix)),
                 "subcode_greedy_cached": maybe_graph(add_graph_suffix("subcode_greedy_cached.xml", rms_suffix)),
+                "subcode_greedy_cached_next_embed": maybe_graph(
+                    add_graph_suffix("subcode_greedy_cached_next_embed.xml", rms_suffix)
+                ),
             }
         )
     if fused_suffix:
@@ -2729,10 +2773,19 @@ def write_manifest(
                 for key, graph in {
                     "talker_stateful": "talker_stateful_sdpa_paged_seed.xml",
                     "fused_cache_step": "fused_cache_step_sdpa_paged_seed.xml",
+                    "talker_subcode_greedy": "fused_cache_step_sdpa_paged_seed.xml",
                     "talker_stateful_gqa": "talker_stateful_sdpa_paged_gqa_seed.xml",
                     "fused_cache_step_gqa": "fused_cache_step_sdpa_paged_gqa_seed.xml",
+                    "talker_subcode_greedy_gqa": "fused_cache_step_sdpa_paged_gqa_seed.xml",
                     "fused_cache_step_subcode_exact": paged_kv_fused_seed_filename(subcode_attention_kernel="exact"),
+                    "talker_subcode_greedy_subcode_exact": paged_kv_fused_seed_filename(
+                        subcode_attention_kernel="exact"
+                    ),
                     "fused_cache_step_gqa_subcode_exact": paged_kv_fused_seed_filename(
+                        gqa_cache=True,
+                        subcode_attention_kernel="exact",
+                    ),
+                    "talker_subcode_greedy_gqa_subcode_exact": paged_kv_fused_seed_filename(
                         gqa_cache=True,
                         subcode_attention_kernel="exact",
                     ),
@@ -2767,6 +2820,11 @@ def write_manifest(
             },
             "subcode_greedy": "subcode_greedy.xml",
             "subcode_greedy_cached": "subcode_greedy_cached.xml",
+            **(
+                {"subcode_greedy_cached_next_embed": "subcode_greedy_cached_next_embed.xml"}
+                if (out_dir / "subcode_greedy_cached_next_embed.xml").exists()
+                else {}
+            ),
             **{
                 f"subcode_greedy_{kernel}": graph
                 for kernel in ["exact"]
@@ -3097,6 +3155,14 @@ def main() -> None:
                 [ov.PartialShape([1, 1, talker.config.hidden_size]), ov.PartialShape([1, 1])],
                 force=args.force_cache_graphs,
             )
+            if subcode_kernel == "sdpa":
+                save_subcode_cached_next_embed_model(
+                    talker,
+                    out_dir / graph("subcode_greedy_cached_next_embed.xml"),
+                    attention_kernel=subcode_kernel,
+                    rms_export_mode=rms_export_mode,
+                    force=args.force_cache_graphs,
+                )
         update_manifest_subcode_graphs(out_dir)
         print(f"subcode export complete: {out_dir / 'manifest.json'}", flush=True)
         return
@@ -3107,6 +3173,7 @@ def main() -> None:
         out_dir / graph("talker_no_cache.xml"),
         out_dir / graph("subcode_greedy.xml"),
         out_dir / graph("subcode_greedy_cached.xml"),
+        out_dir / graph("subcode_greedy_cached_next_embed.xml"),
         out_dir / "code_frame_embedding.xml",
         out_dir / fused_graph("fused_no_cache_step.xml"),
     ]
@@ -3262,6 +3329,11 @@ def main() -> None:
             ),
             out_dir / graph("subcode_greedy_cached.xml"),
             [ov.PartialShape([1, 1, talker.config.hidden_size]), ov.PartialShape([1, 1])],
+        )
+        save_subcode_cached_next_embed_model(
+            talker,
+            out_dir / graph("subcode_greedy_cached_next_embed.xml"),
+            rms_export_mode=rms_export_mode,
         )
         for subcode_kernel in standalone_subcode_attention_kernels:
             if subcode_kernel == "sdpa":

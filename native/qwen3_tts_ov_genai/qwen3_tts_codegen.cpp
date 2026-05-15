@@ -75,12 +75,15 @@ struct NativeCodegen {
     bool profile_enabled = false;
     bool paged_kv_enabled = false;
     bool paged_split_subcode = false;
+    bool subcode_outputs_next_embed = false;
     bool paged_static_decode_enabled = false;
+    bool paged_static_decode_requested = false;
     int64_t paged_kv_block_size = 8;
     int64_t paged_kv_heads = 16;
     int64_t paged_kv_head_dim = 128;
     int64_t paged_static_decode_block_capacity = 0;
     std::string paged_static_decode_mode = "dynamic";
+    std::string paged_static_decode_failure;
     std::string paged_kv_precision = "f16";
     std::string paged_kv_cache_input_precision = "f32";
     int64_t paged_kv_cache_tensor_blocks = 0;
@@ -111,6 +114,16 @@ struct NativeCodegen {
         double cpu_time_ms = 0.0;
         int64_t count = 0;
     };
+    struct CodegenTraceFrame {
+        int64_t frame = 0;
+        std::string label;
+        int64_t first_code = 0;
+        std::vector<int64_t> codes;
+        double hidden_l2 = 0.0;
+        double hidden_max_abs = 0.0;
+        double embed_l2 = 0.0;
+        double embed_max_abs = 0.0;
+    };
     struct RunTiming {
         bool buffer_reuse = true;
         bool no_repeat_fast_path = false;
@@ -118,6 +131,14 @@ struct NativeCodegen {
         double host_prepare_ms = 0.0;
         double tensor_bind_ms = 0.0;
         double codegen_infer_ms = 0.0;
+        double codegen_prefill_infer_ms = 0.0;
+        double codegen_decode_infer_ms = 0.0;
+        double codegen_subcode_infer_ms = 0.0;
+        double subcode_bind_ms = 0.0;
+        double subcode_output_read_ms = 0.0;
+        double subcode_next_embed_ms = 0.0;
+        uint64_t subcode_host_copy_bytes = 0;
+        int64_t subcode_host_copy_fallback_count = 0;
         double sampling_ms = 0.0;
         double decode_infer_ms = 0.0;
         double callback_ms = 0.0;
@@ -129,23 +150,41 @@ struct NativeCodegen {
         int64_t decode_queue_depth_max = 0;
         int64_t decode_input_frames = 0;
         int64_t decode_padded_frames = 0;
+        double ttft_ms = 0.0;
+        double last_token_ms = 0.0;
+        int64_t generated_frames = 0;
         double host_copy_ms = 0.0;
         uint64_t host_copy_bytes = 0;
         int64_t host_copy_fallback_count = 0;
         int64_t zero_copy_count = 0;
+        int64_t codegen_prefill_count = 0;
+        int64_t codegen_decode_count = 0;
+        int64_t codegen_subcode_count = 0;
+        std::vector<double> codegen_prefill_step_ms;
+        std::vector<double> codegen_decode_step_ms;
+        std::vector<double> codegen_bind_step_ms;
+        std::vector<double> codegen_sampling_step_ms;
+        std::vector<double> subcode_bind_step_ms;
+        std::vector<double> subcode_infer_step_ms;
+        std::vector<double> subcode_output_read_step_ms;
+        std::vector<double> subcode_next_embed_step_ms;
         double pcm_convert_ms = 0.0;
         double total_ms = 0.0;
     };
     struct ScratchBuffers {
         std::vector<int64_t> positions;
         std::vector<int64_t> decode_cache_position;
+        std::vector<int64_t> subcode_first_code;
+        std::vector<int64_t> subcode_frame_codes;
         std::vector<float> attention_mask;
         std::vector<float> repeated_mask;
         std::vector<float> allow_eos;
         std::vector<float> penalty;
         std::vector<float> next_embed;
+        std::vector<float> subcode_past_hidden;
     };
     std::unordered_map<std::string, ProfileEntry> profile_ops;
+    std::vector<CodegenTraceFrame> codegen_trace;
     RunTiming last_timing;
     ScratchBuffers scratch;
 };
@@ -450,6 +489,13 @@ int64_t infer_paged_hidden_size(const std::shared_ptr<ov::Model>& model) {
     if (!model) {
         return 0;
     }
+    auto static_last_dim = [](const ov::PartialShape& shape) -> int64_t {
+        if (shape.rank().is_dynamic() || shape.rank().get_length() == 0) {
+            return 0;
+        }
+        const auto dim = shape[shape.rank().get_length() - 1];
+        return dim.is_static() ? dim.get_length() : 0;
+    };
     for (const auto& input : model->inputs()) {
         std::string name;
         try {
@@ -457,16 +503,27 @@ int64_t infer_paged_hidden_size(const std::shared_ptr<ov::Model>& model) {
         } catch (...) {
             continue;
         }
-        if (name != "tts_pad_embed") {
+        if (name != "tts_pad_embed" && name != "inputs_embeds") {
             continue;
         }
-        const auto pshape = input.get_partial_shape();
-        if (pshape.rank().is_dynamic() || pshape.rank().get_length() == 0) {
+        const int64_t hidden = static_last_dim(input.get_partial_shape());
+        if (hidden > 0) {
+            return hidden;
+        }
+    }
+    for (const auto& output : model->outputs()) {
+        std::string name;
+        try {
+            name = output.get_any_name();
+        } catch (...) {
             continue;
         }
-        const auto dim = pshape[pshape.rank().get_length() - 1];
-        if (dim.is_static()) {
-            return dim.get_length();
+        if (name != "last_hidden") {
+            continue;
+        }
+        const int64_t hidden = static_last_dim(output.get_partial_shape());
+        if (hidden > 0) {
+            return hidden;
         }
     }
     return 0;
@@ -862,6 +919,18 @@ bool env_enabled(const char* name, bool default_value) {
     return enabled_env(name, default_value);
 }
 
+int64_t env_int64(const char* name, int64_t default_value) {
+    const char* value = std::getenv(name);
+    if (!value || std::strlen(value) == 0 || disabled_env_value(value)) {
+        return default_value;
+    }
+    try {
+        return std::stoll(value);
+    } catch (...) {
+        return default_value;
+    }
+}
+
 double micros_to_ms(std::chrono::microseconds value) {
     return std::chrono::duration<double, std::milli>(value).count();
 }
@@ -1044,6 +1113,81 @@ std::string native_profile_json(const NativeCodegen& runner) {
     return json;
 }
 
+std::pair<double, double> f32_l2_and_max_abs(const float* data, size_t size) {
+    if (!data || size == 0) {
+        return {0.0, 0.0};
+    }
+    double sum_sq = 0.0;
+    double max_abs = 0.0;
+    for (size_t i = 0; i < size; ++i) {
+        const double value = static_cast<double>(data[i]);
+        sum_sq += value * value;
+        max_abs = std::max(max_abs, std::abs(value));
+    }
+    return {std::sqrt(sum_sq), max_abs};
+}
+
+void append_codegen_trace_json(std::string& json, const NativeCodegen& runner) {
+    json += ", \"codegen_trace\": [";
+    for (size_t i = 0; i < runner.codegen_trace.size(); ++i) {
+        const auto& item = runner.codegen_trace[i];
+        json += "{";
+        json += "\"frame\": " + std::to_string(item.frame);
+        json += ", \"label\": \"" + json_escape_native(item.label) + "\"";
+        json += ", \"first_code\": " + std::to_string(item.first_code);
+        json += ", \"codes\": [";
+        for (size_t j = 0; j < item.codes.size(); ++j) {
+            json += std::to_string(item.codes[j]);
+            json += (j + 1 == item.codes.size()) ? "" : ",";
+        }
+        json += "]";
+        json += ", \"hidden_l2\": " + std::to_string(item.hidden_l2);
+        json += ", \"hidden_max_abs\": " + std::to_string(item.hidden_max_abs);
+        json += ", \"embed_l2\": " + std::to_string(item.embed_l2);
+        json += ", \"embed_max_abs\": " + std::to_string(item.embed_max_abs);
+        json += "}";
+        json += (i + 1 == runner.codegen_trace.size()) ? "" : ",";
+    }
+    json += "]";
+}
+
+void append_timing_distribution_json(std::string& json, const char* name, const std::vector<double>& values) {
+    json += ", \"" + std::string(name) + "\": {";
+    json += "\"count\": " + std::to_string(values.size());
+    if (values.empty()) {
+        json += ", \"total_ms\": 0.000000, \"mean_ms\": 0.000000, \"p50_ms\": 0.000000, \"p90_ms\": 0.000000, \"max_ms\": 0.000000}";
+        return;
+    }
+    std::vector<double> ordered;
+    ordered.reserve(values.size());
+    double total = 0.0;
+    double max_value = 0.0;
+    for (double value : values) {
+        if (!std::isfinite(value)) {
+            continue;
+        }
+        ordered.push_back(value);
+        total += value;
+        max_value = std::max(max_value, value);
+    }
+    if (ordered.empty()) {
+        json += ", \"total_ms\": 0.000000, \"mean_ms\": 0.000000, \"p50_ms\": 0.000000, \"p90_ms\": 0.000000, \"max_ms\": 0.000000}";
+        return;
+    }
+    std::sort(ordered.begin(), ordered.end());
+    auto pct = [&](double percent) {
+        const double raw = (percent / 100.0) * static_cast<double>(ordered.size() - 1);
+        const size_t index = static_cast<size_t>(std::max<double>(0.0, std::min<double>(ordered.size() - 1, std::round(raw))));
+        return ordered[index];
+    };
+    json += ", \"total_ms\": " + std::to_string(total);
+    json += ", \"mean_ms\": " + std::to_string(total / static_cast<double>(ordered.size()));
+    json += ", \"p50_ms\": " + std::to_string(pct(50.0));
+    json += ", \"p90_ms\": " + std::to_string(pct(90.0));
+    json += ", \"max_ms\": " + std::to_string(max_value);
+    json += "}";
+}
+
 std::string native_timing_json(const NativeCodegen& runner) {
     const auto& item = runner.last_timing;
     std::string json = "{";
@@ -1061,10 +1205,23 @@ std::string native_timing_json(const NativeCodegen& runner) {
     json += runner.last_async_decode ? "true" : "false";
     json += ", \"paged_static_decode_enabled\": ";
     json += runner.paged_static_decode_enabled ? "true" : "false";
+    json += ", \"paged_static_decode_requested\": ";
+    json += runner.paged_static_decode_requested ? "true" : "false";
     json += ", \"paged_static_decode_mode\": \"" + json_escape_native(runner.paged_static_decode_mode) + "\"";
+    json += ", \"paged_static_decode_failure\": \"" + json_escape_native(runner.paged_static_decode_failure) + "\"";
     json += ", \"host_prepare_ms\": " + std::to_string(item.host_prepare_ms);
     json += ", \"tensor_bind_ms\": " + std::to_string(item.tensor_bind_ms);
     json += ", \"codegen_infer_ms\": " + std::to_string(item.codegen_infer_ms);
+    json += ", \"codegen_prefill_infer_ms\": " + std::to_string(item.codegen_prefill_infer_ms);
+    json += ", \"codegen_decode_infer_ms\": " + std::to_string(item.codegen_decode_infer_ms);
+    json += ", \"codegen_subcode_infer_ms\": " + std::to_string(item.codegen_subcode_infer_ms);
+    json += ", \"subcode_bind_ms\": " + std::to_string(item.subcode_bind_ms);
+    json += ", \"subcode_output_read_ms\": " + std::to_string(item.subcode_output_read_ms);
+    json += ", \"subcode_next_embed_ms\": " + std::to_string(item.subcode_next_embed_ms);
+    json += ", \"subcode_host_copy_bytes\": " + std::to_string(item.subcode_host_copy_bytes);
+    json += ", \"subcode_host_copy_fallback_count\": " + std::to_string(item.subcode_host_copy_fallback_count);
+    json += ", \"subcode_outputs_next_embed\": ";
+    json += runner.subcode_outputs_next_embed ? "true" : "false";
     json += ", \"sampling_ms\": " + std::to_string(item.sampling_ms);
     json += ", \"decode_infer_ms\": " + std::to_string(item.decode_infer_ms);
     json += ", \"callback_ms\": " + std::to_string(item.callback_ms);
@@ -1076,12 +1233,27 @@ std::string native_timing_json(const NativeCodegen& runner) {
     json += ", \"decode_queue_depth_max\": " + std::to_string(item.decode_queue_depth_max);
     json += ", \"decode_input_frames\": " + std::to_string(item.decode_input_frames);
     json += ", \"decode_padded_frames\": " + std::to_string(item.decode_padded_frames);
+    json += ", \"ttft_ms\": " + std::to_string(item.ttft_ms);
+    json += ", \"last_token_ms\": " + std::to_string(item.last_token_ms);
+    json += ", \"generated_frames\": " + std::to_string(item.generated_frames);
     json += ", \"host_copy_ms\": " + std::to_string(item.host_copy_ms);
     json += ", \"host_copy_bytes\": " + std::to_string(item.host_copy_bytes);
     json += ", \"host_copy_fallback_count\": " + std::to_string(item.host_copy_fallback_count);
     json += ", \"zero_copy_count\": " + std::to_string(item.zero_copy_count);
+    json += ", \"codegen_prefill_count\": " + std::to_string(item.codegen_prefill_count);
+    json += ", \"codegen_decode_count\": " + std::to_string(item.codegen_decode_count);
+    json += ", \"codegen_subcode_count\": " + std::to_string(item.codegen_subcode_count);
     json += ", \"pcm_convert_ms\": " + std::to_string(item.pcm_convert_ms);
     json += ", \"total_ms\": " + std::to_string(item.total_ms);
+    append_timing_distribution_json(json, "codegen_prefill_step_stats", item.codegen_prefill_step_ms);
+    append_timing_distribution_json(json, "codegen_decode_step_stats", item.codegen_decode_step_ms);
+    append_timing_distribution_json(json, "codegen_bind_step_stats", item.codegen_bind_step_ms);
+    append_timing_distribution_json(json, "codegen_sampling_step_stats", item.codegen_sampling_step_ms);
+    append_timing_distribution_json(json, "subcode_bind_step_stats", item.subcode_bind_step_ms);
+    append_timing_distribution_json(json, "subcode_infer_step_stats", item.subcode_infer_step_ms);
+    append_timing_distribution_json(json, "subcode_output_read_step_stats", item.subcode_output_read_step_ms);
+    append_timing_distribution_json(json, "subcode_next_embed_step_stats", item.subcode_next_embed_step_ms);
+    append_codegen_trace_json(json, runner);
     json += "}";
     return json;
 }
@@ -1864,7 +2036,11 @@ int64_t select_first_code_from_logits(
     return candidates[distribution(*rng)].first;
 }
 
-std::vector<float> last_hidden_vector(NativeCodegen* runner, const ov::Tensor& last_hidden_tensor, int64_t hidden_size) {
+void copy_last_hidden_vector(
+    NativeCodegen* runner,
+    const ov::Tensor& last_hidden_tensor,
+    int64_t hidden_size,
+    std::vector<float>& out) {
     const auto host = tensor_to_host_f32_view(runner, last_hidden_tensor, "paged split last_hidden");
     const size_t size = last_hidden_tensor.get_size();
     if (!host.data || host.size == 0 || hidden_size <= 0 || size < static_cast<size_t>(hidden_size)) {
@@ -1875,7 +2051,8 @@ std::vector<float> last_hidden_vector(NativeCodegen* runner, const ov::Tensor& l
     }
     const size_t rows = std::max<size_t>(1, host.size / static_cast<size_t>(hidden_size));
     const float* last_row = host.data + (rows - 1) * static_cast<size_t>(hidden_size);
-    return std::vector<float>(last_row, last_row + hidden_size);
+    out.resize(static_cast<size_t>(hidden_size));
+    std::memcpy(out.data(), last_row, static_cast<size_t>(hidden_size) * sizeof(float));
 }
 
 void run_paged_split_subcode_step(
@@ -1894,9 +2071,12 @@ void run_paged_split_subcode_step(
         throw std::runtime_error("paged split subcode graph is not configured");
     }
     auto& request = runner->subcode_request;
-    std::vector<float> last_hidden;
-    int64_t first_code_buffer[1] = {first_code};
-    measure_ms(runner->last_timing.tensor_bind_ms, [&]() {
+    runner->scratch.subcode_first_code.resize(1);
+    runner->scratch.subcode_first_code[0] = first_code;
+    const uint64_t host_copy_bytes_before = runner->last_timing.host_copy_bytes;
+    const int64_t host_copy_fallback_before = runner->last_timing.host_copy_fallback_count;
+    double bind_ms = 0.0;
+    measure_ms(bind_ms, [&]() {
         bool direct_hidden_bound = false;
         const auto hidden_shape = last_hidden_tensor.get_shape();
         const bool direct_hidden_enabled = env_enabled("QWEN3_TTS_OV_NATIVE_SPLIT_SUBCODE_REMOTE_HIDDEN", true);
@@ -1916,44 +2096,82 @@ void run_paged_split_subcode_step(
             }
         }
         if (!direct_hidden_bound) {
-            last_hidden = last_hidden_vector(runner, last_hidden_tensor, hidden_size);
+            copy_last_hidden_vector(runner, last_hidden_tensor, hidden_size, runner->scratch.subcode_past_hidden);
             request.set_tensor(
                 "past_hidden",
                 ov::Tensor(
                     ov::element::f32,
                     ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
-                    const_cast<float*>(last_hidden.data())));
+                    runner->scratch.subcode_past_hidden.data()));
         }
         request.set_tensor(
             "first_code",
-            ov::Tensor(ov::element::i64, ov::Shape{1, 1}, first_code_buffer));
+            ov::Tensor(ov::element::i64, ov::Shape{1, 1}, runner->scratch.subcode_first_code.data()));
+        if (runner->subcode_outputs_next_embed && compiled_model_has_input(runner->subcode_model, "tts_pad_embed")) {
+            request.set_tensor(
+                "tts_pad_embed",
+                ov::Tensor(
+                    ov::element::f32,
+                    ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
+                    const_cast<float*>(tts_pad_embed)));
+        }
     });
-    measure_ms(runner->last_timing.codegen_infer_ms, [&]() {
+    runner->last_timing.tensor_bind_ms += bind_ms;
+    runner->last_timing.subcode_bind_ms += bind_ms;
+    runner->last_timing.subcode_bind_step_ms.push_back(bind_ms);
+    double subcode_infer_ms = 0.0;
+    measure_ms(subcode_infer_ms, [&]() {
         request.infer();
     });
+    runner->last_timing.codegen_infer_ms += subcode_infer_ms;
+    runner->last_timing.codegen_subcode_infer_ms += subcode_infer_ms;
+    runner->last_timing.codegen_subcode_count += 1;
+    runner->last_timing.subcode_infer_step_ms.push_back(subcode_infer_ms);
     record_request_profile(runner, "codegen_paged_kv_subcode", request);
-    auto codes_tensor = request.get_output_tensor(0);
-    auto sum_embed_tensor = request.get_output_tensor(1);
-    const auto codes = tensor_to_host_view<int64_t>(runner, codes_tensor, "paged split subcode codes");
-    const auto sum_embed = tensor_to_host_f32_view(runner, sum_embed_tensor, "paged split subcode sum_embed");
+    ov::Tensor codes_tensor;
+    ov::Tensor embed_tensor;
+    HostTensorView<int64_t> codes;
+    FloatTensorView embed;
+    double output_read_ms = 0.0;
+    measure_ms(output_read_ms, [&]() {
+        codes_tensor = request.get_output_tensor(0);
+        embed_tensor = request.get_output_tensor(1);
+        codes = tensor_to_host_view<int64_t>(runner, codes_tensor, "paged split subcode codes");
+        embed = tensor_to_host_f32_view(runner, embed_tensor, "paged split subcode embed");
+    });
+    runner->last_timing.subcode_output_read_ms += output_read_ms;
+    runner->last_timing.subcode_output_read_step_ms.push_back(output_read_ms);
+    runner->last_timing.subcode_host_copy_bytes += runner->last_timing.host_copy_bytes - host_copy_bytes_before;
+    runner->last_timing.subcode_host_copy_fallback_count +=
+        runner->last_timing.host_copy_fallback_count - host_copy_fallback_before;
     if (!codes.data || static_cast<int64_t>(codes.size) < num_code_groups) {
         std::ostringstream msg;
         msg << "paged split subcode graph returned too few codec groups (" << tensor_debug_string(codes_tensor)
             << ", expected_groups=" << num_code_groups << ")";
         throw std::runtime_error(msg.str());
     }
-    if (!sum_embed.data || static_cast<int64_t>(sum_embed.size) < hidden_size) {
+    if (!embed.data || static_cast<int64_t>(embed.size) < hidden_size) {
         std::ostringstream msg;
-        msg << "paged split subcode graph returned too small sum_embed (" << tensor_debug_string(sum_embed_tensor)
+        msg << "paged split subcode graph returned too small embed (" << tensor_debug_string(embed_tensor)
             << ", hidden_size=" << hidden_size << ")";
         throw std::runtime_error(msg.str());
     }
-    frame_codes.assign(codes.data, codes.data + num_code_groups);
-    next_embed.resize(static_cast<size_t>(hidden_size));
-    for (int64_t i = 0; i < hidden_size; ++i) {
-        next_embed[static_cast<size_t>(i)] =
-            sum_embed.data[static_cast<size_t>(i)] + tts_pad_embed[static_cast<size_t>(i)];
-    }
+    double next_embed_ms = 0.0;
+    measure_ms(next_embed_ms, [&]() {
+        frame_codes.resize(static_cast<size_t>(num_code_groups));
+        std::memcpy(frame_codes.data(), codes.data, static_cast<size_t>(num_code_groups) * sizeof(int64_t));
+        next_embed.resize(static_cast<size_t>(hidden_size));
+        if (runner->subcode_outputs_next_embed) {
+            std::memcpy(next_embed.data(), embed.data, static_cast<size_t>(hidden_size) * sizeof(float));
+        } else {
+            for (int64_t i = 0; i < hidden_size; ++i) {
+                next_embed[static_cast<size_t>(i)] =
+                    embed.data[static_cast<size_t>(i)] + tts_pad_embed[static_cast<size_t>(i)];
+            }
+        }
+    });
+    runner->last_timing.subcode_next_embed_ms += next_embed_ms;
+    runner->last_timing.subcode_next_embed_step_ms.push_back(next_embed_ms);
 }
 
 void run_paged_kv_impl(
@@ -1985,6 +2203,8 @@ void run_paged_kv_impl(
     runner->last_timing = NativeCodegen::RunTiming{};
     runner->last_timing.buffer_reuse = runner->paged_static_decode_enabled;
     runner->last_timing.no_repeat_fast_path = true;
+    runner->codegen_trace.clear();
+    const int64_t trace_frame_limit = std::max<int64_t>(0, env_int64("QWEN3_TTS_OV_NATIVE_TRACE_CODEGEN_FRAMES", 0));
     const bool use_repetition_penalty = std::abs(repetition_penalty - 1.0f) > 1e-6f;
     if (sampling.do_sample && !runner->paged_split_subcode) {
         throw std::runtime_error(
@@ -2047,6 +2267,7 @@ void run_paged_kv_impl(
     }
     runner->last_remote_embed_used = remote_embed.enabled;
     const int64_t graph_unroll = std::max<int64_t>(1, runner->unroll);
+    std::vector<int64_t>& split_frame_codes = runner->scratch.subcode_frame_codes;
 
     int64_t generated = 0;
     bool stop = false;
@@ -2056,6 +2277,14 @@ void run_paged_kv_impl(
             values[static_cast<size_t>(i)] = (generated + i) >= min_new_tokens ? 1.0f : 0.0f;
         }
         return values;
+    };
+    auto mark_codec_frame = [&]() {
+        const double token_ms = elapsed_ms_since(started);
+        if (runner->last_timing.generated_frames == 0) {
+            runner->last_timing.ttft_ms = token_ms;
+        }
+        runner->last_timing.last_token_ms = token_ms;
+        runner->last_timing.generated_frames += 1;
     };
     auto emit_many = [&](const int64_t* first_codes, const int64_t* codes, int64_t frame_count) {
         if (!first_codes || !codes || stop || generated >= max_new_tokens || frame_count <= 0) {
@@ -2074,6 +2303,7 @@ void run_paged_kv_impl(
                     frame_codes,
                     static_cast<size_t>(num_code_groups) * sizeof(int64_t));
             }
+            mark_codec_frame();
             if (callback) {
                 int callback_rc = 0;
                 double callback_ms = 0.0;
@@ -2090,19 +2320,56 @@ void run_paged_kv_impl(
         }
     };
 
-    auto run_step = [&](
-        ov::InferRequest& step_request,
-        const std::string& step_request_label,
+    auto append_trace = [&](
+        const std::string& label,
+        int64_t frame_index,
+        int64_t first_code,
+        const int64_t* codes,
+        const ov::Tensor* hidden_tensor,
+        const float* embed_data) {
+        if (trace_frame_limit <= 0 || static_cast<int64_t>(runner->codegen_trace.size()) >= trace_frame_limit) {
+            return;
+        }
+        NativeCodegen::CodegenTraceFrame item;
+        item.frame = frame_index;
+        item.label = label;
+        item.first_code = first_code;
+        if (codes && num_code_groups > 0) {
+            item.codes.assign(codes, codes + num_code_groups);
+        }
+        if (hidden_tensor) {
+            try {
+                const auto hidden = tensor_to_host_f32_view(runner, *hidden_tensor, "trace hidden");
+                const auto stats = f32_l2_and_max_abs(hidden.data, std::min<size_t>(hidden.size, static_cast<size_t>(hidden_size)));
+                item.hidden_l2 = stats.first;
+                item.hidden_max_abs = stats.second;
+            } catch (...) {
+                item.hidden_l2 = -1.0;
+                item.hidden_max_abs = -1.0;
+            }
+        }
+        if (embed_data) {
+            const auto stats = f32_l2_and_max_abs(embed_data, static_cast<size_t>(hidden_size));
+            item.embed_l2 = stats.first;
+            item.embed_max_abs = stats.second;
+        }
+        runner->codegen_trace.push_back(std::move(item));
+    };
+
+	    auto run_step = [&](
+	        ov::InferRequest& step_request,
+	        const std::string& step_request_label,
         const float* embeds,
         int64_t seq_len,
         int64_t position_start,
         int64_t past_len,
-        const std::vector<float>& allow_eos_values,
-        const ov::Tensor* remote_input,
-        ov::Tensor* remote_output) {
-        measure_ms(runner->last_timing.tensor_bind_ms, [&]() {
-            bind_paged_step_inputs(
-                step_request,
+	        const std::vector<float>& allow_eos_values,
+	        const ov::Tensor* remote_input,
+	        ov::Tensor* remote_output) {
+	        double bind_ms = 0.0;
+	        measure_ms(bind_ms, [&]() {
+	            bind_paged_step_inputs(
+	                step_request,
                 embeds,
                 seq_len,
                 hidden_size,
@@ -2118,21 +2385,35 @@ void run_paged_kv_impl(
             if (remote_input && static_cast<bool>(*remote_input)) {
                 step_request.set_tensor("inputs_embeds", *remote_input);
             }
-            if (remote_output && static_cast<bool>(*remote_output)) {
-                step_request.set_output_tensor(2, *remote_output);
-            }
+	            if (remote_output && static_cast<bool>(*remote_output)) {
+	                step_request.set_output_tensor(2, *remote_output);
+	            }
+	        });
+	        runner->last_timing.tensor_bind_ms += bind_ms;
+	        runner->last_timing.codegen_bind_step_ms.push_back(bind_ms);
+	        double step_infer_ms = 0.0;
+	        measure_ms(step_infer_ms, [&]() {
+	            step_request.infer();
         });
-        measure_ms(runner->last_timing.codegen_infer_ms, [&]() {
-            step_request.infer();
-        });
+        runner->last_timing.codegen_infer_ms += step_infer_ms;
+	        if (step_request_label.find("prefill") != std::string::npos) {
+	            runner->last_timing.codegen_prefill_infer_ms += step_infer_ms;
+	            runner->last_timing.codegen_prefill_count += 1;
+	            runner->last_timing.codegen_prefill_step_ms.push_back(step_infer_ms);
+	        } else {
+	            runner->last_timing.codegen_decode_infer_ms += step_infer_ms;
+	            runner->last_timing.codegen_decode_count += 1;
+	            runner->last_timing.codegen_decode_step_ms.push_back(step_infer_ms);
+	        }
         record_request_profile(runner, step_request_label, step_request);
         if (runner->paged_split_subcode) {
             auto logits_tensor = step_request.get_output_tensor(0);
-            auto last_hidden_tensor = step_request.get_output_tensor(1);
-            int64_t first_code = 0;
-            measure_ms(runner->last_timing.sampling_ms, [&]() {
-                first_code = select_first_code_from_logits(
-                    runner,
+	            auto last_hidden_tensor = step_request.get_output_tensor(1);
+	            int64_t first_code = 0;
+	            double sampling_ms = 0.0;
+	            measure_ms(sampling_ms, [&]() {
+	                first_code = select_first_code_from_logits(
+	                    runner,
                     logits_tensor,
                     generated,
                     min_new_tokens,
@@ -2140,14 +2421,15 @@ void run_paged_kv_impl(
                     eos_token_id,
                     use_repetition_penalty ? &repeated_first_codes : nullptr,
                     repetition_penalty,
-                    &sampling,
-                    &rng);
-            });
+	                    &sampling,
+	                    &rng);
+	            });
+	            runner->last_timing.sampling_ms += sampling_ms;
+	            runner->last_timing.codegen_sampling_step_ms.push_back(sampling_ms);
             if (first_code == eos_token_id && generated >= min_new_tokens) {
                 stop = true;
                 return;
             }
-            std::vector<int64_t> frame_codes;
             run_paged_split_subcode_step(
                 runner,
                 last_hidden_tensor,
@@ -2155,9 +2437,16 @@ void run_paged_kv_impl(
                 tts_pad_embed,
                 hidden_size,
                 num_code_groups,
-                frame_codes,
+                split_frame_codes,
                 next_embed);
-            emit_many(&first_code, frame_codes.data(), 1);
+            append_trace(
+                "split_subcode",
+                generated,
+                first_code,
+                split_frame_codes.data(),
+                &last_hidden_tensor,
+                next_embed.data());
+            emit_many(&first_code, split_frame_codes.data(), 1);
             if (
                 use_repetition_penalty &&
                 first_code >= 0 &&
@@ -2169,9 +2458,20 @@ void run_paged_kv_impl(
             auto codes_tensor = step_request.get_output_tensor(1);
             auto frame_embed_tensor = step_request.get_output_tensor(2);
             const int64_t output_frames = static_cast<int64_t>(codes_tensor.get_size()) / num_code_groups;
-            emit_many(tensor_data<int64_t>(first_codes_tensor), tensor_data<int64_t>(codes_tensor), output_frames);
+            const int64_t* first_codes = tensor_data<int64_t>(first_codes_tensor);
+            const int64_t* codes = tensor_data<int64_t>(codes_tensor);
+            const float* frame_embed = tensor_data<float>(frame_embed_tensor);
+            for (int64_t frame = 0; frame < output_frames; ++frame) {
+                append_trace(
+                    "graph_fused",
+                    generated + frame,
+                    first_codes ? first_codes[frame] : 0,
+                    codes ? codes + frame * num_code_groups : nullptr,
+                    nullptr,
+                    frame + 1 == output_frames ? frame_embed : nullptr);
+            }
+            emit_many(first_codes, codes, output_frames);
             if (!remote_output || !static_cast<bool>(*remote_output)) {
-                const float* frame_embed = tensor_data<float>(frame_embed_tensor);
                 std::memcpy(next_embed.data(), frame_embed, static_cast<size_t>(hidden_size) * sizeof(float));
             }
         }
@@ -2347,6 +2647,17 @@ void run_unroll4_statefulmask_impl(
 
     int64_t generated = 0;
     bool stop = false;
+    auto mark_codec_frames = [&](int64_t count) {
+        if (count <= 0) {
+            return;
+        }
+        const double token_ms = elapsed_ms_since(started);
+        if (runner->last_timing.generated_frames == 0) {
+            runner->last_timing.ttft_ms = token_ms;
+        }
+        runner->last_timing.last_token_ms = token_ms;
+        runner->last_timing.generated_frames += count;
+    };
     auto emit_codes = [&](const int64_t* first, const int64_t* all_codes, int64_t limit) {
         int64_t emit_count = 0;
         for (int64_t offset = 0; offset < limit; ++offset) {
@@ -2365,6 +2676,7 @@ void run_unroll4_statefulmask_impl(
                 all_codes,
                 static_cast<size_t>(emit_count * num_code_groups) * sizeof(int64_t));
         }
+        mark_codec_frames(emit_count);
         if (callback) {
             int callback_rc = 0;
             double callback_ms = 0.0;
@@ -2544,6 +2856,8 @@ public:
         m_runner.paged_kv_precision = precision;
         m_runner.paged_kv_cache_input_precision = cache_input_precision;
         m_runner.paged_split_subcode = split_subcode;
+        m_runner.subcode_outputs_next_embed =
+            split_subcode && lower_text(std::filesystem::path(subcode_xml).filename().string()).find("next_embed") != std::string::npos;
         m_runner.bucket = 0;
         m_runner.unroll = parse_unroll_steps(paged_seed_xml);
         auto model = convert_paged_kv_seed_model(
@@ -2565,6 +2879,8 @@ public:
         if (static_mode != "minimal" && static_mode != "full") {
             throw std::runtime_error("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE_MODE must be minimal or full");
         }
+        m_runner.paged_static_decode_requested = want_static_decode;
+        m_runner.paged_static_decode_failure.clear();
         m_runner.paged_static_decode_block_capacity = static_blocks;
         m_runner.paged_static_decode_mode = want_static_decode ? static_mode : "dynamic";
         bool static_decode_ready = false;
@@ -2579,9 +2895,13 @@ public:
                     static_mode);
             } catch (const std::exception& exc) {
                 static_decode_ready = false;
+                m_runner.paged_static_decode_failure = std::string("reshape_failed: ") + exc.what();
                 if (enabled_env("QWEN3_TTS_OV_NATIVE_DEBUG_GRAPH", false)) {
                     std::cerr << "paged static decode reshape failed: " << exc.what() << std::endl;
                 }
+            }
+            if (!static_decode_ready && m_runner.paged_static_decode_failure.empty()) {
+                m_runner.paged_static_decode_failure = "reshape_not_applicable";
             }
         }
         m_runner.prefill_model = m_runner.core.compile_model(model, device, config);
@@ -2591,15 +2911,20 @@ public:
                 m_runner.decode_model = m_runner.core.compile_model(decode_model, device, config);
                 m_runner.decode_request = m_runner.decode_model.create_infer_request();
                 m_runner.paged_static_decode_enabled = true;
+                m_runner.paged_static_decode_failure.clear();
             } catch (const std::exception& exc) {
                 m_runner.paged_static_decode_enabled = false;
                 m_runner.paged_static_decode_mode = "dynamic";
+                m_runner.paged_static_decode_failure = std::string("compile_failed: ") + exc.what();
                 if (enabled_env("QWEN3_TTS_OV_NATIVE_DEBUG_GRAPH", false)) {
                     std::cerr << "paged static decode compile failed: " << exc.what() << std::endl;
                 }
             }
         } else {
             m_runner.paged_static_decode_mode = "dynamic";
+            if (want_static_decode && m_runner.paged_static_decode_failure.empty()) {
+                m_runner.paged_static_decode_failure = "static_decode_disabled";
+            }
         }
         if (split_subcode) {
             const char* subcode_device_env = std::getenv("QWEN3_TTS_OV_NATIVE_SUBCODE_DEVICE");

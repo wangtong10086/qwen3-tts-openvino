@@ -18,7 +18,9 @@ from .profiles import (
     FASTEST_CACHE_KERNEL,
     FASTEST_CACHE_STEP,
     FASTEST_GRAPH_VARIANT,
+    FASTEST_NATIVE_CODEGEN_FUSION,
     FASTEST_NATIVE_CODEGEN_DEVICE,
+    FASTEST_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE,
     FASTEST_MODE,
     FASTEST_NATIVE_BUFFER_REUSE,
     FASTEST_NATIVE_PAGED_KV,
@@ -107,6 +109,7 @@ def add_runtime_args(
     parser.add_argument("--native-paged-kv-experimental-unroll", default=None, choices=["off", "on"], help=advanced)
     parser.add_argument("--native-paged-kv-subcode-attention", default=None, choices=["auto", "sdpa", "exact"], help=advanced)
     parser.add_argument("--native-paged-kv-split-subcode", default=None, choices=["off", "on"], help=advanced)
+    parser.add_argument("--native-codegen-fusion", default=None, choices=["off", "split", "auto", "graph"], help=advanced)
     parser.add_argument(
         "--native-paged-kv-split-subcode-mode",
         default=None,
@@ -117,6 +120,7 @@ def add_runtime_args(
     parser.add_argument("--native-paged-kv-hybrid", default=None, choices=["off", "on"], help=advanced)
     parser.add_argument("--native-paged-kv-hybrid-prefix-frames", default=None, type=int, help=advanced)
     parser.add_argument("--native-codegen-device", default=None, help=advanced)
+    parser.add_argument("--native-dynamic-quantization-group-size", default=None, type=int, help=advanced)
     parser.add_argument("--native-ov-profile", action="store_true", help=advanced)
     if not include_generation:
         return
@@ -212,8 +216,11 @@ def apply_profile_defaults(args):
         if getattr(args, "native_paged_kv_block_size", None) is None:
             args.native_paged_kv_block_size = FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE
         args.native_paged_kv_split_subcode = FASTEST_NATIVE_PAGED_KV_SPLIT_SUBCODE
+        if getattr(args, "native_codegen_fusion", None) is None:
+            args.native_codegen_fusion = FASTEST_NATIVE_CODEGEN_FUSION
         args.native_paged_kv_score_aggregation = FASTEST_NATIVE_PAGED_KV_SCORE_AGGREGATION
         args.native_codegen_device = FASTEST_NATIVE_CODEGEN_DEVICE
+        args.native_dynamic_quantization_group_size = FASTEST_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE
         apply_kv_cache_profile_defaults(args)
         return
     apply_kv_cache_profile_defaults(args)
@@ -315,6 +322,12 @@ def apply_native_env(args):
         os.environ.pop("QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE", None)
     elif paged_kv_split_subcode == "on":
         os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE"] = "1"
+    native_codegen_fusion = getattr(args, "native_codegen_fusion", None)
+    if native_codegen_fusion:
+        if native_codegen_fusion == "off":
+            os.environ.pop("QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION", None)
+        else:
+            os.environ["QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION"] = str(native_codegen_fusion)
     paged_kv_split_subcode_mode = getattr(args, "native_paged_kv_split_subcode_mode", None)
     if paged_kv_split_subcode_mode:
         os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE_MODE"] = str(paged_kv_split_subcode_mode)
@@ -334,6 +347,14 @@ def apply_native_env(args):
     native_codegen_device = getattr(args, "native_codegen_device", None)
     if native_codegen_device:
         os.environ["QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE"] = str(native_codegen_device)
+    native_dynamic_quantization_group_size = getattr(args, "native_dynamic_quantization_group_size", None)
+    if native_dynamic_quantization_group_size is not None:
+        if int(native_dynamic_quantization_group_size) <= 0:
+            os.environ.pop("QWEN3_TTS_OV_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE", None)
+        else:
+            os.environ["QWEN3_TTS_OV_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE"] = str(
+                int(native_dynamic_quantization_group_size)
+            )
     if getattr(args, "native_ov_profile", False):
         os.environ["QWEN3_TTS_OV_NATIVE_PERF_COUNT"] = "1"
 
@@ -759,6 +780,7 @@ def add_cache_warmup_args(parser):
     parser.add_argument("--codegen-unroll", default="profile", choices=CODEGEN_UNROLL_CHOICES, help=advanced)
     parser.add_argument("--codegen-schedule", default="current", choices=CODEGEN_SCHEDULE_CHOICES, help=advanced)
     parser.add_argument("--codegen-decode-unroll", default="off", choices=["off", "auto", "on"], help=advanced)
+    parser.add_argument("--native-codegen-fusion", default=None, choices=["off", "split", "auto", "graph"], help=advanced)
     parser.add_argument("--preferred-cache-bucket", default="112", help=advanced)
     parser.add_argument("--precision-hint", default="f16", choices=["f16", "f32"])
     parser.add_argument("--ov-cache-dir", default=None)

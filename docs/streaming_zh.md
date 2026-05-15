@@ -11,6 +11,7 @@
 - cached standalone subcode graph
 - streaming decoder graph
 - `int8_sym_paged_talker_split` graph variant
+- OpenVINO GPU 编译默认设置 `DYNAMIC_QUANTIZATION_GROUP_SIZE=32`
 
 缺少这些图时，`fastest` 应直接报错。不要在生产路径中静默切到 legacy profile，否则 RTF 和音质结论会失真。
 
@@ -145,3 +146,87 @@ uv run python scripts/benchmark_streaming_realtime.py \
 ```
 
 不要用 `PERF_COUNT` 下的结果作为线上 RTF。OpenVINO operator profiling 会显著放慢小图自回归循环，只适合定位算子热点。
+
+长度维度验证使用统一脚本，同时覆盖短文本和长文本，并输出 TTFT/TPS：
+
+```bash
+uv run python scripts/benchmark_tts_length_scaling.py \
+  --ir-dir openvino/voice_design \
+  --device GPU \
+  --profiles fastest \
+  --cases short,long \
+  --short-max-new-tokens-set 48,128 \
+  --long-max-new-tokens-set 256,768 \
+  --warmup-generations 1
+```
+
+关键指标定义：
+
+- `ttft_ms`：从开始测量到首个 codec frame 生成完成的时间，来自 native timing。
+- `first_audio_ms`：从开始测量到首个可播放音频块返回 Python 的时间。
+- `codec_tps_post_ttft`：首 token 后的 codec frame/s，更接近 LLM 的 steady-state TPS。
+- `codec_tps_codegen`：仅按 native codegen infer 时间计算的 codec frame/s，用于隔离 decoder 影响。
+- `stream_rtf`：端到端流式耗时 / 输出音频时长，真实播放是否追得上主要看它是否小于 1。
+
+当前性能热点仍在 codegen：standalone subcode 约占 codegen 时间 60% 以上，talker decode 约占 35%。`fastest` 已默认启用 `DYNAMIC_QUANTIZATION_GROUP_SIZE=32`，在本机隔离 benchmark 中相对旧默认带来约 1-2% 的稳定收益；`LATENCY`/`NUM_STREAMS=1`/subcode CPU/exact subcode/graph-fused subcode 都没有通过默认路径验收。
+
+native timing 现在会拆出 `subcode_bind_ms`、`subcode_output_read_ms`、`subcode_next_embed_ms` 和 `subcode_host_copy_*`。如果要验证 standalone subcode 的 host 侧开销是否仍值得优化，优先看这些字段，而不是只看总的 `tensor_bind_ms`。
+
+进一步定位单步 decoding 时，使用 paged-KV ablation profile set：
+
+```bash
+uv run python scripts/benchmark_streaming_realtime.py \
+  --ir-dir openvino/voice_design \
+  --device GPU \
+  --profile-set paged-kv-step-ablation \
+  --runs 1 \
+  --max-new-tokens 64 \
+  --warmup-generations 1
+```
+
+关注 `codegen_decode_step_mean_ms`、`subcode_infer_step_mean_ms`、`codegen_bind_step_mean_ms` 和 `native_paged_static_decode_failure`。当前验证结果是：`cachedsub` 在短文本上可能降低几毫秒 subcode 时间，但长文本不稳定；`split_next_embed_graph` 基本没有收益；static decode reshape 已可进入编译阶段，但当前 OpenVINO GPU 会在编译时报 `map::at` 并自动回退到 dynamic decode。因此这些路径都保持为实验项，不替换 `fastest`。
+
+## Codegen 融合实验
+
+默认 `fastest` 仍使用已经验证的 split-subcode 路径。若导出的 IR 包含
+`graphs.paged_kv_seed.fused_cache_step_gqa`，可以测试 talker+subcode 单图路径：
+
+旧 IR 可能只包含 `talker_stateful_gqa`。这种情况下需要用当前 exporter 重新导出，
+并保留 `--export-paged-kv-seed`，否则 graph-fused 路径会明确报缺图。
+
+```bash
+uv run python scripts/compress_openvino_weights.py \
+  --ir-dir openvino/voice_design \
+  --preset fastest-fused-seed-selective
+
+uv run python scripts/verify_codegen_fusion_correctness.py \
+  --ir-dir openvino/voice_design \
+  --graph-variant-split int8_sym_paged_talker_split \
+  --graph-variant-graph int8_sym_paged_fused_seed_selective \
+  --max-new-tokens 48 \
+  --trace-frames 16
+
+uv run python scripts/benchmark_streaming_realtime.py \
+  --ir-dir openvino/voice_design \
+  --device GPU \
+  --profiles fastest,graph_fused_fp16,graph_fused_int8_selective,graph_fused_int8_full \
+  --runs 3
+```
+
+`verify_codegen_fusion_correctness.py` 默认会先跑 `fp16 split` vs `fp16 graph`
+作为结构基线，再跑目标 variant。`classification=passed` 才能用于性能对比；
+若显示 `quantization_mismatch`，说明图结构正确但目标量化 variant 改变了 codec 序列。
+
+如果导出了 `subcode_greedy_cached_next_embed.xml`，可以单独测试把
+`sum_embed + tts_pad_embed` 下沉到 standalone subcode 图内：
+
+```bash
+uv run python scripts/benchmark_streaming_realtime.py \
+  --ir-dir openvino/voice_design \
+  --device GPU \
+  --profiles fastest,split_next_embed_graph \
+  --runs 3
+```
+
+该路径默认不替换 `fastest`。只有 codes/质量一致且 RTF 稳定改善后，才应把
+`QWEN3_TTS_OV_NATIVE_SUBCODE_NEXT_EMBED_GRAPH=1` 用于生产 profile。

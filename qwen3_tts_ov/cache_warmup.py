@@ -157,6 +157,7 @@ def collect_warmup_tasks(
     preload_buckets: str = "warmup",
     stream_decoders: str = "strategy",
     warmup_strategy: str = "low_latency",
+    native_codegen_fusion: str = "split",
 ) -> tuple[list[WarmupTask], dict]:
     ir_dir = resolve_ir_dir(ir_dir, fallback_to_local_voice_design=True, warn=True)
     manifest = load_manifest(ir_dir)
@@ -193,20 +194,38 @@ def collect_warmup_tasks(
         if fastest_paged_kv:
             paged_seed_graphs = dict((manifest_graphs.get("paged_kv_seed") or {}))
             paged_seed_graphs.update((variant_graphs.get("paged_kv_seed") or {}))
-            add(
-                "core:paged_kv_seed:talker_stateful_gqa",
-                paged_seed_graphs.get("talker_stateful_gqa")
-                or paged_seed_graphs.get("talker_stateful")
-                or paged_seed_graphs.get("fused_cache_step_gqa")
-                or paged_seed_graphs.get("fused_cache_step"),
-            )
-            add(
-                "core:subcode_greedy_cached",
-                variant_graphs.get("subcode_greedy_cached")
-                or manifest_graphs.get("subcode_greedy_cached")
-                or variant_graphs.get("subcode_greedy")
-                or manifest_graphs.get("subcode_greedy"),
-            )
+            fusion_mode = str(native_codegen_fusion or "split").strip().lower().replace("-", "_")
+            if fusion_mode in {"graph", "fused", "graph_fused"}:
+                fused_seed_graph = (
+                    paged_seed_graphs.get("fused_cache_step_gqa")
+                    or paged_seed_graphs.get("talker_subcode_greedy_gqa")
+                    or paged_seed_graphs.get("fused_cache_step")
+                    or paged_seed_graphs.get("talker_subcode_greedy")
+                )
+                if not fused_seed_graph:
+                    raise ValueError(
+                        "cache-warmup --native-codegen-fusion graph requires "
+                        "graphs.paged_kv_seed.fused_cache_step_gqa or fused_cache_step"
+                    )
+                add(
+                    "core:paged_kv_seed:fused_cache_step_gqa",
+                    fused_seed_graph,
+                )
+            else:
+                add(
+                    "core:paged_kv_seed:talker_stateful_gqa",
+                    paged_seed_graphs.get("talker_stateful_gqa")
+                    or paged_seed_graphs.get("talker_stateful")
+                    or paged_seed_graphs.get("fused_cache_step_gqa")
+                    or paged_seed_graphs.get("fused_cache_step"),
+                )
+                add(
+                    "core:subcode_greedy_cached",
+                    variant_graphs.get("subcode_greedy_cached")
+                    or manifest_graphs.get("subcode_greedy_cached")
+                    or variant_graphs.get("subcode_greedy")
+                    or manifest_graphs.get("subcode_greedy"),
+                )
         elif effective_mode == "no-cache":
             add("core:talker", graph_name(manifest_graphs, variant_graphs, "talker"))
             add("core:subcode_greedy", graph_name(manifest_graphs, variant_graphs, "subcode_greedy"))
@@ -510,6 +529,7 @@ def run_cache_warmup(args: argparse.Namespace, compile_config: dict) -> dict:
         preload_buckets=args.preload_buckets,
         stream_decoders=args.stream_decoders,
         warmup_strategy=args.warmup_strategy,
+        native_codegen_fusion=getattr(args, "native_codegen_fusion", "split"),
     )
     effective_mode, effective_kernel, effective_step, effective_variant = effective_runtime_options(
         args.mode,

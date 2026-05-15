@@ -90,6 +90,61 @@ def env_flag_enabled(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "on", "yes"}
 
 
+def load_optional_openvino_extensions(core: ov.Core) -> list[str]:
+    """Load optional OpenVINO extension libraries declared by environment.
+
+    This is intentionally generic: an RMSNorm custom kernel can be dropped in
+    without making the production runtime depend on that experimental library.
+    Set QWEN3_TTS_OV_OPENVINO_EXTENSIONS_REQUIRED=1 to fail fast in experiments.
+    """
+    values = [
+        os.environ.get("QWEN3_TTS_OV_OPENVINO_EXTENSIONS"),
+        os.environ.get("QWEN3_TTS_OV_RMS_EXTENSION_PATH"),
+    ]
+    required = env_flag_enabled(os.environ.get("QWEN3_TTS_OV_OPENVINO_EXTENSIONS_REQUIRED"))
+    loaded: list[str] = []
+    for raw in values:
+        for item in str(raw or "").replace(",", os.pathsep).split(os.pathsep):
+            path_text = item.strip()
+            if not path_text:
+                continue
+            path = Path(path_text).expanduser()
+            if not path.exists():
+                message = f"OpenVINO extension not found: {path}"
+                if required:
+                    raise FileNotFoundError(message)
+                print(f"warning: {message}; continuing without it", flush=True)
+                continue
+            try:
+                core.add_extension(str(path))
+                loaded.append(str(path))
+            except Exception as exc:
+                message = f"failed to load OpenVINO extension {path}: {exc}"
+                if required:
+                    raise RuntimeError(message) from exc
+                print(f"warning: {message}; continuing without it", flush=True)
+    return loaded
+
+
+def normalize_native_codegen_fusion(value: str | None) -> str:
+    mode = str(value or "split").strip().lower().replace("-", "_")
+    aliases = {
+        "0": "off",
+        "false": "off",
+        "no": "off",
+        "1": "graph",
+        "true": "graph",
+        "yes": "graph",
+        "fused": "graph",
+        "graph_fused": "graph",
+        "split_subcode": "split",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"off", "split", "auto", "graph"}:
+        raise ValueError("QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION must be one of: off, split, auto, graph")
+    return mode
+
+
 def effective_paged_kv_unroll(requested: int | str | None, experimental_enabled: bool = False) -> int:
     value = int(requested or 1)
     if value > 1 and not experimental_enabled:
@@ -100,6 +155,22 @@ def effective_paged_kv_unroll(requested: int | str | None, experimental_enabled:
 def paged_kv_seed_uses_gqa(seed_key: str | None) -> bool:
     key = str(seed_key or "")
     return key.endswith("_gqa") or "_gqa_" in key
+
+
+def paged_kv_seed_key_candidates(seed_key: str) -> list[str]:
+    keys = [seed_key]
+    if seed_key.startswith("fused_cache_step"):
+        keys.append(seed_key.replace("fused_cache_step", "talker_subcode_greedy", 1))
+    elif seed_key.startswith("talker_subcode_greedy"):
+        keys.append(seed_key.replace("talker_subcode_greedy", "fused_cache_step", 1))
+    return list(dict.fromkeys(keys))
+
+
+def paged_kv_seed_graph_exists(paged_seed_graphs: dict, seed_key: str) -> str | None:
+    for candidate in paged_kv_seed_key_candidates(seed_key):
+        if paged_seed_graphs.get(candidate):
+            return candidate
+    return None
 
 
 def select_paged_kv_seed_key(
@@ -125,28 +196,30 @@ def select_paged_kv_seed_key(
             if prefer_gqa
             else f"fused_cache_step_unroll{int(requested_unroll)}"
         )
-        if paged_seed_graphs.get(unroll_key):
-            seed_key = unroll_key
+        if found_key := paged_kv_seed_graph_exists(paged_seed_graphs, unroll_key):
+            seed_key = found_key
     fallback = False
     selected_subcode_attention = "split" if split_subcode else "sdpa"
     if subcode_mode == "exact" and not split_subcode:
         exact_key = f"{seed_key}_subcode_exact"
-        if paged_seed_graphs.get(exact_key):
-            seed_key = exact_key
+        if found_key := paged_kv_seed_graph_exists(paged_seed_graphs, exact_key):
+            seed_key = found_key
             selected_subcode_attention = "exact"
         else:
             non_gqa_exact_key = exact_key.replace("_gqa", "")
-            if prefer_gqa and paged_seed_graphs.get(non_gqa_exact_key):
-                seed_key = non_gqa_exact_key
+            if prefer_gqa and (found_key := paged_kv_seed_graph_exists(paged_seed_graphs, non_gqa_exact_key)):
+                seed_key = found_key
                 selected_subcode_attention = "exact"
             else:
                 fallback = True
     elif subcode_mode == "exact" and split_subcode:
         fallback = True
-    if not paged_seed_graphs.get(seed_key):
+    if not paged_kv_seed_graph_exists(paged_seed_graphs, seed_key):
         non_gqa_key = seed_key.replace("_gqa", "")
-        if prefer_gqa and paged_seed_graphs.get(non_gqa_key):
-            seed_key = non_gqa_key
+        if prefer_gqa and (found_key := paged_kv_seed_graph_exists(paged_seed_graphs, non_gqa_key)):
+            seed_key = found_key
+    else:
+        seed_key = paged_kv_seed_graph_exists(paged_seed_graphs, seed_key) or seed_key
     return seed_key, selected_subcode_attention, fallback
 
 
@@ -736,6 +809,9 @@ class OpenVINOQwen3TTS:
         self.tokenizer = Qwen2BPETokenizer(self.model_dir)
 
         self.core = ov.Core()
+        self.openvino_extensions_loaded = load_optional_openvino_extensions(self.core)
+        if self.openvino_extensions_loaded:
+            print(f"Loaded OpenVINO extensions: {self.openvino_extensions_loaded}", flush=True)
         print(f"OpenVINO available devices: {self.core.available_devices}", flush=True)
         started = time.time()
         self.text_embedding = compile_model(
@@ -1581,6 +1657,15 @@ class OpenVINOQwen3TTS:
                 )
                 prefer_gqa = self._native_paged_kv_gqa_enabled()
                 paged_split_subcode = self._native_paged_kv_split_subcode_enabled()
+                requested_codegen_fusion = normalize_native_codegen_fusion(
+                    os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION")
+                )
+                selected_graph_fusion_key = None
+                selected_graph_fusion_attention = None
+                selected_graph_fusion_fallback = False
+                codegen_fusion = "split" if paged_split_subcode else "graph"
+                codegen_fusion_fallback = False
+                codegen_fusion_reason = "split_subcode_requested" if paged_split_subcode else "split_subcode_disabled"
                 if do_sample and not paged_split_subcode:
                     raise RuntimeError("native paged-KV sampling requires split-subcode mode")
                 requested_paged_unroll = int(
@@ -1603,6 +1688,51 @@ class OpenVINOQwen3TTS:
                     .lower()
                     .replace("-", "_")
                 )
+                if paged_split_subcode and requested_codegen_fusion in {"auto", "graph"}:
+                    can_graph_fuse = (
+                        not do_sample
+                        and abs(float(repetition_penalty) - 1.0) <= 1e-6
+                        and int(requested_paged_unroll or 1) == 1
+                    )
+                    if can_graph_fuse:
+                        candidate_key, candidate_attention, candidate_fallback = select_paged_kv_seed_key(
+                            paged_seed_graphs,
+                            prefer_gqa=prefer_gqa,
+                            split_subcode=False,
+                            requested_unroll=requested_paged_unroll,
+                            subcode_attention=subcode_attention,
+                        )
+                        if paged_seed_graphs.get(candidate_key):
+                            paged_split_subcode = False
+                            selected_graph_fusion_key = candidate_key
+                            selected_graph_fusion_attention = candidate_attention
+                            selected_graph_fusion_fallback = candidate_fallback
+                            codegen_fusion = "graph"
+                            codegen_fusion_reason = "fused_paged_seed_graph_available"
+                        else:
+                            codegen_fusion_fallback = True
+                            codegen_fusion_reason = f"missing_fused_seed_graph:{candidate_key}"
+                            if requested_codegen_fusion == "graph":
+                                raise RuntimeError(
+                                    "native paged-KV graph-fused codegen requires "
+                                    f"graphs.paged_kv_seed.{candidate_key}; "
+                                    "re-export with --export-paged-kv-seed and fused seed graph enabled, "
+                                    "or set QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION=split"
+                                )
+                    else:
+                        codegen_fusion_fallback = True
+                        if do_sample:
+                            codegen_fusion_reason = "sampling_requires_split_subcode"
+                        elif abs(float(repetition_penalty) - 1.0) > 1e-6:
+                            codegen_fusion_reason = "repetition_penalty_requires_split_subcode"
+                        else:
+                            codegen_fusion_reason = "paged_unroll_requires_split_subcode"
+                        if requested_codegen_fusion == "graph":
+                            raise RuntimeError(
+                                "native paged-KV graph-fused codegen currently supports greedy "
+                                "repetition_penalty=1.0 and paged_unroll=1 only; "
+                                f"reason={codegen_fusion_reason}"
+                            )
                 paged_seed_key, selected_subcode_attention, paged_subcode_attention_fallback = select_paged_kv_seed_key(
                     paged_seed_graphs,
                     prefer_gqa=prefer_gqa,
@@ -1610,6 +1740,10 @@ class OpenVINOQwen3TTS:
                     requested_unroll=requested_paged_unroll,
                     subcode_attention=subcode_attention,
                 )
+                if selected_graph_fusion_key:
+                    paged_seed_key = selected_graph_fusion_key
+                    selected_subcode_attention = selected_graph_fusion_attention
+                    paged_subcode_attention_fallback = selected_graph_fusion_fallback
                 paged_seed_graph = paged_seed_graphs.get(paged_seed_key)
                 if not paged_seed_graph:
                     raise RuntimeError(
@@ -1648,7 +1782,20 @@ class OpenVINOQwen3TTS:
                             or graphs_root.get("subcode_greedy_cached")
                         )
                     else:
+                        use_next_embed_graph = (
+                            str(os.environ.get("QWEN3_TTS_OV_NATIVE_SUBCODE_NEXT_EMBED_GRAPH") or "0")
+                            .strip()
+                            .lower()
+                            not in {"0", "false", "off", "no"}
+                        )
                         subcode_graph_name = (
+                            (
+                                (self.variant_graphs or {}).get("subcode_greedy_cached_next_embed")
+                                or graphs_root.get("subcode_greedy_cached_next_embed")
+                            )
+                            if use_next_embed_graph
+                            else None
+                        ) or (
                             (self.variant_graphs or {}).get("subcode_greedy_cached")
                             or graphs_root.get("subcode_greedy_cached")
                             or (self.variant_graphs or {}).get("subcode_greedy")
@@ -1749,7 +1896,7 @@ class OpenVINOQwen3TTS:
             effective_paged_kv_static_mode = str(
                 os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE_MODE") or "minimal"
             ).strip().lower()
-            effective_paged_split_subcode = bool(paged_kv_requested and self._native_paged_kv_split_subcode_enabled())
+            effective_paged_split_subcode = bool(paged_kv_requested and paged_split_subcode)
             effective_prompt_device = str(
                 os.environ.get("QWEN3_TTS_OV_NATIVE_PROMPT_DEVICE") or self.prompt_device or "CPU"
             )
@@ -1853,6 +2000,10 @@ class OpenVINOQwen3TTS:
                 "paged_kv_seed_key": paged_seed_key if paged_kv_requested else None,
                 "paged_kv_gqa": bool(paged_kv_requested and paged_kv_seed_uses_gqa(paged_seed_key)),
                 "paged_kv_split_subcode": bool(effective_paged_split_subcode) if paged_kv_requested else None,
+                "codegen_fusion": codegen_fusion if paged_kv_requested else None,
+                "codegen_fusion_requested": requested_codegen_fusion if paged_kv_requested else None,
+                "codegen_fusion_fallback": bool(codegen_fusion_fallback) if paged_kv_requested else None,
+                "codegen_fusion_reason": codegen_fusion_reason if paged_kv_requested else None,
                 "paged_kv_subcode_attention": (
                     selected_subcode_attention
                     if paged_kv_requested and not paged_split_subcode
@@ -2004,6 +2155,10 @@ class OpenVINOQwen3TTS:
                         "native_prompt_pipeline": bool(native_prompt_pipeline),
                         "native_async_decode": actual_async_decode,
                         "native_sampling": bool(do_sample and paged_kv_requested and effective_paged_split_subcode),
+                        "codegen_fusion": codegen_fusion if paged_kv_requested else None,
+                        "codegen_fusion_requested": requested_codegen_fusion if paged_kv_requested else None,
+                        "codegen_fusion_fallback": bool(codegen_fusion_fallback) if paged_kv_requested else None,
+                        "codegen_fusion_reason": codegen_fusion_reason if paged_kv_requested else None,
                         "do_sample": bool(do_sample),
                         "top_k": int(top_k),
                         "top_p": float(top_p),

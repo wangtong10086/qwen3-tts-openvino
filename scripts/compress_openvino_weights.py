@@ -63,10 +63,22 @@ def main() -> None:
     parser.add_argument(
         "--preset",
         default="custom",
-        choices=["custom", "fastest"],
+        choices=[
+            "custom",
+            "fastest",
+            "fastest-cachedsub",
+            "fastest-selective-cachedsub",
+            "fastest-fused-seed",
+            "fastest-fused-seed-selective",
+        ],
         help=(
             "Convenience graph selection. 'fastest' creates the production "
-            "int8_sym_paged_talker_split variant for the native paged-KV path."
+            "int8_sym_paged_talker_split variant for the native paged-KV path; "
+            "'fastest-cachedsub' also compresses cached subcode for experiments; "
+            "'fastest-selective-cachedsub' compresses cached subcode while excluding fragile layers; "
+            "'fastest-fused-seed' creates an experimental graph-fused seed variant; "
+            "'fastest-fused-seed-selective' compresses the graph-fused seed while keeping subcode-sensitive "
+            "nodes in FP precision for correctness testing."
         ),
     )
     parser.add_argument("--variant", default="int8_fused")
@@ -118,6 +130,84 @@ def main() -> None:
         args.include_fused_decode_unroll = False
         args.include_paged_kv_seed = True
         args.paged_kv_seed_keys = "talker_stateful_gqa"
+    elif args.preset == "fastest-cachedsub":
+        if args.variant == parser.get_default("variant"):
+            args.variant = "int8_sym_paged_talker_split_cachedsub"
+        if args.mode == parser.get_default("mode"):
+            args.mode = "int8_sym"
+        args.include_no_cache = False
+        args.include_subcode = False
+        args.include_cached_subcode = True
+        args.include_sdpa_cache = False
+        args.include_fused_cache = False
+        args.include_fused_unroll = False
+        args.include_fused_decode_unroll = False
+        args.include_paged_kv_seed = True
+        args.paged_kv_seed_keys = "talker_stateful_gqa"
+    elif args.preset == "fastest-selective-cachedsub":
+        if args.variant == parser.get_default("variant"):
+            args.variant = "int8_sym_paged_talker_split_cachedsub_selective"
+        if args.mode == parser.get_default("mode"):
+            args.mode = "int8_sym"
+        args.include_no_cache = False
+        args.include_subcode = False
+        args.include_cached_subcode = True
+        args.include_sdpa_cache = False
+        args.include_fused_cache = False
+        args.include_fused_unroll = False
+        args.include_fused_decode_unroll = False
+        args.include_paged_kv_seed = True
+        args.paged_kv_seed_keys = "talker_stateful_gqa"
+        selective_patterns = [
+            ".*embedding.*",
+            ".*embed.*",
+            ".*lm_head.*",
+            ".*norm.*",
+            ".*RMS.*",
+        ]
+        existing_patterns = parse_csv(args.ignore_patterns)
+        args.ignore_patterns = ",".join([*existing_patterns, *selective_patterns])
+    elif args.preset == "fastest-fused-seed":
+        if args.variant == parser.get_default("variant"):
+            args.variant = "int8_sym_paged_fused_seed"
+        if args.mode == parser.get_default("mode"):
+            args.mode = "int8_sym"
+        args.include_no_cache = False
+        args.include_subcode = False
+        args.include_cached_subcode = False
+        args.include_sdpa_cache = False
+        args.include_fused_cache = False
+        args.include_fused_unroll = False
+        args.include_fused_decode_unroll = False
+        args.include_paged_kv_seed = True
+        args.paged_kv_seed_keys = "fused_cache_step_gqa"
+    elif args.preset == "fastest-fused-seed-selective":
+        if args.variant == parser.get_default("variant"):
+            args.variant = "int8_sym_paged_fused_seed_selective"
+        if args.mode == parser.get_default("mode"):
+            args.mode = "int8_sym"
+        args.include_no_cache = False
+        args.include_subcode = False
+        args.include_cached_subcode = False
+        args.include_sdpa_cache = False
+        args.include_fused_cache = False
+        args.include_fused_unroll = False
+        args.include_fused_decode_unroll = False
+        args.include_paged_kv_seed = True
+        args.paged_kv_seed_keys = "fused_cache_step_gqa"
+        selective_patterns = [
+            # The split production path keeps subcode inference as a separate
+            # FP graph. Leave all subcode-side weights uncompressed so this
+            # variant isolates graph fusion from subcode quantization drift.
+            ".*subcode.*",
+            ".*embedding.*",
+            ".*embed.*",
+            ".*lm_head.*",
+            ".*norm.*",
+            ".*RMS.*",
+        ]
+        existing_patterns = parse_csv(args.ignore_patterns)
+        args.ignore_patterns = ",".join([*existing_patterns, *selective_patterns])
 
     ir_dir = resolve_ir_dir(args.ir_dir, fallback_to_local_voice_design=True, warn=True)
     manifest_path = ir_dir / "manifest.json"
@@ -164,6 +254,11 @@ def main() -> None:
         target = add_suffix(source, f"_{args.variant}")
         compress_model(ir_dir / source, ir_dir / target, mode, ignored_scope, args.force)
         variant_graphs["subcode_greedy_cached"] = target
+        source = graphs.get("subcode_greedy_cached_next_embed")
+        if source:
+            target = add_suffix(source, f"_{args.variant}")
+            compress_model(ir_dir / source, ir_dir / target, mode, ignored_scope, args.force)
+            variant_graphs["subcode_greedy_cached_next_embed"] = target
 
     if args.include_sdpa_cache:
         selected_jobs += 1
@@ -265,7 +360,7 @@ def main() -> None:
     if selected_jobs == 0:
         raise ValueError("no graph groups selected for compression")
 
-    if args.preset == "fastest":
+    if args.preset in {"fastest", "fastest-fused-seed", "fastest-fused-seed-selective"}:
         # Keep the production variant narrow and reproducible even if the same
         # local IR was used for older compression experiments.
         manifest.setdefault("graph_variants", {}).pop(args.variant, None)

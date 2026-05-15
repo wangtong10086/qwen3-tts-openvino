@@ -37,7 +37,9 @@ from .profiles import (
     FASTEST_CODEGEN_DECODE_UNROLL,
     FASTEST_CODEGEN_SCHEDULE,
     FASTEST_CODEGEN_UNROLL,
+    FASTEST_NATIVE_CODEGEN_FUSION,
     FASTEST_NATIVE_CODEGEN_DEVICE,
+    FASTEST_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE,
     FASTEST_NATIVE_BUFFER_REUSE,
     FASTEST_NATIVE_PAGED_KV,
     FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE,
@@ -104,12 +106,14 @@ LONG_TEXT_PROFILE_ENV_MAP = {
     "native_paged_kv_block_size": "QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE",
     "native_paged_kv_gqa": "QWEN3_TTS_OV_NATIVE_PAGED_KV_GQA",
     "native_paged_kv_split_subcode": "QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE",
+    "native_codegen_fusion": "QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION",
     "native_paged_kv_split_subcode_mode": "QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE_MODE",
     "native_paged_kv_score_aggregation": "QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION",
     "native_paged_kv_subcode_attention": "QWEN3_TTS_OV_NATIVE_PAGED_KV_SUBCODE_ATTENTION",
     "native_pipeline": "QWEN3_TTS_OV_NATIVE_PIPELINE",
     "native_paged_kv": "QWEN3_TTS_OV_NATIVE_PAGED_KV",
     "native_buffer_reuse": "QWEN3_TTS_OV_NATIVE_BUFFER_REUSE",
+    "native_dynamic_quantization_group_size": "QWEN3_TTS_OV_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE",
 }
 WEB_AUTO_SEGMENT_UNITS = 64
 WEB_AUTO_SEGMENT_MAX_NEW_TOKENS = 240
@@ -1872,11 +1876,16 @@ def create_app(
         os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE"] = (
             "1" if FASTEST_NATIVE_PAGED_KV_SPLIT_SUBCODE == "on" else "0"
         )
+        os.environ.setdefault("QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION", FASTEST_NATIVE_CODEGEN_FUSION)
         os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION"] = (
             "1" if FASTEST_NATIVE_PAGED_KV_SCORE_AGGREGATION == "on" else "0"
         )
         os.environ["QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE"] = (
             FASTEST_NATIVE_CODEGEN_DEVICE if uses_gpu_device else str(device or "CPU")
+        )
+        os.environ.setdefault(
+            "QWEN3_TTS_OV_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE",
+            str(FASTEST_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE),
         )
     apply_kv_cache_env()
     effective_kv_cache_precision = os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION") or FASTEST_NATIVE_PAGED_KV_PRECISION
@@ -2087,6 +2096,7 @@ def create_app(
         "native_paged_kv_experimental_unroll": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_EXPERIMENTAL_UNROLL") or "0",
         "native_paged_kv_subcode_attention": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SUBCODE_ATTENTION") or "auto",
         "native_paged_kv_split_subcode": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE") or "off",
+        "native_codegen_fusion": os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION") or "split",
         "native_paged_kv_split_subcode_mode": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE_MODE") or "cached",
         "native_paged_kv_score_aggregation": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION") or "on",
         "native_paged_kv_hybrid": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID") or "off",
@@ -2181,6 +2191,7 @@ def create_app(
         "native_paged_kv_experimental_unroll": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_EXPERIMENTAL_UNROLL") or "0",
         "native_paged_kv_subcode_attention": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SUBCODE_ATTENTION") or "auto",
         "native_paged_kv_split_subcode": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE") or "off",
+        "native_codegen_fusion": os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION") or "split",
         "native_paged_kv_split_subcode_mode": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE_MODE") or "cached",
         "native_paged_kv_score_aggregation": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION") or "on",
         "native_paged_kv_hybrid": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID") or "off",
@@ -3596,11 +3607,15 @@ def create_app(
                     or os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE")
                     or "off"
                 ),
+                "native_codegen_fusion": os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION") or "split",
                 "native_paged_kv_split_subcode_mode": (
                     os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE_MODE") or "cached"
                 ),
                 "native_paged_kv_score_aggregation": (
                     os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION") or "on"
+                ),
+                "native_dynamic_quantization_group_size": (
+                    os.environ.get("QWEN3_TTS_OV_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE") or "default"
                 ),
                 "native_subcode_device": os.environ.get("QWEN3_TTS_OV_NATIVE_SUBCODE_DEVICE") or "same",
                 "native_paged_kv_hybrid": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID") or "off",

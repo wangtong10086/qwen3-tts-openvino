@@ -9,6 +9,7 @@ from pathlib import Path
 from qwen3_tts_ov.profiles import (
     REALTIME_BENCHMARK_PROFILE_OPTIONS,
     apply_realtime_profile,
+    fastest_runtime_defaults,
 )
 
 
@@ -33,12 +34,32 @@ NATIVE_COMPILE_ENV_KEYS = {
     "native_paged_kv_static_decode_mode": "QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE_MODE",
     "native_paged_kv_score_aggregation": "QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION",
     "native_paged_kv_split_subcode": "QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE",
+    "native_codegen_fusion": "QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION",
     "native_paged_kv_split_subcode_mode": "QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE_MODE",
     "native_subcode_device": "QWEN3_TTS_OV_NATIVE_SUBCODE_DEVICE",
+    "native_subcode_next_embed_graph": "QWEN3_TTS_OV_NATIVE_SUBCODE_NEXT_EMBED_GRAPH",
 }
 PROFILE_SETS = {
     "fastest-gate": "fastest",
     "rtf-p90-gate": "fastest",
+    "paged-kv-step-ablation": ",".join(
+        [
+            "fastest",
+            "paged_split_static_decode",
+            "paged_split_block8",
+            "paged_split_u8_all",
+            "paged_split_dq32",
+            "paged_split_dq64",
+            "paged_split_dq128",
+            "split_next_embed_graph",
+            "paged_split_int8_cachedsub",
+            "paged_split_num_streams_1",
+            "paged_split_latency_high",
+            "paged_split_throughput_hint",
+            "paged_split_no_score_aggregation",
+            "paged_split_remote_hidden_off",
+        ]
+    ),
 }
 PROFILES = {
     "fastest": {
@@ -97,6 +118,91 @@ PROFILES = {
         "native_codegen_device": "GPU",
         "native_buffer_reuse": "0",
         "native_async_decode": "0",
+        "preferred_cache_bucket": "0",
+        "repetition_penalty": "1.0",
+    },
+    "fastest_block8": {
+        "mode": "no-cache",
+        "cache_kernel": "exact",
+        "cache_step": "fused",
+        "graph_variant": "int8_sym_paged_talker_split",
+        "codegen_unroll": "1",
+        "codegen_schedule": "current",
+        "codegen_decode_unroll": "off",
+        "native_pipeline": "require",
+        "native_paged_kv": "require",
+        "native_paged_kv_gqa": "1",
+        "native_paged_kv_precision": "u8",
+        "native_paged_kv_block_size": "8",
+        "native_paged_kv_split_subcode": "1",
+        "native_codegen_device": "GPU",
+        "native_buffer_reuse": "0",
+        "native_async_decode": "1",
+        "preferred_cache_bucket": "0",
+        "repetition_penalty": "1.0",
+    },
+    "fastest_u8_all": {
+        "mode": "no-cache",
+        "cache_kernel": "exact",
+        "cache_step": "fused",
+        "graph_variant": "int8_sym_paged_talker_split",
+        "codegen_unroll": "1",
+        "codegen_schedule": "current",
+        "codegen_decode_unroll": "off",
+        "native_pipeline": "require",
+        "native_paged_kv": "require",
+        "native_paged_kv_gqa": "1",
+        "native_paged_kv_precision": "u8",
+        "native_paged_kv_cache_input_precision": "u8",
+        "native_paged_kv_block_size": "16",
+        "native_paged_kv_split_subcode": "1",
+        "native_codegen_device": "GPU",
+        "native_buffer_reuse": "0",
+        "native_async_decode": "1",
+        "preferred_cache_bucket": "0",
+        "repetition_penalty": "1.0",
+    },
+    "fastest_no_score_aggregation": {
+        "mode": "no-cache",
+        "cache_kernel": "exact",
+        "cache_step": "fused",
+        "graph_variant": "int8_sym_paged_talker_split",
+        "codegen_unroll": "1",
+        "codegen_schedule": "current",
+        "codegen_decode_unroll": "off",
+        "native_pipeline": "require",
+        "native_paged_kv": "require",
+        "native_paged_kv_gqa": "1",
+        "native_paged_kv_precision": "u8",
+        "native_paged_kv_block_size": "16",
+        "native_paged_kv_score_aggregation": "0",
+        "native_paged_kv_split_subcode": "1",
+        "native_codegen_device": "GPU",
+        "native_buffer_reuse": "0",
+        "native_async_decode": "1",
+        "preferred_cache_bucket": "0",
+        "repetition_penalty": "1.0",
+    },
+    "fastest_static_decode_minimal_blocks128": {
+        "mode": "no-cache",
+        "cache_kernel": "exact",
+        "cache_step": "fused",
+        "graph_variant": "int8_sym_paged_talker_split",
+        "codegen_unroll": "1",
+        "codegen_schedule": "current",
+        "codegen_decode_unroll": "off",
+        "native_pipeline": "require",
+        "native_paged_kv": "require",
+        "native_paged_kv_gqa": "1",
+        "native_paged_kv_precision": "u8",
+        "native_paged_kv_block_size": "16",
+        "native_paged_kv_split_subcode": "1",
+        "native_paged_kv_static_decode": "1",
+        "native_paged_kv_static_blocks": "128",
+        "native_paged_kv_static_decode_mode": "minimal",
+        "native_codegen_device": "GPU",
+        "native_buffer_reuse": "0",
+        "native_async_decode": "1",
         "preferred_cache_bucket": "0",
         "repetition_penalty": "1.0",
     },
@@ -1216,7 +1322,25 @@ PROFILES = {
 
 
 def realtime_benchmark_option_to_profile(option: dict) -> dict:
-    realtime_profile = str(option.get("realtime_profile") or "fp16")
+    realtime_profile = str(option.get("realtime_profile") or "")
+    if option.get("mode"):
+        config = {
+            "mode": str(option["mode"]),
+            "cache_kernel": str(option.get("cache_kernel", "exact")),
+            "cache_step": str(option.get("cache_step", "fused")),
+            "graph_variant": str(option.get("graph_variant", "fp16")),
+            "codegen_unroll": str(option.get("codegen_unroll", "1")),
+            "codegen_schedule": str(option.get("codegen_schedule", "current")),
+            "codegen_decode_unroll": str(option.get("codegen_decode_unroll", "off")),
+        }
+        for key in ("preferred_cache_bucket", "repetition_penalty"):
+            if key in option:
+                config[key] = str(option[key])
+        for key, value in option.items():
+            if key.startswith("native_"):
+                config[key] = str(value)
+        return config
+    realtime_profile = realtime_profile or "fp16"
     mode, cache_kernel, cache_step, graph_variant = apply_realtime_profile(
         realtime_profile,
         "cache",
@@ -1247,7 +1371,7 @@ def realtime_benchmark_option_to_profile(option: dict) -> dict:
         "mode": requested_modes.get(realtime_profile, mode),
         "cache_kernel": cache_kernel,
         "cache_step": cache_step,
-        "graph_variant": graph_variant,
+        "graph_variant": str(option.get("graph_variant", graph_variant)),
         "codegen_unroll": str(option.get("codegen_unroll", "1")),
         "codegen_schedule": str(option.get("codegen_schedule", "current")),
         "codegen_decode_unroll": str(option.get("codegen_decode_unroll", "off")),
@@ -1256,6 +1380,12 @@ def realtime_benchmark_option_to_profile(option: dict) -> dict:
         config["preferred_cache_bucket"] = str(option["preferred_cache_bucket"])
     if "repetition_penalty" in option:
         config["repetition_penalty"] = str(option["repetition_penalty"])
+    if realtime_profile in {"fastest", "auto"}:
+        for key, value in fastest_runtime_defaults().items():
+            config.setdefault(key, str(value))
+    for key, value in option.items():
+        if key.startswith("native_"):
+            config[key] = str(value)
     if realtime_profile in {"fastest", "auto"} or str(option.get("codegen_decode_unroll", "off")) != "off":
         config.setdefault("native_pipeline", "require")
         config.setdefault("native_buffer_reuse", "1")
@@ -1263,7 +1393,11 @@ def realtime_benchmark_option_to_profile(option: dict) -> dict:
 
 
 for _name, _option in REALTIME_BENCHMARK_PROFILE_OPTIONS.items():
-    PROFILES.setdefault(_name, realtime_benchmark_option_to_profile(_option))
+    # Keep benchmark aliases synchronized with qwen3_tts_ov.profiles. Several
+    # production profiles, especially fastest, are intentionally tuned there
+    # after release validation. Stale local definitions would benchmark a
+    # different runtime path and make hotspot analysis misleading.
+    PROFILES[_name] = realtime_benchmark_option_to_profile(_option)
 
 
 def parse_csv(value: str) -> list[str]:
@@ -1279,17 +1413,55 @@ def percentile(values: list[float], pct: float) -> float | None:
     return float(ordered[index])
 
 
+def nested_number(item: dict, *keys: str) -> float | None:
+    value: object = item
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def collect_nested_numbers(rows: list[dict], *keys: str) -> list[float]:
+    values: list[float] = []
+    for row in rows:
+        value = nested_number(row, *keys)
+        if value is not None:
+            values.append(value)
+    return values
+
+
 def summarize_results(results: list[dict]) -> list[dict]:
-    groups: dict[tuple[str, int], list[dict]] = {}
+    groups: dict[tuple[str, str, int], list[dict]] = {}
     for item in results:
         if item.get("status") != "ok":
             continue
-        key = (str(item.get("profile")), int(item.get("max_new_tokens") or 0))
+        key = (
+            str(item.get("case_name") or "default"),
+            str(item.get("profile")),
+            int(item.get("max_new_tokens") or 0),
+        )
         groups.setdefault(key, []).append(item)
     summaries = []
-    for (profile, max_new_tokens), rows in sorted(groups.items()):
+    for (case_name, profile, max_new_tokens), rows in sorted(groups.items()):
         rtfs = [float(row["stream_rtf"]) for row in rows if row.get("stream_rtf") is not None]
         first = [float(row["first_audio_ms"]) for row in rows if row.get("first_audio_ms") is not None]
+        ttft = [float(row["ttft_ms"]) for row in rows if row.get("ttft_ms") is not None]
+        tps = [float(row["codec_tps_post_ttft"]) for row in rows if row.get("codec_tps_post_ttft") is not None]
+        codegen_tps = [
+            float(row["codec_tps_codegen"])
+            for row in rows
+            if row.get("codec_tps_codegen") is not None
+        ]
+        decode_step_mean = collect_nested_numbers(rows, "native_timing", "codegen_decode_step_stats", "mean_ms")
+        decode_step_p90 = collect_nested_numbers(rows, "native_timing", "codegen_decode_step_stats", "p90_ms")
+        subcode_step_mean = collect_nested_numbers(rows, "native_timing", "subcode_infer_step_stats", "mean_ms")
+        subcode_step_p90 = collect_nested_numbers(rows, "native_timing", "subcode_infer_step_stats", "p90_ms")
+        bind_step_mean = collect_nested_numbers(rows, "native_timing", "codegen_bind_step_stats", "mean_ms")
+        sampling_step_mean = collect_nested_numbers(rows, "native_timing", "codegen_sampling_step_stats", "mean_ms")
         compute = [float(row["stream_compute_rtf"]) for row in rows if row.get("stream_compute_rtf") is not None]
         fallback = any(bool(row.get("fallback")) for row in rows)
         unroll_fallback = any(bool(row.get("unroll_fallback")) for row in rows)
@@ -1322,15 +1494,29 @@ def summarize_results(results: list[dict]) -> list[dict]:
             reasons.append("underrun_risk")
         summaries.append(
             {
+                "case_name": case_name,
                 "profile": profile,
                 "max_new_tokens": max_new_tokens,
                 "runs": len(rows),
+                "text_chars": rows[0].get("text_chars"),
                 "p50_stream_rtf": percentile(rtfs, 50),
                 "p90_stream_rtf": p90_rtf,
                 "p50_stream_compute_rtf": percentile(compute, 50),
                 "p90_stream_compute_rtf": percentile(compute, 90),
+                "p50_ttft_ms": percentile(ttft, 50),
+                "p90_ttft_ms": percentile(ttft, 90),
                 "p50_first_audio_ms": percentile(first, 50),
                 "p90_first_audio_ms": p90_first,
+                "p50_codec_tps_post_ttft": percentile(tps, 50),
+                "p90_codec_tps_post_ttft": percentile(tps, 90),
+                "p50_codec_tps_codegen": percentile(codegen_tps, 50),
+                "p90_codec_tps_codegen": percentile(codegen_tps, 90),
+                "p50_decode_step_mean_ms": percentile(decode_step_mean, 50),
+                "p90_decode_step_p90_ms": percentile(decode_step_p90, 90),
+                "p50_subcode_step_mean_ms": percentile(subcode_step_mean, 50),
+                "p90_subcode_step_p90_ms": percentile(subcode_step_p90, 90),
+                "p50_bind_step_mean_ms": percentile(bind_step_mean, 50),
+                "p50_sampling_step_mean_ms": percentile(sampling_step_mean, 50),
                 "fallback": fallback,
                 "unroll_fallback": unroll_fallback,
                 "underrun_count": underrun_count,
@@ -1619,12 +1805,48 @@ def run_profile(name: str, args: argparse.Namespace) -> dict:
     stream_compute_rtf = final_timings.get("stream_compute_rtf")
     if stream_rtf is None and audio_ms:
         stream_rtf = elapsed_ms / audio_ms
+    ttft_ms = native_timing.get("ttft_ms")
+    last_token_ms = native_timing.get("last_token_ms")
+    native_generated_frames = int(native_timing.get("generated_frames") or emitted_frames or 0)
+    post_ttft_ms = None
+    codec_tps_post_ttft = None
+    if ttft_ms is not None and last_token_ms is not None:
+        post_ttft_ms = max(0.0, float(last_token_ms) - float(ttft_ms))
+        if native_generated_frames > 1 and post_ttft_ms > 0.0:
+            codec_tps_post_ttft = (native_generated_frames - 1) / (post_ttft_ms / 1000.0)
+    codegen_infer_ms = native_timing.get("codegen_infer_ms")
+    codec_tps_codegen = None
+    if codegen_infer_ms is not None and float(codegen_infer_ms) > 0 and native_generated_frames > 0:
+        codec_tps_codegen = native_generated_frames / (float(codegen_infer_ms) / 1000.0)
+    decode_step_stats = native_timing.get("codegen_decode_step_stats") or {}
+    prefill_step_stats = native_timing.get("codegen_prefill_step_stats") or {}
+    subcode_infer_step_stats = native_timing.get("subcode_infer_step_stats") or {}
+    bind_step_stats = native_timing.get("codegen_bind_step_stats") or {}
+    sampling_step_stats = native_timing.get("codegen_sampling_step_stats") or {}
+    subcode_output_read_step_stats = native_timing.get("subcode_output_read_step_stats") or {}
+    subcode_next_embed_step_stats = native_timing.get("subcode_next_embed_step_stats") or {}
+    codegen_total = float(codegen_infer_ms or 0.0)
+    codegen_decode_share = (
+        float(native_timing.get("codegen_decode_infer_ms") or 0.0) / codegen_total
+        if codegen_total > 0.0
+        else None
+    )
+    codegen_subcode_share = (
+        float(native_timing.get("codegen_subcode_infer_ms") or 0.0) / codegen_total
+        if codegen_total > 0.0
+        else None
+    )
     return {
+        "case_name": args.case_name,
         "profile": name,
         "status": "error" if error else "ok",
         "error": error,
         "config": config,
+        "text_chars": len(args.text or ""),
         "first_audio_ms": first_audio_ms,
+        "ttft_ms": ttft_ms,
+        "last_token_ms": last_token_ms,
+        "post_ttft_ms": post_ttft_ms,
         "elapsed_ms": elapsed_ms,
         "worker_elapsed_ms": worker_elapsed_ms,
         "warmup_generations": int(args.warmup_generations or 0),
@@ -1633,7 +1855,26 @@ def run_profile(name: str, args: argparse.Namespace) -> dict:
         "audio_ms": audio_ms,
         "chunks": chunks,
         "emitted_frames": emitted_frames,
+        "native_generated_frames": native_generated_frames,
         "tokens_per_second": (emitted_frames / (elapsed_ms / 1000.0)) if elapsed_ms > 0 else 0.0,
+        "codec_tps_e2e": (emitted_frames / (elapsed_ms / 1000.0)) if elapsed_ms > 0 else 0.0,
+        "codec_tps_post_ttft": codec_tps_post_ttft,
+        "codec_tps_codegen": codec_tps_codegen,
+        "codegen_decode_share": codegen_decode_share,
+        "codegen_subcode_share": codegen_subcode_share,
+        "codegen_prefill_step_mean_ms": prefill_step_stats.get("mean_ms"),
+        "codegen_decode_step_mean_ms": decode_step_stats.get("mean_ms"),
+        "codegen_decode_step_p50_ms": decode_step_stats.get("p50_ms"),
+        "codegen_decode_step_p90_ms": decode_step_stats.get("p90_ms"),
+        "codegen_decode_step_max_ms": decode_step_stats.get("max_ms"),
+        "subcode_infer_step_mean_ms": subcode_infer_step_stats.get("mean_ms"),
+        "subcode_infer_step_p50_ms": subcode_infer_step_stats.get("p50_ms"),
+        "subcode_infer_step_p90_ms": subcode_infer_step_stats.get("p90_ms"),
+        "subcode_infer_step_max_ms": subcode_infer_step_stats.get("max_ms"),
+        "codegen_bind_step_mean_ms": bind_step_stats.get("mean_ms"),
+        "codegen_sampling_step_mean_ms": sampling_step_stats.get("mean_ms"),
+        "subcode_output_read_step_mean_ms": subcode_output_read_step_stats.get("mean_ms"),
+        "subcode_next_embed_step_mean_ms": subcode_next_embed_step_stats.get("mean_ms"),
         "stream_rtf": stream_rtf,
         "stream_compute_rtf": stream_compute_rtf,
         "decode_path": audio_timings.get("decode_path"),
@@ -1662,6 +1903,9 @@ def run_profile(name: str, args: argparse.Namespace) -> dict:
         "inline_decode_ms": native_timing.get("inline_decode_ms"),
         "decode_queue_wait_ms": native_timing.get("decode_queue_wait_ms"),
         "decode_queue_depth_max": native_timing.get("decode_queue_depth_max"),
+        "native_ttft_ms": native_timing.get("ttft_ms"),
+        "native_last_token_ms": native_timing.get("last_token_ms"),
+        "native_generated_frames_timing": native_timing.get("generated_frames"),
         "pcm_convert_ms": audio_timings.get("pcm_convert_ms"),
         "paged_kv": bool(audio_timings.get("paged_kv", False)),
         "paged_kv_backend": audio_timings.get("paged_kv_backend"),
@@ -1674,6 +1918,10 @@ def run_profile(name: str, args: argparse.Namespace) -> dict:
         "paged_kv_cache_input_precision": audio_timings.get("paged_kv_cache_input_precision"),
         "paged_kv_score_aggregation": audio_timings.get("paged_kv_score_aggregation"),
         "paged_kv_split_subcode": audio_timings.get("paged_kv_split_subcode"),
+        "codegen_fusion": audio_timings.get("codegen_fusion"),
+        "codegen_fusion_requested": audio_timings.get("codegen_fusion_requested"),
+        "codegen_fusion_fallback": audio_timings.get("codegen_fusion_fallback"),
+        "codegen_fusion_reason": audio_timings.get("codegen_fusion_reason"),
         "selected_paged_split_subcode_graph": audio_timings.get("selected_paged_split_subcode_graph"),
         "hybrid_paged_kv": bool(audio_timings.get("hybrid_paged_kv", False)),
         "hybrid_phase": audio_timings.get("hybrid_phase"),
@@ -1682,11 +1930,25 @@ def run_profile(name: str, args: argparse.Namespace) -> dict:
         "native_buffer_reuse": native_timing.get("buffer_reuse"),
         "native_kv_cache_tensor_reuse": native_timing.get("kv_cache_tensor_reuse"),
         "native_paged_static_decode_enabled": native_timing.get("paged_static_decode_enabled"),
+        "native_paged_static_decode_requested": native_timing.get("paged_static_decode_requested"),
         "native_paged_static_decode_mode": native_timing.get("paged_static_decode_mode"),
+        "native_paged_static_decode_failure": native_timing.get("paged_static_decode_failure"),
         "native_no_repeat_fast_path": native_timing.get("no_repeat_fast_path"),
         "host_prepare_ms": native_timing.get("host_prepare_ms"),
         "tensor_bind_ms": native_timing.get("tensor_bind_ms"),
         "codegen_infer_ms": native_timing.get("codegen_infer_ms"),
+        "codegen_prefill_infer_ms": native_timing.get("codegen_prefill_infer_ms"),
+        "codegen_decode_infer_ms": native_timing.get("codegen_decode_infer_ms"),
+        "codegen_subcode_infer_ms": native_timing.get("codegen_subcode_infer_ms"),
+        "subcode_bind_ms": native_timing.get("subcode_bind_ms"),
+        "subcode_output_read_ms": native_timing.get("subcode_output_read_ms"),
+        "subcode_next_embed_ms": native_timing.get("subcode_next_embed_ms"),
+        "subcode_host_copy_bytes": native_timing.get("subcode_host_copy_bytes"),
+        "subcode_host_copy_fallback_count": native_timing.get("subcode_host_copy_fallback_count"),
+        "subcode_outputs_next_embed": native_timing.get("subcode_outputs_next_embed"),
+        "codegen_prefill_count": native_timing.get("codegen_prefill_count"),
+        "codegen_decode_count": native_timing.get("codegen_decode_count"),
+        "codegen_subcode_count": native_timing.get("codegen_subcode_count"),
         "decode_infer_ms": native_timing.get("decode_infer_ms"),
         "native_callback_ms": native_timing.get("callback_ms"),
         "unroll_fallback": bool(audio_timings.get("unroll_fallback", False)),
@@ -1714,12 +1976,12 @@ def worker_command(args: argparse.Namespace, profile: str) -> list[str]:
         profile,
         "--runs",
         "1",
-        "--text",
-        args.text,
         "--instruct",
         args.instruct,
         "--language",
         args.language,
+        "--case-name",
+        args.case_name,
         "--chunk-strategy",
         args.chunk_strategy,
         "--preferred-cache-bucket",
@@ -1739,6 +2001,10 @@ def worker_command(args: argparse.Namespace, profile: str) -> list[str]:
         "--output-json",
         "",
     ]
+    if args.text_file:
+        cmd.extend(["--text-file", str(args.text_file)])
+    else:
+        cmd.extend(["--text", args.text])
     if args.native_ov_profile:
         cmd.append("--native-ov-profile")
     if args.decoder_device:
@@ -1815,6 +2081,8 @@ def main() -> None:
     parser.add_argument("--profile-set", default=None, choices=sorted(PROFILE_SETS))
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--text", default=DEFAULT_TEXT)
+    parser.add_argument("--text-file", default=None)
+    parser.add_argument("--case-name", default="default")
     parser.add_argument("--instruct", default=DEFAULT_INSTRUCT)
     parser.add_argument("--language", default="Chinese")
     parser.add_argument("--chunk-strategy", default="smooth", choices=["realtime", "low_latency", "smooth", "balanced", "stable"])
@@ -1832,6 +2100,13 @@ def main() -> None:
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--worker-profile", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.text_file:
+        text_path = Path(args.text_file)
+        args.text = text_path.read_text(encoding="utf-8").strip()
+        if args.case_name == "default":
+            args.case_name = text_path.stem
+    if not args.text:
+        raise ValueError("benchmark text is empty")
 
     if args.worker:
         profile = args.worker_profile or parse_csv(args.profiles)[0]

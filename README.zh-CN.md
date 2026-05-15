@@ -95,6 +95,7 @@ uv run python -m qwen3_tts_ov serve \
 - talker seed 图使用 `int8_sym_paged_talker_split`。
 - cached subcode 图保持 FP16，优先保证音质稳定。
 - KV cache 默认使用 U8 paged-KV 存储，显存占用约为 FP16 KV cache 的一半；可用 `--kv-cache-profile fp16` 回到保守路径。
+- OpenVINO GPU 编译默认设置 `DYNAMIC_QUANTIZATION_GROUP_SIZE=32`，这是当前验证过的最快 codegen 配置。
 - 流式输出 mono 24 kHz `pcm_s16le`。
 - 长文本使用完整上下文全自回归生成；runtime 只把音频切块给播放器，不默认切分输入文本。
 - 长文本 prompt 预算默认 `auto`：GPU 路径会根据模型上下文、KV/cache-input 精度和 `--max-vram-ratio` 计算 token 上限；CPU-only 使用保守固定预算。超长输入可通过 `--max-continuous-prompt-tokens` 显式覆盖。
