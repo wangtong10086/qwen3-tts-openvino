@@ -17,6 +17,7 @@ English entry: [Documentation](README.md). 示例入口：[examples](../examples
 ## 文档列表
 
 - [Release 使用说明](release_zh.md)
+- [Release Notes](releases/README.zh-CN.md)
 - [Quick Start](quick_start_zh.md)
 - [运行接口](runtime_zh.md)
 - [导出与构建](export_zh.md)

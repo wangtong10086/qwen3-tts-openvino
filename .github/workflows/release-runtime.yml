@@ -222,11 +222,37 @@ jobs:
           cat > release-notes.md <<EOF
           Runtime-minimal sidecar release for Qwen3-TTS OpenVINO.
 
-          Assets:
+          ## Assets
+
           - Linux x64 runtime package
           - Windows x64 runtime package
 
-          This release contains runtime packages only. Model weights are not included. If no local OpenVINO IR is found, the server automatically downloads the public VoiceDesign OpenVINO IR from Hugging Face on first start.
+          The GitHub Release contains runtime applications only. Model weights,
+          exported OpenVINO IR, generated audio, and OpenVINO compile caches are
+          not included.
+
+          ## Model Artifacts
+
+          The runtime downloads compiled OpenVINO IR from the public Hugging Face
+          model repository when a local model directory is missing:
+
+          - Model repo: https://huggingface.co/waston10086/qwen3-tts-openvino-voice-design
+          - Runtime subdirectory: openvino_realtime/
+          - Included modes: voice_design, custom_voice, and base for VoiceClone
+
+          ## Runtime Scope
+
+          This package exposes the local sidecar server, Web Demo, WebSocket
+          streaming API, HTTP streaming API, non-streaming WAV API, and
+          OpenAI-compatible /v1/audio/speech endpoint.
+
+          The production runtime uses the fastest profile, native OpenVINO
+          codegen, paged KV cache, runtime-minimal IR, and the vLLM-like online
+          batching scheduler. Windows Intel GPU+NPU users can optionally test
+          heterogeneous execution with --npu-offload.
+
+          For detailed version-specific notes, see docs/releases/ in the source
+          repository.
           EOF
 
           flags=()

@@ -21,6 +21,7 @@ and [examples](../examples/README.md) provide English entry points.
 ## Documents
 
 - [Release usage](release_zh.md)
+- [Release notes](releases/v0.1.4.md)
 - [Source quick start](quick_start_zh.md)
 - [Runtime APIs](runtime_zh.md)
 - [Export and build](export_zh.md)
