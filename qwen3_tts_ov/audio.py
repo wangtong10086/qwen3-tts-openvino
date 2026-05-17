@@ -1,6 +1,7 @@
 import base64
 import io
 import urllib.request
+from importlib import import_module
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -48,7 +49,7 @@ def load_audio(audio, target_sr: int, sr: int | None = None) -> np.ndarray:
                 source_sr = int(read_sr)
             except Exception as exc:
                 try:
-                    import librosa
+                    librosa = import_module("librosa")
                 except Exception as import_exc:
                     raise RuntimeError(
                         f"failed to read audio with soundfile: {item}. "

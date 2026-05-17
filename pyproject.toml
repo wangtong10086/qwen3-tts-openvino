@@ -1,6 +1,6 @@
 [project]
 name = "qwen3-tts-openvino"
-version = "0.1.3"
+version = "0.1.4"
 description = "OpenVINO runtime and exporter for Qwen3-TTS 12 Hz models."
 readme = "README.md"
 requires-python = ">=3.12"
