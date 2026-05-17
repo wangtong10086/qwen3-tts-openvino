@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from qwen3_tts_ov.cache import build_ov_cache_config, default_ov_cache_root, normalize_ov_cache_mode, resolve_ov_cache_dir
-from qwen3_tts_ov.cache_warmup import collect_warmup_tasks, select_buckets
+from qwen3_tts_ov.cache_warmup import collect_warmup_tasks, select_buckets, subprocess_base_args
 from qwen3_tts_ov.cli import apply_native_env, apply_profile_defaults
 from qwen3_tts_ov.manifest import resolve_ir_dir
 from qwen3_tts_ov.profiles import (
@@ -119,6 +119,36 @@ def test_cache_warmup_prefers_common_low_latency_bucket():
     assert select_buckets(available, "warmup") == {112: "cache112.xml"}
 
 
+def test_cache_warmup_subprocess_preserves_npu_offload():
+    args = SimpleNamespace(
+        ir_dir="openvino/voice_design",
+        device="GPU",
+        decoder_device="NPU",
+        encoder_device="NPU",
+        prompt_device="NPU",
+        npu_offload="all",
+        mode="no-cache",
+        cache_kernel="exact",
+        cache_step="fused",
+        graph_variant="int8_sym_paged_talker_split",
+        codegen_unroll=1,
+        codegen_schedule="current",
+        preferred_cache_bucket=0,
+        precision_hint="f16",
+        ov_cache_mode="optimize_speed",
+        ov_cache_dir=None,
+        disable_ov_cache=False,
+        allow_cpu_fallback=False,
+    )
+
+    cmd = subprocess_base_args(args, {})
+
+    assert cmd[cmd.index("--decoder-device") + 1] == "NPU"
+    assert cmd[cmd.index("--encoder-device") + 1] == "NPU"
+    assert cmd[cmd.index("--prompt-device") + 1] == "NPU"
+    assert cmd[cmd.index("--npu-offload") + 1] == "all"
+
+
 def test_resolve_cache_dir_is_namespaced(monkeypatch, tmp_path):
     monkeypatch.setenv("QWEN3_TTS_OV_CACHE_DIR", str(tmp_path / "cache-root"))
     manifest = {"tts_model_type": "voice_design", "graphs": {"text_embedding": "text_embedding.xml"}}
@@ -150,6 +180,20 @@ def test_resolve_cache_dir_is_namespaced(monkeypatch, tmp_path):
 
     assert str(first).startswith(str(tmp_path / "cache-root"))
     assert first != second
+    third = resolve_ov_cache_dir(
+        tmp_path / "ir",
+        manifest,
+        device="GPU",
+        decoder_device="GPU",
+        prompt_device="NPU",
+        mode="cache",
+        cache_kernel="exact",
+        cache_step="fused",
+        graph_variant="fp16",
+        precision_hint="f16",
+        compile_config={},
+    )
+    assert third != first
 
 
 def test_normalize_ov_cache_mode_accepts_cli_values():
@@ -191,6 +235,7 @@ def test_collect_warmup_tasks_uses_strategy_stream_decoders(tmp_path):
 
     labels = [task.label for task in tasks]
     assert "core:text_embedding" in labels
+    assert next(task for task in tasks if task.label == "core:text_embedding").device_role == "prompt"
     assert "stream:c0_t8" in labels
     assert "stream:c25_t12" in labels
     assert "bucket:fused_cache_step_buckets:128" in labels
@@ -242,384 +287,21 @@ def test_cache_warmup_default_auto_uses_local_voice_design(monkeypatch, tmp_path
     assert [task.label for task in tasks] == ["core:text_embedding"]
 
 
-def test_realtime_int8_expands_to_fused_exact_int8_variant():
-    assert effective_runtime_options("realtime-int8", "sdpa", "split", "fp16") == (
-        "cache",
+def test_fastest_profile_expands_to_native_paged_kv_defaults():
+    assert effective_runtime_options("fastest", "sdpa", "split", "fp16") == (
+        "no-cache",
         "exact",
         "fused",
-        "int8_fused",
+        "int8_sym_paged_talker_split",
     )
+    assert effective_codegen_unroll("fastest", "int8_sym_paged_talker_split", "profile") == 1
+    assert effective_codegen_unroll("fastest", "int8_sym_paged_talker_split", "12") == 12
+    assert scheduled_codegen_unrolls("current", 1) == (1,)
 
 
-def test_realtime_int8_sym_expands_to_fused_exact_sym_unroll4():
-    mode, kernel, step, variant = effective_runtime_options("realtime-int8-sym", "sdpa", "split", "fp16")
-
-    assert (mode, kernel, step, variant) == ("cache", "exact", "fused", "int8_sym_fused")
-    assert effective_codegen_unroll("realtime-int8-sym", variant, "profile") == 4
-    assert effective_codegen_unroll("realtime-int8-sym", variant, "1") == 1
-    assert effective_codegen_unroll("realtime-int8-sym", variant, "12") == 12
-    assert scheduled_codegen_unrolls("ll-v2", 4) == (4, 12)
-
-
-def test_rms_realtime_modes_expand_to_fused_variants():
-    assert effective_runtime_options("realtime-fp16-fused-rms", "sdpa", "split", "fp16") == (
-        "cache",
-        "exact",
-        "fused",
-        "fp16_fused_rms",
-    )
-    assert effective_runtime_options("realtime-int8-sym-fused-rms", "sdpa", "split", "fp16") == (
-        "cache",
-        "exact",
-        "fused",
-        "int8_sym_fused_rms",
-    )
-    assert effective_runtime_options("realtime-fp16-sdpa-fused-rms", "exact", "split", "fp16") == (
-        "cache",
-        "sdpa",
-        "fused",
-        "fp16_sdpa_fused_rms",
-    )
-    assert effective_codegen_unroll("cache", "fp16_fused_rms", "profile") == 4
-    assert effective_codegen_unroll("cache", "int8_sym_fused_rms", "profile") == 4
-
-
-def test_cachedsub_realtime_modes_expand_to_fused_variants():
-    assert effective_runtime_options("realtime-fp16-fused-cachedsub", "sdpa", "split", "fp16") == (
-        "cache",
-        "exact",
-        "fused",
-        "fp16_fused_cachedsub",
-    )
-    assert effective_runtime_options("realtime-int8-sym-fused-cachedsub", "sdpa", "split", "fp16") == (
-        "cache",
-        "exact",
-        "fused",
-        "int8_sym_fused_cachedsub",
-    )
-    assert effective_runtime_options("realtime-int8-sym-fused-cachedsub-norepeat", "sdpa", "split", "fp16") == (
-        "cache",
-        "exact",
-        "fused",
-        "int8_sym_fused_cachedsub",
-    )
-    assert effective_runtime_options("realtime-fp16-sdpa-fused-cachedsub", "exact", "split", "fp16") == (
-        "cache",
-        "sdpa",
-        "fused",
-        "fp16_sdpa_fused_cachedsub",
-    )
-    assert effective_runtime_options("realtime-int8-sym-sdpa-fused-cachedsub", "exact", "split", "fp16") == (
-        "cache",
-        "sdpa",
-        "fused",
-        "int8_sym_sdpa_fused_cachedsub",
-    )
-    assert effective_runtime_options("realtime-int8-sym-sdpa-fused-cachedsub-norepeat", "exact", "split", "fp16") == (
-        "cache",
-        "sdpa",
-        "fused",
-        "int8_sym_sdpa_fused_cachedsub",
-    )
-    assert effective_codegen_unroll("cache", "fp16_fused_cachedsub", "profile") == 4
-    assert effective_codegen_unroll("cache", "int8_sym_fused_cachedsub", "profile") == 4
-    assert effective_codegen_unroll("cache", "fp16_sdpa_fused_cachedsub", "profile") == 4
-    assert effective_codegen_unroll("cache", "int8_sym_sdpa_fused_cachedsub", "profile") == 4
-    assert effective_codegen_unroll("realtime-int8-sym-sdpa-fused-cachedsub-norepeat", "fp16", "profile") == 4
-    assert effective_runtime_options("realtime-int8-sym-fused-cachedsub-rms", "sdpa", "split", "fp16") == (
-        "cache",
-        "exact",
-        "fused",
-        "int8_sym_fused_cachedsub_rms",
-    )
-    assert effective_codegen_unroll("cache", "int8_sym_fused_cachedsub_rms", "profile") == 4
-
-
-def test_missing_rms_variant_message_reports_export_and_compression_hints():
-    fp16_hint = missing_graph_variant_message("fp16_fused_rms", "none")
-    int8_hint = missing_graph_variant_message("int8_sym_fused_rms", "fp16_fused_rms")
-
-    assert "--rms-export-mode canonical" in fp16_hint
-    assert "--source-variant fp16_fused_rms" in int8_hint
-    assert "--fused-subcode-mode cached" in missing_graph_variant_message("fp16_fused_cachedsub", "none")
-    assert "--source-variant fp16_fused_cachedsub" in missing_graph_variant_message(
-        "int8_sym_fused_cachedsub",
-        "fp16_fused_cachedsub",
-    )
-    assert "--fused-cache-kernels sdpa" in missing_graph_variant_message(
-        "int8_sym_sdpa_fused_cachedsub",
-        "fp16_sdpa_fused_cachedsub",
-    )
-    assert "--source-variant fp16_fused_cachedsub_rms" in missing_graph_variant_message(
-        "int8_sym_fused_cachedsub_rms",
-        "fp16_fused_cachedsub_rms",
-    )
-
-
-def test_realtime_int8_warmup_uses_int8_fused_bucket(tmp_path):
-    ir_dir = tmp_path / "ir"
-    ir_dir.mkdir()
-    manifest = {
-        "tts_model_type": "voice_design",
-        "graphs": {
-            "fused_cache_step_buckets": {"exact": {"128": "fused_cache_step_exact_cache128.xml"}},
-        },
-        "graph_variants": {
-            "int8_fused": {
-                "graphs": {
-                    "fused_cache_step_buckets": {
-                        "exact": {"128": "fused_cache_step_exact_cache128_int8_fused.xml"}
-                    }
-                }
-            }
-        },
-    }
-    with open(ir_dir / "manifest.json", "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle)
-
-    tasks, _ = collect_warmup_tasks(ir_dir, mode="realtime-int8", graphs="buckets")
-
-    assert len(tasks) == 1
-    assert tasks[0].graph == "fused_cache_step_exact_cache128_int8_fused.xml"
-
-
-def test_realtime_int8_sym_warmup_uses_unroll_variant_bucket(tmp_path):
-    ir_dir = tmp_path / "ir"
-    ir_dir.mkdir()
-    manifest = {
-        "tts_model_type": "voice_design",
-        "graphs": {
-            "fused_cache_step_buckets": {"exact": {"128": "fused_cache_step_exact_cache128.xml"}},
-            "fused_cache_step_unroll_buckets": {
-                "exact": {
-                    "4": {"128": "fused_cache_step_unroll4_exact_cache128.xml"}
-                }
-            },
-        },
-        "graph_variants": {
-            "int8_sym_fused": {
-                "graphs": {
-                    "fused_cache_step_unroll_buckets": {
-                        "exact": {
-                            "4": {"128": "fused_cache_step_unroll4_exact_cache128_int8_sym_fused.xml"}
-                        }
-                    }
-                }
-            }
-        },
-    }
-    with open(ir_dir / "manifest.json", "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle)
-
-    tasks, _ = collect_warmup_tasks(
-        ir_dir,
-        mode="realtime-int8-sym",
-        graphs="buckets",
-        codegen_decode_unroll="auto",
-    )
-
-    assert len(tasks) == 1
-    assert tasks[0].label == "bucket:fused_cache_step_unroll4:128"
-    assert tasks[0].graph == "fused_cache_step_unroll4_exact_cache128_int8_sym_fused.xml"
-
-
-def test_realtime_int8_sym_ll_v2_warmup_includes_initial_and_steady_unrolls(tmp_path):
-    ir_dir = tmp_path / "ir"
-    ir_dir.mkdir()
-    manifest = {
-        "tts_model_type": "voice_design",
-        "graphs": {
-            "fused_cache_step_buckets": {"exact": {"128": "fused_cache_step_exact_cache128.xml"}},
-            "fused_cache_step_unroll_buckets": {
-                "exact": {
-                    "4": {"128": "fused_cache_step_unroll4_exact_cache128.xml"},
-                    "12": {"128": "fused_cache_step_unroll12_exact_cache128.xml"},
-                }
-            },
-        },
-        "graph_variants": {
-            "int8_sym_fused": {
-                "graphs": {
-                    "fused_cache_step_unroll_buckets": {
-                        "exact": {
-                            "4": {"128": "fused_cache_step_unroll4_exact_cache128_int8_sym_fused.xml"},
-                            "12": {"128": "fused_cache_step_unroll12_exact_cache128_int8_sym_fused.xml"},
-                        }
-                    }
-                }
-            }
-        },
-    }
-    with open(ir_dir / "manifest.json", "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle)
-
-    tasks, _ = collect_warmup_tasks(
-        ir_dir,
-        mode="realtime-int8-sym",
-        graphs="buckets",
-        codegen_schedule="ll-v2",
-    )
-
-    assert [task.label for task in tasks] == [
-        "bucket:fused_cache_step_unroll4:128",
-        "bucket:fused_cache_step_unroll12:128",
-    ]
-
-
-def test_realtime_int8_sym_warmup_includes_decode_unroll_bucket(tmp_path):
-    ir_dir = tmp_path / "ir"
-    ir_dir.mkdir()
-    manifest = {
-        "tts_model_type": "voice_design",
-        "graphs": {
-            "fused_cache_step_buckets": {"exact": {"128": "fused_cache_step_exact_cache128.xml"}},
-            "fused_cache_step_unroll_buckets": {
-                "exact": {"4": {"128": "fused_cache_step_unroll4_exact_cache128.xml"}}
-            },
-            "fused_cache_decode_unroll_stateful_mask_buckets": {
-                "exact": {"4": {"128": "fused_cache_decode_unroll4_exact_statefulmask_cache128.xml"}}
-            },
-        },
-        "graph_variants": {
-            "int8_sym_fused": {
-                "graphs": {
-                    "fused_cache_step_unroll_buckets": {
-                        "exact": {"4": {"128": "fused_cache_step_unroll4_exact_cache128_int8_sym_fused.xml"}}
-                    },
-                    "fused_cache_decode_unroll_stateful_mask_buckets": {
-                        "exact": {
-                            "4": {
-                                "128": "fused_cache_decode_unroll4_exact_statefulmask_cache128_int8_sym_fused.xml"
-                            }
-                        }
-                    },
-                }
-            }
-        },
-    }
-    with open(ir_dir / "manifest.json", "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle)
-
-    default_tasks, _ = collect_warmup_tasks(ir_dir, mode="realtime-int8-sym", graphs="buckets")
-    assert [task.label for task in default_tasks] == ["bucket:fused_cache_step_unroll4:128"]
-
-    tasks, _ = collect_warmup_tasks(
-        ir_dir,
-        mode="realtime-int8-sym",
-        graphs="buckets",
-        codegen_decode_unroll="auto",
-    )
-
-    assert [task.label for task in tasks] == [
-        "bucket:fused_cache_step_unroll4:128",
-        "bucket:fused_cache_decode_unroll4:128",
-    ]
-    assert tasks[1].graph == "fused_cache_decode_unroll4_exact_statefulmask_cache128_int8_sym_fused.xml"
-
-
-def test_realtime_int8_sym_norepeat_warmup_uses_norepeat_unroll_and_decode(tmp_path):
-    ir_dir = tmp_path / "ir"
-    ir_dir.mkdir()
-    manifest = {
-        "tts_model_type": "voice_design",
-        "graphs": {
-            "fused_cache_step_unroll_norepeat_buckets": {
-                "exact": {"4": {"96": "fused_cache_step_unroll4_exact_norepeat_cache96.xml"}}
-            },
-            "fused_cache_decode_unroll_norepeat_buckets": {
-                "exact": {"4": {"96": "fused_cache_decode_unroll4_exact_norepeat_cache96.xml"}}
-            },
-        },
-        "graph_variants": {
-            "int8_sym_fused": {
-                "graphs": {
-                    "fused_cache_step_unroll_norepeat_buckets": {
-                        "exact": {"4": {"96": "fused_cache_step_unroll4_exact_norepeat_cache96_int8_sym_fused.xml"}}
-                    },
-                    "fused_cache_decode_unroll_norepeat_buckets": {
-                        "exact": {
-                            "4": {"96": "fused_cache_decode_unroll4_exact_norepeat_cache96_int8_sym_fused.xml"}
-                        }
-                    },
-                }
-            }
-        },
-    }
-    with open(ir_dir / "manifest.json", "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle)
-
-    tasks, _ = collect_warmup_tasks(
-        ir_dir,
-        mode="realtime-int8-sym-norepeat",
-        graphs="buckets",
-        codegen_decode_unroll="auto",
-        preferred_cache_bucket=96,
-    )
-
-    assert [task.label for task in tasks] == [
-        "bucket:fused_cache_step_unroll4:96",
-        "bucket:fused_cache_decode_unroll4:96",
-    ]
-    assert tasks[0].graph == "fused_cache_step_unroll4_exact_norepeat_cache96_int8_sym_fused.xml"
-    assert tasks[1].graph == "fused_cache_decode_unroll4_exact_norepeat_cache96_int8_sym_fused.xml"
-
-
-def test_realtime_int8_sym_warmup_includes_large_decode_unroll_bucket(tmp_path):
-    ir_dir = tmp_path / "ir"
-    ir_dir.mkdir()
-    manifest = {
-        "tts_model_type": "voice_design",
-        "graphs": {
-            "fused_cache_step_unroll_buckets": {
-                "exact": {"12": {"128": "fused_cache_step_unroll12_exact_cache128.xml"}}
-            },
-            "fused_cache_decode_unroll_stateful_mask_buckets": {
-                "exact": {"12": {"128": "fused_cache_decode_unroll12_exact_statefulmask_cache128.xml"}}
-            },
-        },
-        "graph_variants": {
-            "int8_sym_fused": {
-                "graphs": {
-                    "fused_cache_step_unroll_buckets": {
-                        "exact": {"12": {"128": "fused_cache_step_unroll12_exact_cache128_int8_sym_fused.xml"}}
-                    },
-                    "fused_cache_decode_unroll_stateful_mask_buckets": {
-                        "exact": {
-                            "12": {
-                                "128": "fused_cache_decode_unroll12_exact_statefulmask_cache128_int8_sym_fused.xml"
-                            }
-                        }
-                    },
-                }
-            }
-        },
-    }
-    with open(ir_dir / "manifest.json", "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle)
-
-    tasks, _ = collect_warmup_tasks(
-        ir_dir,
-        mode="realtime-int8-sym",
-        graphs="buckets",
-        codegen_unroll=12,
-        codegen_decode_unroll="auto",
-    )
-
-    assert [task.label for task in tasks] == [
-        "bucket:fused_cache_step_unroll12:128",
-        "bucket:fused_cache_decode_unroll12:128",
-    ]
-    assert tasks[1].graph == "fused_cache_decode_unroll12_exact_statefulmask_cache128_int8_sym_fused.xml"
-
-
-def test_realtime_int8_missing_variant_reports_compression_hint(tmp_path):
-    ir_dir = tmp_path / "ir"
-    ir_dir.mkdir()
-    with open(ir_dir / "manifest.json", "w", encoding="utf-8") as handle:
-        json.dump({"tts_model_type": "voice_design", "graphs": {}}, handle)
-
-    with pytest.raises(ValueError, match="compress_openvino_weights.py"):
-        collect_warmup_tasks(ir_dir, mode="realtime-int8", graphs="buckets")
+def test_missing_fastest_variant_message_reports_production_hint():
+    hint = missing_graph_variant_message("int8_sym_paged_talker_split", "none")
+    assert "--preset fastest" in hint
 
 
 def test_runtime_bucket_loader_prefers_int8_fused_variant():
@@ -648,15 +330,14 @@ def test_cache_warmup_select_buckets_uses_preferred_cache_bucket():
 
 def test_runtime_codegen_schedule_selects_low_latency_then_steady_unroll():
     runtime = object.__new__(OpenVINOQwen3TTS)
-    runtime.codegen_schedule = "ll-v2"
-    runtime.codegen_unroll = 4
+    runtime.codegen_schedule = "current"
+    runtime.codegen_unroll = 1
     runtime.fused_cache_unroll_bucket_graphs_by_step = {
-        4: {128: "u4.xml"},
-        12: {128: "u12.xml"},
+        1: {128: "u1.xml"},
     }
 
-    assert runtime.select_codegen_unroll_for_step(0) == 4
-    assert runtime.select_codegen_unroll_for_step(8) == 12
+    assert runtime.select_codegen_unroll_for_step(0) == 1
+    assert runtime.select_codegen_unroll_for_step(8) == 1
 
 
 def test_runtime_unroll_bucket_loader_prefers_variant():

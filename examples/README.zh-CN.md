@@ -2,9 +2,54 @@
 
 这些示例只包含小型文本 JSON，不包含真实模型、IR、音频或私有路径。
 
+English version: [README.md](README.md)。
+
 ## 前置条件
 
-先按 [Quick Start](../docs/quick_start_zh.md) 构建 `fastest` 所需 IR，确认 `openvino/voice_design/manifest.json` 存在。
+Release 用户直接启动预编译服务；源码开发者先按 [Quick Start](../docs/quick_start_zh.md) 构建 `fastest` 所需 IR。
+
+Release 包：
+
+```bash
+./qwen3-tts-ov-server --device GPU
+```
+
+源码服务：
+
+```bash
+uv run python -m qwen3_tts_ov serve \
+  --model-root openvino \
+  --device GPU \
+  --realtime-profile fastest
+```
+
+默认服务地址是 `http://127.0.0.1:17860`。
+
+## Python 客户端
+
+整段 WAV：
+
+```bash
+python examples/python/http_tts_wav.py \
+  --text "你好，这是一个 HTTP WAV 示例。" \
+  --output outputs/example_http.wav
+```
+
+WebSocket 流式 PCM，写为 WAV：
+
+```bash
+uv run --with websockets python examples/python/websocket_stream_pcm.py \
+  --request examples/stream_request.example.json \
+  --output outputs/example_ws.wav
+```
+
+OpenAI-compatible Speech API：
+
+```bash
+python examples/python/openai_speech.py \
+  --request examples/openai_speech_request.example.json \
+  --output outputs/example_openai.pcm
+```
 
 ## 批处理 JSONL
 
@@ -12,7 +57,7 @@
 
 ```bash
 uv run python -m qwen3_tts_ov batch \
-  --ir-dir openvino/voice_design \
+  --ir-dir auto \
   --realtime-profile fastest \
   --batch-jsonl examples/requests.example.jsonl \
   --output-dir outputs/batch

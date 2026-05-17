@@ -1,0 +1,43 @@
+{
+  "feature": "sampled_online_default",
+  "policy": "sampled-online",
+  "passed": true,
+  "quality_passed": true,
+  "created_at_unix": 1778879857.2755725,
+  "quality": {
+    "path": "outputs/online_batch_quality_sampled_on_128/quality_summary.json",
+    "passed": true,
+    "reason": "summary_passed",
+    "omni_judge": true,
+    "batch_size": 4,
+    "max_new_tokens": 128,
+    "ttft_ms_p90": 1090.599,
+    "aggregate_rtf": 0.514
+  },
+  "online_benchmark": {
+    "path": "outputs/online_batch/benchmark_sampled_batch_on_gpu.json",
+    "passed": true,
+    "reason": "online_benchmark_passed",
+    "runs": 16,
+    "largest_batch": 8,
+    "worst_ttft_p90_ms": 1355.018138885498,
+    "best_aggregate_tps": 60.16541761468121
+  },
+  "single_arch_gate": {
+    "path": "outputs/single_arch_gate/quality_summary.json",
+    "passed": false,
+    "reason": "not_run_after_single_arch_consolidation"
+  },
+  "generation_defaults": {
+    "do_sample": true,
+    "top_k": 50,
+    "top_p": 1.0,
+    "temperature": 0.9,
+    "repetition_penalty": 1.05
+  },
+  "notes": [
+    "Validated on the project reference Intel GPU environment.",
+    "Sampled/repetition online requests use native continuous batching with the batch-safe subcode graph when the IR provides it.",
+    "Server sampled-batch-subcode=auto falls back to row-by-row subcode only for older IRs that do not include the batch subcode graph."
+  ]
+}

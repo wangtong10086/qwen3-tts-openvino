@@ -624,10 +624,13 @@ def extract_json_object(text: str) -> dict[str, Any]:
     content = re.sub(r"^```(?:json)?\s*", "", content, flags=re.IGNORECASE)
     content = re.sub(r"\s*```$", "", content)
     start = content.find("{")
-    end = content.rfind("}")
-    if start < 0 or end < start:
+    if start < 0:
         raise ValueError(f"no JSON object found in Omni response: {content[:200]}")
-    return json.loads(content[start : end + 1])
+    decoder = json.JSONDecoder(strict=False)
+    parsed, _ = decoder.raw_decode(content[start:])
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Omni response JSON is not an object: {content[:200]}")
+    return parsed
 
 
 def normalize_omni_result(raw: dict[str, Any], *, segment_label: str) -> dict[str, Any]:

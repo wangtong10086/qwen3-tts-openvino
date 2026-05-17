@@ -1,0 +1,136 @@
+name: windows-gpu-npu-runtime
+
+on:
+  push:
+    branches:
+      - "test/windows-gpu-npu-*"
+      - "test/windows-gpu-npu-path"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Runtime package version suffix
+        required: true
+        default: gpu-npu-runtime
+
+concurrency:
+  group: windows-gpu-npu-runtime-${{ github.ref_name || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            version="${{ inputs.version }}"
+          else
+            safe_ref="$(echo "${GITHUB_REF_NAME:-branch}" | tr -c 'A-Za-z0-9._-' '-' | sed -E 's/^-+|-+$//g' | cut -c1-40)"
+            version="ci-${safe_ref:-branch}-${GITHUB_SHA:0:7}"
+          fi
+          if [[ -z "${version}" ]]; then
+            echo "invalid empty version" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra native --extra server --extra release --extra dev
+      - name: Run static checks
+        run: |
+          uv run ruff check qwen3_tts_ov scripts tests
+          uv run ty check
+      - name: Compile Python modules
+        run: uv run python -m py_compile qwen3_tts_ov/*.py scripts/*.py
+      - name: Run Windows GPU+NPU path unit tests
+        run: uv run pytest -q tests/test_windows_gpu_npu_path.py
+
+  build-runtime:
+    needs:
+      - prepare
+      - validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            archive_ext: tar.zst
+            smoke_port: 17970
+            native_backend: direct
+            package_shell: bash
+          - os: windows-latest
+            target: windows-x64
+            archive_ext: zip
+            smoke_port: 17971
+            native_backend: cmake
+            package_shell: powershell
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra native --extra server --extra release
+      - name: Build native runtime
+        run: uv run python scripts/build_native_codegen.py --backend ${{ matrix.native_backend }}
+      - name: Package runtime
+        if: matrix.package_shell == 'bash'
+        shell: bash
+        run: |
+          uv run python scripts/package_release.py \
+            --target ${{ matrix.target }} \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --profile runtime-minimal
+      - name: Package runtime
+        if: matrix.package_shell == 'powershell'
+        shell: powershell
+        run: |
+          uv run python scripts/package_release.py `
+            --target ${{ matrix.target }} `
+            --version "${{ needs.prepare.outputs.version }}" `
+            --profile runtime-minimal
+      - name: Smoke release package
+        shell: bash
+        run: |
+          uv run python scripts/smoke_release_package.py \
+            --archive "dist/release/qwen3-tts-ov-server-${{ matrix.target }}-${{ needs.prepare.outputs.version }}-runtime-minimal.${{ matrix.archive_ext }}" \
+            --work-dir "build/release-smoke-${{ matrix.target }}" \
+            --port ${{ matrix.smoke_port }} \
+            --exe-path-out "build/release-smoke-${{ matrix.target }}/exe_path.txt"
+      - name: Verify Windows executable from cmd
+        if: matrix.os == 'windows-latest'
+        shell: cmd
+        run: |
+          set /p EXE=<build\release-smoke-${{ matrix.target }}\exe_path.txt
+          "%EXE%" --help
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qwen3-tts-ov-server-${{ matrix.target }}-${{ needs.prepare.outputs.version }}-smoke-logs
+          path: build/release-smoke-${{ matrix.target }}/server.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qwen3-tts-ov-server-${{ matrix.target }}-${{ needs.prepare.outputs.version }}-runtime-minimal
+          path: dist/release/qwen3-tts-ov-server-${{ matrix.target }}-${{ needs.prepare.outputs.version }}-runtime-minimal.*

@@ -19,12 +19,13 @@ def _is_probably_base64(value: str) -> bool:
 
 
 def load_audio(audio, target_sr: int, sr: int | None = None) -> np.ndarray:
+    source_sr: int | None = sr
     if isinstance(audio, tuple):
         values, source_sr = audio
         values = np.asarray(values, dtype=np.float32)
-        sr = int(source_sr)
+        source_sr = int(source_sr)
     elif isinstance(audio, np.ndarray):
-        if sr is None:
+        if source_sr is None:
             raise ValueError("sr is required when audio is a numpy array")
         values = audio.astype(np.float32, copy=False)
     elif isinstance(audio, (str, Path)):
@@ -33,15 +34,18 @@ def load_audio(audio, target_sr: int, sr: int | None = None) -> np.ndarray:
             with urllib.request.urlopen(item) as response:
                 payload = response.read()
             with io.BytesIO(payload) as handle:
-                values, sr = sf.read(handle, dtype="float32", always_2d=False)
+                values, read_sr = sf.read(handle, dtype="float32", always_2d=False)
+                source_sr = int(read_sr)
         elif _is_probably_base64(item):
             if item.startswith("data:") and "," in item:
                 item = item.split(",", 1)[1]
             with io.BytesIO(base64.b64decode(item)) as handle:
-                values, sr = sf.read(handle, dtype="float32", always_2d=False)
+                values, read_sr = sf.read(handle, dtype="float32", always_2d=False)
+                source_sr = int(read_sr)
         else:
             try:
-                values, sr = sf.read(item, dtype="float32", always_2d=False)
+                values, read_sr = sf.read(item, dtype="float32", always_2d=False)
+                source_sr = int(read_sr)
             except Exception as exc:
                 try:
                     import librosa
@@ -51,17 +55,20 @@ def load_audio(audio, target_sr: int, sr: int | None = None) -> np.ndarray:
                         "Install the optional audio-full extra for broader codec support."
                     ) from import_exc
                 try:
-                    values, sr = librosa.load(item, sr=None, mono=True)
+                    values, read_sr = librosa.load(item, sr=None, mono=True)
+                    source_sr = int(read_sr)
                 except Exception:
                     raise exc
     else:
         raise TypeError(f"unsupported audio input type: {type(audio)!r}")
+    if source_sr is None:
+        raise ValueError("source sample rate could not be determined")
 
     values = np.asarray(values, dtype=np.float32)
     if values.ndim > 1:
         values = np.mean(values, axis=-1)
-    if int(sr) != int(target_sr):
-        values = soxr.resample(values, int(sr), int(target_sr))
+    if source_sr != int(target_sr):
+        values = soxr.resample(values, source_sr, int(target_sr))
     return values.astype(np.float32, copy=False)
 
 

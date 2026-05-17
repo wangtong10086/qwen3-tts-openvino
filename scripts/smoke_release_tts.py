@@ -15,6 +15,48 @@ from pathlib import Path
 from smoke_release_package import extract_archive, find_executable, read_health, tail, terminate_process
 
 
+def parse_device_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def normalize_device_name(value: str | None) -> str:
+    return str(value or "").strip().upper()
+
+
+def device_available(available_devices: list[str], required: str) -> bool:
+    required_name = normalize_device_name(required)
+    if not required_name:
+        return True
+    for item in available_devices:
+        name = normalize_device_name(item)
+        if name == required_name or name.startswith(f"{required_name}."):
+            return True
+    return False
+
+
+def missing_devices(available_devices: list[str], required_devices: list[str]) -> list[str]:
+    return [device for device in required_devices if not device_available(available_devices, device)]
+
+
+def query_openvino_devices() -> tuple[list[str], str | None]:
+    try:
+        import openvino as ov
+
+        return [str(item) for item in ov.Core().available_devices], None
+    except Exception as exc:  # pragma: no cover - depends on local OpenVINO install
+        return [], str(exc)
+
+
+def write_summary(summary: dict, summary_out: str | None) -> None:
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    if summary_out:
+        summary_path = Path(summary_out)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def wait_for_health(url: str, deadline: float) -> dict:
     last_payload = None
     while time.time() < deadline:
@@ -36,6 +78,7 @@ def run_stream_request(url: str, payload: dict, timeout: float) -> dict:
     )
     audio_bytes = 0
     event_types: list[str] = []
+    metadata_event = None
     final_event = None
     with urllib.request.urlopen(request, timeout=timeout) as response:
         for raw_line in response:
@@ -46,6 +89,8 @@ def run_stream_request(url: str, payload: dict, timeout: float) -> dict:
             event_types.append(str(event_type))
             if event_type == "error":
                 raise RuntimeError(str(event.get("message")))
+            if event_type == "metadata":
+                metadata_event = event
             if event_type == "audio":
                 audio_bytes += len(base64.b64decode(event["audio"]))
             if event_type == "final":
@@ -55,7 +100,110 @@ def run_stream_request(url: str, payload: dict, timeout: float) -> dict:
         raise RuntimeError(f"stream produced no audio; event_types={event_types}")
     if final_event is None:
         raise RuntimeError(f"stream did not produce a final event; event_types={event_types}")
-    return {"audio_bytes": audio_bytes, "event_types": event_types, "final": final_event}
+    return {"audio_bytes": audio_bytes, "event_types": event_types, "metadata": metadata_event or {}, "final": final_event}
+
+
+def health_runtime_values(health: dict, key: str) -> list[str]:
+    values: list[str] = []
+    warmup = health.get("warmup")
+    if isinstance(warmup, dict) and warmup.get(key) is not None:
+        values.append(str(warmup[key]))
+    runtimes = health.get("runtimes")
+    if isinstance(runtimes, dict):
+        for runtime in runtimes.values():
+            if isinstance(runtime, dict) and runtime.get(key) is not None:
+                values.append(str(runtime[key]))
+    return values
+
+
+def assert_expected_device(
+    *,
+    label: str,
+    expected: str | None,
+    stream: dict,
+    health: dict,
+    metadata_key: str,
+    health_key: str | None = None,
+) -> None:
+    if not expected:
+        return
+    expected_name = normalize_device_name(expected)
+    candidates = []
+    metadata = stream.get("metadata") if isinstance(stream, dict) else None
+    if isinstance(metadata, dict) and metadata.get(metadata_key) is not None:
+        candidates.append(str(metadata[metadata_key]))
+    candidates.extend(health_runtime_values(health, health_key or metadata_key))
+    if not any(normalize_device_name(value) == expected_name for value in candidates):
+        raise RuntimeError(f"expected {label}={expected_name}, got candidates={candidates!r}")
+
+
+def assert_expected_value(
+    *,
+    label: str,
+    expected: str | None,
+    stream: dict,
+    health: dict,
+    metadata_key: str,
+    health_key: str | None = None,
+) -> None:
+    if not expected:
+        return
+    expected_value = str(expected)
+    candidates = []
+    metadata = stream.get("metadata") if isinstance(stream, dict) else None
+    if isinstance(metadata, dict) and metadata.get(metadata_key) is not None:
+        candidates.append(str(metadata[metadata_key]))
+    candidates.extend(health_runtime_values(health, health_key or metadata_key))
+    if expected_value not in candidates:
+        raise RuntimeError(f"expected {label}={expected_value}, got candidates={candidates!r}")
+
+
+def first_stream_or_health_value(stream: dict, health: dict, key: str, default: str | None = None) -> str | None:
+    metadata = stream.get("metadata") if isinstance(stream, dict) else None
+    if isinstance(metadata, dict) and metadata.get(key) is not None:
+        return str(metadata[key])
+    values = health_runtime_values(health, key)
+    if values:
+        return values[0]
+    return default
+
+
+def exercised_runtime_stages(mode: str, *, x_vector_only: bool = False) -> list[str]:
+    normalized = str(mode or "voice_design").strip().lower().replace("-", "_")
+    stages = ["prompt", "text_embedding", "stream_decoder"]
+    if normalized == "voice_clone":
+        stages.append("speaker_encoder")
+        if not x_vector_only:
+            stages.append("speech_encoder")
+    return stages
+
+
+def npu_offload_coverage(npu_offload: str | None, exercised_stages: list[str]) -> dict:
+    normalized = str(npu_offload or "off").strip().lower().replace("_", "-")
+    if normalized in {"auto", "require"}:
+        normalized = "decoder"
+    exercised = set(exercised_stages)
+    expected = []
+    if normalized in {"decoder", "audio", "all"}:
+        expected.append("stream_decoder")
+    if normalized in {"audio", "all"}:
+        expected.extend(["speech_encoder", "speaker_encoder"])
+    if normalized == "all":
+        expected.extend(["prompt", "text_embedding"])
+    covered = [stage for stage in expected if stage in exercised]
+    missing = [stage for stage in expected if stage not in exercised]
+    return {
+        "expected_npu_stages": expected,
+        "exercised_npu_stages": covered,
+        "unexercised_npu_stages": missing,
+    }
+
+
+def manifest_path_for_mode(model_root: Path, mode: str) -> Path:
+    normalized = str(mode or "voice_design").strip().lower().replace("-", "_")
+    if normalized == "voice_clone":
+        return model_root / "base" / "manifest.json"
+    return model_root / "voice_design" / "manifest.json"
 
 
 def main() -> None:
@@ -70,10 +218,26 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=17970)
     parser.add_argument("--device", default="CPU")
+    parser.add_argument("--decoder-device", default=None)
+    parser.add_argument("--npu-offload", default=None, choices=("off", "auto", "decoder", "audio", "all", "require"))
+    parser.add_argument("--require-devices", default="")
+    parser.add_argument("--skip-if-missing-devices", action="store_true")
+    parser.add_argument("--expect-native-codegen-device", default=None)
+    parser.add_argument("--expect-decoder-device", default=None)
+    parser.add_argument("--expect-encoder-device", default=None)
+    parser.add_argument("--expect-prompt-device", default=None)
+    parser.add_argument("--expect-text-embedding-device", default=None)
+    parser.add_argument("--expect-speech-encoder-device", default=None)
+    parser.add_argument("--expect-speaker-encoder-device", default=None)
+    parser.add_argument("--expect-npu-offload-effective", default=None)
     parser.add_argument("--timeout", type=float, default=900.0)
+    parser.add_argument("--mode", default="voice_design", choices=("voice_design", "voice_clone"))
     parser.add_argument("--text", default="你好。")
     parser.add_argument("--instruct", default="A calm young female voice.")
     parser.add_argument("--language", default="Chinese")
+    parser.add_argument("--ref-audio", default=None)
+    parser.add_argument("--ref-text", default=None)
+    parser.add_argument("--x-vector-only", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument(
         "--do-sample",
@@ -85,13 +249,34 @@ def main() -> None:
     parser.add_argument("--summary-out", default=None)
     args = parser.parse_args()
 
+    available_devices, device_error = query_openvino_devices()
+    required_devices = parse_device_list(args.require_devices)
+    missing = missing_devices(available_devices, required_devices)
+    if missing:
+        summary = {
+            "status": "skipped" if args.skip_if_missing_devices else "failed",
+            "skip_reason": f"missing required OpenVINO devices: {', '.join(missing)}",
+            "required_devices": required_devices,
+            "available_devices": available_devices,
+            "openvino_error": device_error,
+            "device": args.device,
+            "decoder_device": args.decoder_device or args.device,
+            "npu_offload": args.npu_offload,
+        }
+        write_summary(summary, args.summary_out)
+        if args.skip_if_missing_devices:
+            return
+        raise RuntimeError(summary["skip_reason"])
+
     work_dir = Path(args.work_dir).resolve()
     bundle_root = extract_archive(Path(args.archive).resolve(), work_dir / "extracted")
     exe = find_executable(bundle_root)
     model_root = Path(args.model_root).resolve()
-    manifest = model_root / "voice_design" / "manifest.json"
+    if args.mode == "voice_clone" and not args.ref_audio:
+        raise ValueError("--mode voice_clone requires --ref-audio")
+    manifest = manifest_path_for_mode(model_root, args.mode)
     if not manifest.exists():
-        raise FileNotFoundError(f"voice_design manifest not found under model root: {manifest}")
+        raise FileNotFoundError(f"{args.mode} manifest not found under model root: {manifest}")
 
     log_path = work_dir / "server.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,6 +296,10 @@ def main() -> None:
         "--ov-cache-dir",
         str(work_dir / "ov-cache"),
     ]
+    if args.decoder_device:
+        cmd.extend(["--decoder-device", args.decoder_device])
+    if args.npu_offload:
+        cmd.extend(["--npu-offload", args.npu_offload])
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
     try:
@@ -123,27 +312,113 @@ def main() -> None:
             generation["do_sample"] = args.do_sample == "true"
 
         request_payload = {
-            "mode": "voice_design",
+            "mode": args.mode,
             "text": args.text,
             "language": args.language,
-            "instruct": args.instruct,
             "generation": generation,
             "stream": {
                 "chunk_strategy": args.chunk_strategy,
                 "format": "pcm_s16le",
             },
         }
+        if args.mode == "voice_design":
+            request_payload["instruct"] = args.instruct
+        else:
+            request_payload["ref_audio"] = args.ref_audio
+            request_payload["ref_text"] = args.ref_text
+            request_payload["x_vector_only"] = bool(args.x_vector_only)
+        exercised_stages = exercised_runtime_stages(args.mode, x_vector_only=bool(args.x_vector_only))
+        coverage = npu_offload_coverage(args.npu_offload, exercised_stages)
         stream = run_stream_request(
             f"http://{args.host}:{args.port}/v1/tts/stream",
             request_payload,
             timeout=args.timeout,
         )
+        assert_expected_device(
+            label="native_codegen_device",
+            expected=args.expect_native_codegen_device,
+            stream=stream,
+            health=health,
+            metadata_key="native_codegen_device",
+        )
+        assert_expected_device(
+            label="decoder_device",
+            expected=args.expect_decoder_device,
+            stream=stream,
+            health=health,
+            metadata_key="decoder_device",
+        )
+        assert_expected_device(
+            label="encoder_device",
+            expected=args.expect_encoder_device,
+            stream=stream,
+            health=health,
+            metadata_key="encoder_device",
+        )
+        assert_expected_device(
+            label="prompt_device",
+            expected=args.expect_prompt_device,
+            stream=stream,
+            health=health,
+            metadata_key="prompt_device",
+        )
+        assert_expected_device(
+            label="text_embedding_device",
+            expected=args.expect_text_embedding_device,
+            stream=stream,
+            health=health,
+            metadata_key="text_embedding_device",
+        )
+        assert_expected_device(
+            label="speech_encoder_device",
+            expected=args.expect_speech_encoder_device,
+            stream=stream,
+            health=health,
+            metadata_key="speech_encoder_device",
+        )
+        assert_expected_device(
+            label="speaker_encoder_device",
+            expected=args.expect_speaker_encoder_device,
+            stream=stream,
+            health=health,
+            metadata_key="speaker_encoder_device",
+        )
+        assert_expected_value(
+            label="npu_offload_effective",
+            expected=args.expect_npu_offload_effective,
+            stream=stream,
+            health=health,
+            metadata_key="npu_offload_effective",
+        )
+        effective_decoder_device = first_stream_or_health_value(
+            stream,
+            health,
+            "decoder_device",
+            args.decoder_device or args.device,
+        )
         summary = {
+            "status": "ok",
             "executable": str(exe),
             "model_root": str(model_root),
             "device": args.device,
+            "decoder_device": effective_decoder_device,
+            "encoder_device": first_stream_or_health_value(stream, health, "encoder_device", None),
+            "prompt_device": first_stream_or_health_value(stream, health, "prompt_device", None),
+            "text_embedding_device": first_stream_or_health_value(stream, health, "text_embedding_device", None),
+            "speech_encoder_device": first_stream_or_health_value(stream, health, "speech_encoder_device", None),
+            "speaker_encoder_device": first_stream_or_health_value(stream, health, "speaker_encoder_device", None),
+            "native_codegen_device": first_stream_or_health_value(stream, health, "native_codegen_device", None),
+            "npu_offload": args.npu_offload,
+            "npu_offload_effective": first_stream_or_health_value(stream, health, "npu_offload_effective", None),
+            "exercised_runtime_stages": exercised_stages,
+            "npu_offload_coverage": coverage,
+            "required_devices": required_devices,
+            "available_devices": available_devices,
             "request": {
+                "mode": args.mode,
                 "text": args.text,
+                "ref_audio": args.ref_audio,
+                "x_vector_only": bool(args.x_vector_only),
                 "max_new_tokens": args.max_new_tokens,
                 "do_sample": args.do_sample,
                 "chunk_strategy": args.chunk_strategy,
@@ -151,11 +426,7 @@ def main() -> None:
             "health": {"ok": health.get("ok"), "warmup": health.get("warmup", {})},
             "stream": stream,
         }
-        print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
-        if args.summary_out:
-            summary_path = Path(args.summary_out)
-            summary_path.parent.mkdir(parents=True, exist_ok=True)
-            summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_summary(summary, args.summary_out)
     except Exception:
         print("--- server log tail ---", file=sys.stderr)
         print(tail(log_path), file=sys.stderr)

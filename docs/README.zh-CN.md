@@ -1,33 +1,34 @@
 # 文档索引
 
-这是 Qwen3-TTS OpenVINO 仓库的中文文档索引。先按你的角色选择入口，再进入细节文档。
+本项目已收敛为单一生产推理架构：`fastest` profile + native paged-KV + vLLM-like online batching。
 
-## 按角色阅读
+English entry: [Documentation](README.md). 示例入口：[examples](../examples/README.zh-CN.md)。
 
-| 角色 | 先读 | 目的 |
+## 推荐阅读顺序
+
+| 角色 | 先读 | 内容 |
 | --- | --- | --- |
-| 最终用户 | [Release 使用说明](release_zh.md) | 下载 GitHub Release runtime，首次启动自动下载 Hugging Face OpenVINO IR |
-| 源码开发者 | [Quick Start](quick_start_zh.md) | 从 PyTorch 模型导出最快 OpenVINO IR，并启动 Web Demo |
-| 发布维护者 | [开发说明](development_zh.md) | 构建 native、打包 runtime、触发 `release-runtime` |
-| 性能/质量调试 | [流式与长文本](streaming_zh.md) | 理解 full-AR 长文本、流式输出和质量门禁 |
+| 最终用户 | [Release 使用说明](release_zh.md) | 下载预编译 runtime，自动下载 Hugging Face IR，启动 Web Demo |
+| 源码开发者 | [Quick Start](quick_start_zh.md) | 从 PyTorch 模型导出生产 IR，构建 native backend |
+| 集成方 | [运行接口](runtime_zh.md) | HTTP、WebSocket、OpenAI-compatible Speech API |
+| 发布维护者 | [开发说明](development_zh.md) | 本地检查、打包、GitHub Actions release |
+| 性能/质量验证 | [流式与长文本](streaming_zh.md) | full-AR 长文本、online batching、benchmark、Omni gate |
 
-## 入门与部署
+## 文档列表
 
-- [Release 使用说明](release_zh.md): 最终用户部署路径；runtime 来自 GitHub Release，已编译 IR 可自动从 Hugging Face 下载。
-- [Quick Start](quick_start_zh.md): 源码路径；下载 PyTorch 模型，一键构建 fastest IR，启动 Web Demo。
-- [运行接口](runtime_zh.md): CLI、Python API、sidecar、WebSocket、OpenAI-compatible Speech API。
-- [OpenVINO 编译缓存](cache_zh.md): cache warmup、缓存目录、预热策略。
+- [Release 使用说明](release_zh.md)
+- [Quick Start](quick_start_zh.md)
+- [运行接口](runtime_zh.md)
+- [导出与构建](export_zh.md)
+- [流式与长文本](streaming_zh.md)
+- [OpenVINO 编译缓存](cache_zh.md)
+- [大文件与产物策略](artifacts_zh.md)
+- [Windows GPU+NPU 测试路径](windows_gpu_npu_zh.md)
+- [辅助脚本](../scripts/README.zh-CN.md)
+- [native backend](../native/qwen3_tts_ov_genai/README.md)
+- [安全说明](security_zh.md)
+- [示例请求与 Python 客户端](../examples/README.zh-CN.md)
 
-## 开发与发布
+## 已清理内容
 
-- [开发说明](development_zh.md): 源码开发、native 构建、release workflow、本地打包。
-- [导出与压缩](export_zh.md): 手动导出 OpenVINO IR、生成 `int8_sym_paged_talker_split`。
-- [大文件与产物策略](artifacts_zh.md): 模型权重、OpenVINO IR、outputs、native build 的处理规则。
-
-## 参考
-
-- [流式与长文本](streaming_zh.md): 流式协议、浏览器播放、长文本 full-AR、质量门禁。
-- [示例请求](../examples/README.zh-CN.md): JSON、JSONL、OpenAI-compatible 请求样例。
-- [安全说明](security_zh.md): token、`.env`、凭据和提交检查。
-- [辅助脚本](../scripts/README.zh-CN.md): 构建、压缩、benchmark、质量评测脚本说明。
-- [native pipeline](../native/qwen3_tts_ov_genai/README.md): C++ pipeline 和 paged-KV 诊断说明。
+历史 ONNX/XPU、旧 runtime、旧 profile sweep、分段长文本 fallback、旧 benchmark 和 PTQ 对照文档不再作为主仓库入口保留。需要新的性能实验时，应基于当前 `fastest` 生产路径新增小而明确的脚本或记录。

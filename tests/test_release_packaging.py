@@ -174,7 +174,7 @@ def test_package_ir_dry_run(tmp_path):
     assert "qwen3-tts-openvino-ir-voice_design-test.zip" in result.stdout
 
 
-def test_package_ir_runtime_minimal_keeps_only_long_ar_graphs(tmp_path):
+def test_package_ir_runtime_minimal_keeps_only_unified_online_graphs(tmp_path):
     package_ir = load_script("scripts/package_ir.py")
     ir_dir = tmp_path / "ir"
     model_dir = tmp_path / "model"
@@ -195,9 +195,14 @@ def test_package_ir_runtime_minimal_keeps_only_long_ar_graphs(tmp_path):
             "streaming_decoder": {"12": "speech_decoder_stream_c25_t12.xml", "24": "speech_decoder_stream_c25_t24.xml"},
         },
         "graph_variants": {
-            "int8_sym_paged_talker_split": {
+            "int8_sym_batch_fused_gqa": {
                 "precision": "int8_sym_weights",
-                "graphs": {"paged_kv_seed": {"talker_stateful_gqa": "talker_int8.xml"}},
+                "graphs": {
+                    "paged_kv_seed": {
+                        "talker_stateful_batch_gqa": "talker_batch_int8.xml",
+                        "fused_cache_step_batch_gqa": "fused_batch_int8.xml",
+                    }
+                },
             }
         },
         "streaming_decoder": {
@@ -214,12 +219,16 @@ def test_package_ir_runtime_minimal_keeps_only_long_ar_graphs(tmp_path):
         "text_embedding.bin",
         "codec_embedding.xml",
         "codec_embedding.bin",
-        "talker_int8.xml",
-        "talker_int8.bin",
+        "talker_batch_int8.xml",
+        "talker_batch_int8.bin",
+        "fused_batch_int8.xml",
+        "fused_batch_int8.bin",
         "subcode_greedy_cached.xml",
         "subcode_greedy_cached.bin",
         "speech_decoder_stream_c0_t8.xml",
         "speech_decoder_stream_c0_t8.bin",
+        "speech_decoder_stream_c25_t12.xml",
+        "speech_decoder_stream_c25_t12.bin",
         "speech_decoder_stream_c25_t24.xml",
         "speech_decoder_stream_c25_t24.bin",
     ):
@@ -239,19 +248,28 @@ def test_package_ir_runtime_minimal_keeps_only_long_ar_graphs(tmp_path):
         "text_embedding.bin",
         "codec_embedding.xml",
         "codec_embedding.bin",
-        "talker_int8.xml",
-        "talker_int8.bin",
+        "talker_batch_int8.xml",
+        "talker_batch_int8.bin",
         "subcode_greedy_cached.xml",
         "subcode_greedy_cached.bin",
         "speech_decoder_stream_c0_t8.xml",
         "speech_decoder_stream_c0_t8.bin",
+        "speech_decoder_stream_c25_t12.xml",
+        "speech_decoder_stream_c25_t12.bin",
         "speech_decoder_stream_c25_t24.xml",
         "speech_decoder_stream_c25_t24.bin",
     }
     assert set(tokenizer_sources) == {"vocab.json", "merges.txt", "tokenizer_config.json"}
+    assert minimal["production_profile"] == "minimal-online-paged-kv"
     assert minimal["streaming_decoder"]["contexts"] == {
         "0": {"8": "speech_decoder_stream_c0_t8.xml"},
-        "25": {"24": "speech_decoder_stream_c25_t24.xml"},
+        "25": {"12": "speech_decoder_stream_c25_t12.xml", "24": "speech_decoder_stream_c25_t24.xml"},
+    }
+    assert minimal["graphs"]["paged_kv_seed"] == {
+        "talker_stateful_batch_gqa": "talker_batch_int8.xml"
+    }
+    assert minimal["graph_variants"]["int8_sym_batch_fused_gqa"]["graphs"]["paged_kv_seed"] == {
+        "talker_stateful_batch_gqa": "talker_batch_int8.xml"
     }
 
 
@@ -265,11 +283,11 @@ def test_package_ir_runtime_minimal_base_requires_clone_graphs(tmp_path):
             "subcode_greedy_cached": "subcode_greedy_cached.xml",
         },
         "graph_variants": {
-            "int8_sym_paged_talker_split": {
-                "graphs": {"paged_kv_seed": {"talker_stateful_gqa": "talker_int8.xml"}}
+            "int8_sym_batch_fused_gqa": {
+                "graphs": {"paged_kv_seed": {"talker_stateful_batch_gqa": "talker_int8.xml"}}
             }
         },
-        "streaming_decoder": {"contexts": {"0": {"8": "c0.xml"}, "25": {"24": "c25.xml"}}},
+        "streaming_decoder": {"contexts": {"0": {"8": "c0.xml"}, "25": {"12": "c12.xml", "24": "c25.xml"}}},
     }
 
     try:
@@ -297,8 +315,13 @@ def test_upload_hf_ir_defaults_to_runtime_minimal_folder(tmp_path):
             "speech_decoder": {"256": "speech_decoder_t256.xml"},
         },
         "graph_variants": {
-            "int8_sym_paged_talker_split": {
-                "graphs": {"paged_kv_seed": {"talker_stateful_gqa": "talker_int8.xml"}}
+            "int8_sym_batch_fused_gqa": {
+                "graphs": {
+                    "paged_kv_seed": {
+                        "talker_stateful_batch_gqa": "talker_batch_int8.xml",
+                        "fused_cache_step_batch_gqa": "fused_batch_int8.xml",
+                    }
+                }
             }
         },
         "streaming_decoder": {
@@ -328,8 +351,10 @@ def test_upload_hf_ir_defaults_to_runtime_minimal_folder(tmp_path):
         "speech_decoder_stream_c25_t12.bin",
         "speech_decoder_stream_c25_t24.xml",
         "speech_decoder_stream_c25_t24.bin",
-        "talker_int8.xml",
-        "talker_int8.bin",
+        "talker_batch_int8.xml",
+        "talker_batch_int8.bin",
+        "fused_batch_int8.xml",
+        "fused_batch_int8.bin",
     ):
         (ir_dir / rel).write_text(rel, encoding="utf-8")
     for rel in ("vocab.json", "merges.txt", "tokenizer_config.json"):
@@ -346,14 +371,15 @@ def test_upload_hf_ir_defaults_to_runtime_minimal_folder(tmp_path):
     assert info["profile"] == "runtime-minimal"
     assert "speech_decoder_t256.xml" not in uploaded
     assert "speech_decoder_stream_c0_t12.xml" not in uploaded
-    assert "speech_decoder_stream_c25_t12.xml" not in uploaded
+    assert "fused_batch_int8.xml" not in uploaded
     assert "subcode_greedy.xml" not in uploaded
     assert {
         "text_embedding.xml",
         "codec_embedding.xml",
-        "talker_int8.xml",
+        "talker_batch_int8.xml",
         "subcode_greedy_cached.xml",
         "speech_decoder_stream_c0_t8.xml",
+        "speech_decoder_stream_c25_t12.xml",
         "speech_decoder_stream_c25_t24.xml",
         "manifest.json",
         "vocab.json",
@@ -363,7 +389,7 @@ def test_upload_hf_ir_defaults_to_runtime_minimal_folder(tmp_path):
     minimal_manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
     assert minimal_manifest["streaming_decoder"]["contexts"] == {
         "0": {"8": "speech_decoder_stream_c0_t8.xml"},
-        "25": {"24": "speech_decoder_stream_c25_t24.xml"},
+        "25": {"12": "speech_decoder_stream_c25_t12.xml", "24": "speech_decoder_stream_c25_t24.xml"},
     }
 
 
@@ -433,6 +459,7 @@ def test_package_release_dry_run_uses_server_entry_and_native_lib(tmp_path):
     assert payload["profile"] == "runtime-minimal"
     assert payload["native_lib"] == str(native_lib)
     assert "qwen3_tts_ov_server_entry.py" in " ".join(payload["cmd"])
+    assert "qwen3_tts_ov/web_static" in " ".join(payload["cmd"])
     assert "huggingface_hub" in " ".join(payload["cmd"])
     assert "librosa" in " ".join(payload["cmd"])
     assert "scipy" in " ".join(payload["cmd"])

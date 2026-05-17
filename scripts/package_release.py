@@ -80,7 +80,7 @@ def find_native_library(target: str, override: str | None = None) -> Path:
     for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()
-    raise FileNotFoundError(f"native library not found; build it first with `uv run python scripts/build_native_codegen.py`")
+    raise FileNotFoundError("native library not found; build it first with `uv run python scripts/build_native_codegen.py`")
 
 
 def add_data_arg(source: Path, dest: str) -> str:
@@ -205,6 +205,10 @@ def build_pyinstaller_command(args, target: str, native_lib: Path, entry_script:
         "uvicorn.protocols.websockets.auto",
         "--add-binary",
         add_data_arg(native_lib, "native/build"),
+        "--add-data",
+        add_data_arg(REPO_ROOT / "qwen3_tts_ov" / "default_policy_summary.json", "qwen3_tts_ov"),
+        "--add-data",
+        add_data_arg(REPO_ROOT / "qwen3_tts_ov" / "web_static", "qwen3_tts_ov/web_static"),
         str(entry_script),
     ]
     excluded_modules = list(EXCLUDED_DEV_MODULES)
@@ -218,7 +222,7 @@ def build_pyinstaller_command(args, target: str, native_lib: Path, entry_script:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", default=current_target(), choices=["linux-x64", "windows-x64"])
-    parser.add_argument("--version", default="0.1.3")
+    parser.add_argument("--version", default="0.1.4")
     parser.add_argument("--out-dir", default="dist/release")
     parser.add_argument("--work-dir", default="build/release")
     parser.add_argument("--native-lib", default=None)

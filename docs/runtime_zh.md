@@ -1,10 +1,166 @@
 # 运行接口
 
-本页汇总当前生产接口。默认使用 `fastest` profile。
+当前生产路径固定为 `fastest` profile：native C++ codec generation、OpenVINO paged-KV、vLLM-like online batching、长文本 full autoregressive。
+
+## Sidecar
+
+推荐所有桌面应用和 Web 应用通过本地 HTTP/WebSocket sidecar 集成：
+
+```bash
+uv run python -m qwen3_tts_ov serve \
+  --model-root openvino \
+  --device GPU \
+  --realtime-profile fastest \
+  --runtime-residency lazy \
+  --host 127.0.0.1 \
+  --port 17860
+```
+
+默认行为：
+
+- `online_batching=on`
+- `online_batch_scheduler=layered`
+- `runtime_residency=lazy`
+- `kv_cache_profile=auto`，当前等价于 U8 paged-KV
+- 长文本 `full_context_text=true`，不分段生成
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:17860/health
+```
+
+`/health` 会报告模型状态、warmup 状态、KV cache 精度、预分配块数、最大 token 预算、online batching 状态和当前设备。
+
+## Web Demo
+
+打开 `/` 或 `/web` 可以进入本地控制台。当前 demo 覆盖：
+
+- VoiceDesign、CustomVoice、VoiceClone 三种模式。
+- VoiceClone 参考音频上传、路径/URL 和 `ref_text`。
+- 长文本 full-AR token 预算、上下文使用率和显存占比调节。
+- WebSocket 流式播放、WAV 下载、请求 JSON/curl 复制。
+- `/v1/audio/speech` OpenAI-compatible 请求预览。
+- 自定义最终请求 JSON，用于完全客制化调试。
+- `同时请求数`，用于快速观察 online batching 是否工作。
+
+多请求 smoke 只用于交互式排查，正式性能数据仍使用 `scripts/benchmark_prompt_batch_matrix.py`。
+
+## Endpoint 总览
+
+| Endpoint | 方法 | 用途 |
+| --- | --- | --- |
+| `/`、`/web` | GET | Web Demo |
+| `/health` | GET | 服务状态、模型可用性、warmup、KV/cache 预算 |
+| `/v1/models` | GET | 查看 VoiceDesign、CustomVoice、VoiceClone IR 是否就绪和下载状态 |
+| `/v1/models/download` | POST | 触发指定模式 IR 下载 |
+| `/v1/tts/tokenize` | POST | 计算 prompt token 和上下文预算，用于 Web Demo 实时提示 |
+| `/v1/tts` | POST | 返回整段 WAV |
+| `/v1/tts/stream` | POST | HTTP NDJSON 流式返回 metadata/audio/final |
+| `/v1/tts/stream` | WebSocket | 先发请求 JSON，再接收 metadata、PCM binary chunk、final |
+| `/v1/audio/voices` | GET | 返回 CustomVoice speaker 列表和模式可用性 |
+| `/v1/audio/speech` | POST | OpenAI-compatible Speech API |
+
+模型状态与一键下载：
+
+```bash
+curl http://127.0.0.1:17860/v1/models
+
+curl -X POST http://127.0.0.1:17860/v1/models/download \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"voice_clone","sync":false}'
+```
+
+## WebSocket Streaming
+
+Endpoint:
+
+```text
+ws://127.0.0.1:17860/v1/tts/stream
+```
+
+VoiceDesign：
+
+```json
+{
+  "mode": "voice_design",
+  "text": "你好，这是 WebSocket 流式合成。",
+  "language": "Chinese",
+  "instruct": "A calm young female voice.",
+  "generation": {
+    "max_new_tokens": 128
+  },
+  "stream": {
+    "chunk_strategy": "smooth",
+    "format": "pcm_s16le"
+  }
+}
+```
+
+CustomVoice：
+
+```json
+{
+  "mode": "custom_voice",
+  "text": "这是一段自定义说话人测试。",
+  "language": "Chinese",
+  "speaker": "Vivian",
+  "instruct": "自然朗读。",
+  "generation": {
+    "max_new_tokens": 128
+  }
+}
+```
+
+VoiceClone：
+
+```json
+{
+  "mode": "voice_clone",
+  "text": "This is generated with the reference voice.",
+  "language": "English",
+  "ref_audio": "/path/to/reference.wav",
+  "ref_text": "Reference transcript for the audio.",
+  "x_vector_only": false,
+  "generation": {
+    "max_new_tokens": 128
+  }
+}
+```
+
+VoiceClone 使用 Base IR，不能用 VoiceDesign IR 代替。默认 `x_vector_only=false`，即使用参考音频 codec prompt 和 speaker embedding。
+
+## HTTP
+
+整段 WAV：
+
+```bash
+curl -X POST http://127.0.0.1:17860/v1/tts \
+  -H 'Content-Type: application/json' \
+  -o out.wav \
+  -d '{"mode":"voice_design","text":"你好。","language":"Chinese","instruct":"自然朗读。"}'
+```
+
+OpenAI-compatible Speech API：
+
+```bash
+curl -X POST http://127.0.0.1:17860/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -o out.wav \
+  -d '{"model":"qwen3-tts-openvino","voice":"voice_design","input":"你好。","language":"Chinese","instructions":"自然朗读。"}'
+```
+
+Python examples:
+
+```bash
+python examples/python/http_tts_wav.py --output outputs/example_http.wav
+python examples/python/openai_speech.py --output outputs/example_openai.pcm
+uv run --with websockets python examples/python/websocket_stream_pcm.py --output outputs/example_ws.wav
+```
 
 ## CLI
 
-VoiceDesign 流式：
+CLI 保留用于开发验证和批处理。生产集成优先使用 sidecar。
 
 ```bash
 uv run python -m qwen3_tts_ov stream voice-design \
@@ -14,43 +170,10 @@ uv run python -m qwen3_tts_ov stream voice-design \
   --text "你好，这是一次流式 OpenVINO 合成测试。" \
   --instruct "A calm young female voice." \
   --language Chinese \
-  --chunk-dir outputs/stream \
-  --output outputs/stream.wav
+  --output outputs/voice_design.wav
 ```
 
-CustomVoice：
-
-```bash
-uv run python -m qwen3_tts_ov stream custom-voice \
-  --ir-dir openvino/custom_voice \
-  --device GPU \
-  --realtime-profile fastest \
-  --text "其实我真的有发现，我是一个特别善于观察别人情绪的人。" \
-  --speaker Vivian \
-  --instruct "用特别愤怒的语气说" \
-  --language Chinese \
-  --output outputs/custom_voice.wav
-```
-
-VoiceClone：
-
-```bash
-uv run python -m qwen3_tts_ov stream voice-clone \
-  --ir-dir openvino/base \
-  --device GPU \
-  --realtime-profile fastest \
-  --text "I am solving the equation, but it is a disaster." \
-  --language English \
-  --ref-audio /path/to/reference.wav \
-  --ref-text "Reference transcript for the audio." \
-  --output outputs/voice_clone.wav
-```
-
-注意：VoiceClone 不能使用 VoiceDesign IR 代替。它依赖 Base/VoiceClone 导出的参考音频 encoder、speaker encoder、speech tokenizer decoder 和主自回归图，服务端需要能找到 `openvino/base/manifest.json`。公开 Hugging Face IR 已提供 `openvino_realtime/base`，Web Demo 可在缺失时直接下载。
-
-VoiceClone 默认是 ICL 克隆：`x_vector_only=false`，需要同时提供 `--ref-audio` 和准确的 `--ref-text`。这条路径会使用参考音频 codec prompt，更适合保留参考语音的音色、语气和韵律。只有需要做 speaker embedding-only 对照实验时，才显式添加 `--x-vector-only`。
-
-Batch JSONL：
+批处理：
 
 ```bash
 uv run python -m qwen3_tts_ov batch \
@@ -76,142 +199,29 @@ for chunk in tts.stream_voice_design(
         print(chunk.index, chunk.audio.shape, chunk.is_final)
 ```
 
-`from_ir()` 默认使用 `fastest`。低层实验参数请直接调用构造函数或使用 `devtools/`。
+## 性能验证
 
-## Sidecar
-
-启动：
+不同 batch、prompt 长度、在线/离线到达场景：
 
 ```bash
-uv run python -m qwen3_tts_ov serve \
-  --model-root openvino \
+uv run python scripts/benchmark_prompt_batch_matrix.py \
+  --ir-dir openvino/voice_design \
   --device GPU \
-  --realtime-profile fastest \
-  --max-continuous-prompt-tokens auto \
-  --host 127.0.0.1 \
-  --port 17860
+  --profile-set baseline \
+  --batch-sizes 1,2,4,8,16 \
+  --prompt-lengths short,medium,long,xlong \
+  --scenarios offline,online \
+  --runs 3 \
+  --max-new-tokens 96 \
+  --output outputs/online_batch/prompt_batch_matrix.json
 ```
 
-健康检查：
+发布前 gate：
 
 ```bash
-curl http://127.0.0.1:17860/health
+uv run python scripts/evaluate_single_arch_gate.py \
+  --server-url http://127.0.0.1:17860 \
+  --modes voice_design,custom_voice,voice_clone \
+  --runs 3 \
+  --concurrency 1,2,4,8
 ```
-
-默认 `fastest` 路径会启用 U8 paged-KV cache。需要显式确认或降低长文本 token 预算使用的显存比例时：
-
-```bash
-uv run python -m qwen3_tts_ov serve \
-  --model-root openvino \
-  --device GPU \
-  --realtime-profile fastest \
-  --kv-cache-profile u8 \
-  --max-vram-ratio 70
-```
-
-`/health` 中的 `warmup.kv_cache_profile`、`memory.native_paged_kv_precision`、`memory.kv_cache_relative_to_fp16`、`memory.effective_max_total_tokens` 和 `memory.preallocated_kv_blocks` 会显示实际生效配置。
-
-Web Demo：
-
-```text
-http://127.0.0.1:17860/
-```
-
-## WebSocket
-
-Endpoint:
-
-```text
-ws://127.0.0.1:17860/v1/tts/stream
-```
-
-请求示例：
-
-```json
-{
-  "mode": "voice_design",
-  "text": "你好，这是 WebSocket 流式合成。",
-  "language": "Chinese",
-  "instruct": "A calm young female voice.",
-  "generation": {
-    "max_new_tokens": 48
-  },
-  "stream": {
-    "chunk_strategy": "smooth",
-    "format": "pcm_s16le"
-  }
-}
-```
-
-VoiceClone 请求示例：
-
-```json
-{
-  "mode": "voice_clone",
-  "text": "This is generated with the reference voice.",
-  "language": "English",
-  "ref_audio": "/path/to/reference.wav",
-  "ref_text": "Reference transcript for the audio.",
-  "x_vector_only": false,
-  "generation": {
-    "max_new_tokens": 128
-  },
-  "stream": {
-    "chunk_strategy": "smooth",
-    "format": "pcm_s16le"
-  }
-}
-```
-
-`x_vector_only` 省略时也按 `false` 处理。Web Demo 会把历史保存过的旧设置迁移回默认关闭，避免误跳过参考音频 codec prompt。
-
-返回顺序：
-
-1. metadata JSON
-2. 多个 binary `pcm_s16le` 音频块
-3. final JSON
-
-## HTTP NDJSON
-
-```bash
-curl -N http://127.0.0.1:17860/v1/tts/stream \
-  -H "content-type: application/json" \
-  -d @examples/stream_request.example.json
-```
-
-HTTP NDJSON 会把音频块用 base64 放在 JSON 行中，适合不方便处理 WebSocket binary frame 的客户端。
-
-## OpenAI-Compatible Speech API
-
-流式 PCM：
-
-```bash
-curl -N http://127.0.0.1:17860/v1/audio/speech \
-  -H "content-type: application/json" \
-  -d @examples/openai_speech_request.example.json \
-  --output outputs/openai_speech.pcm
-```
-
-非流式 WAV：
-
-```bash
-curl http://127.0.0.1:17860/v1/audio/speech \
-  -H "content-type: application/json" \
-  -d '{"model":"qwen3-tts-openvino","voice":"default","input":"你好，这是一次 WAV 输出测试。","language":"Chinese","task_type":"voice_design","instructions":"A calm young female voice.","stream":false,"response_format":"wav"}' \
-  --output outputs/speech.wav
-```
-
-## 长文本
-
-长文本仍使用同一个 prompt 做完整自回归。服务端可以分块发送音频，但不会默认把文本切成多段独立生成。详细策略见 [streaming_zh.md](streaming_zh.md)。
-
-`--max-continuous-prompt-tokens` 默认值为 `auto`。GPU 路径会使用 KV-cache planner，根据 GPU 总显存、`--max-vram-ratio`、KV/cache-input 精度、block size、模型层数和上下文长度计算 `effective_max_total_tokens`。普通长输出会按请求的 `max_new_tokens` 预留输出空间；full-context 长文本不会按文本长度预估语音 token，而是在精确 tokenizer 后使用 `effective_max_total_tokens - prompt_len - 1` 作为运行时 `max_new_tokens`，生成直到 EOS 或上下文/KV 上限。CPU-only 路径仍使用保守固定预算。
-
-因此 full-context 路径不再依赖 `字数 -> 语音 token` 的估算公式；前端显示的“运行上限”是当前 prompt 后真实可生成的剩余上下文容量。
-
-相关参数：
-
-- `--max-vram-ratio auto|N`: planner 可使用的最大显存比例，例如 `70` 表示 70%。
-- `--kv-cache-reserve-mb auto|N`: 为模型权重、中间 buffer 和驱动保留的显存；默认按 GPU 显存自动保留。
-- `--kv-cache-max-blocks auto|N`: 手动限制 KV block 数，用于调试或规避特定驱动上的 USM 压力。
-- `--kv-cache-preallocation auto|off|static`: `auto` 只计算预算；`static` 同时把计划出的 block 数传给 native static decode 路径。

@@ -63,6 +63,8 @@ def manifest_cache_fingerprint(
     codegen_schedule: str = "current",
     precision_hint: str,
     compile_config: dict | None,
+    encoder_device: str | None = None,
+    prompt_device: str | None = None,
 ) -> str:
     ir_dir = Path(ir_dir)
     manifest_bytes = json.dumps(manifest, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -71,6 +73,8 @@ def manifest_cache_fingerprint(
         "openvino_version": getattr(ov, "__version__", "unknown"),
         "device": device,
         "decoder_device": decoder_device or device,
+        "encoder_device": encoder_device or "",
+        "prompt_device": prompt_device or "",
         "mode": mode,
         "cache_kernel": cache_kernel,
         "cache_step": cache_step,
@@ -92,6 +96,8 @@ def resolve_ov_cache_dir(
     *,
     device: str,
     decoder_device: str | None = None,
+    encoder_device: str | None = None,
+    prompt_device: str | None = None,
     mode: str = "cache",
     cache_kernel: str = "exact",
     cache_step: str = "fused",
@@ -109,12 +115,16 @@ def resolve_ov_cache_dir(
         return Path(ov_cache_dir).expanduser()
     model_type = sanitize_cache_part(manifest.get("tts_model_type") or "qwen3_tts")
     ov_version = sanitize_cache_part(getattr(ov, "__version__", "unknown").split("-")[0])
-    device_part = sanitize_cache_part(f"{device}-{decoder_device or device}")
+    device_part = sanitize_cache_part(
+        f"{device}-{decoder_device or device}-{encoder_device or 'default'}-{prompt_device or 'default'}"
+    )
     fingerprint = manifest_cache_fingerprint(
         ir_dir,
         manifest,
         device=device,
         decoder_device=decoder_device,
+        encoder_device=encoder_device,
+        prompt_device=prompt_device,
         mode=mode,
         cache_kernel=cache_kernel,
         cache_step=cache_step,

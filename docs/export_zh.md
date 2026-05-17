@@ -1,10 +1,8 @@
-# 导出最快路径 IR
+# 导出与构建
 
-生产 profile `fastest` 需要导出 paged-KV talker seed graph、cached standalone subcode graph 和 streaming decoder graph，然后生成 `int8_sym_paged_talker_split` variant。默认生产路径不依赖 fixed-bucket cache、unroll 或 decode-unroll graph。
+推荐使用 `build-fastest`，不要手动拼接旧 profile 或诊断图。
 
-首次使用建议先按 [Quick Start](quick_start_zh.md) 走一键构建。本页用于需要手工控制导出、压缩和验证参数的场景。
-
-## 推荐一键构建
+## 一键构建
 
 ```bash
 uv run python -m qwen3_tts_ov build-fastest \
@@ -13,23 +11,42 @@ uv run python -m qwen3_tts_ov build-fastest \
   --device GPU
 ```
 
-该命令会构建 native、导出缺失 IR、执行 `--preset fastest` 压缩，并预热 OpenVINO cache。使用 `--dry-run` 可先查看具体命令。
+该命令会完成 native build、OpenVINO export、INT8_SYM production variant、minimal online-batching variant 和 cache warmup。
 
-默认 `--graph-set production` 是低内存构建路径。需要额外导出旧的 fixed-bucket/unroll 诊断图时显式添加：
+CustomVoice：
+
+```bash
+uv run python -m qwen3_tts_ov build-fastest \
+  --model-type custom_voice \
+  --model models/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --out-dir openvino/custom_voice \
+  --device GPU
+```
+
+Base/VoiceClone：
+
+```bash
+uv run python -m qwen3_tts_ov build-fastest \
+  --model-type base \
+  --model models/Qwen3-TTS-12Hz-1.7B-Base \
+  --out-dir openvino/base \
+  --device GPU
+```
+
+## 从零重建
 
 ```bash
 uv run python -m qwen3_tts_ov build-fastest \
   --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
   --out-dir openvino/voice_design \
   --device GPU \
-  --graph-set compat
+  --clean \
+  --clean-native
 ```
 
-## 分步导出
+## 手动导出
 
-下面的命令用于调试或需要手工控制导出参数时使用。
-
-## VoiceDesign
+只有在调试 exporter 时才直接使用：
 
 ```bash
 uv run python -m qwen3_tts_ov export \
@@ -41,90 +58,27 @@ uv run python -m qwen3_tts_ov export \
   --cache-kernels exact \
   --fused-cache-kernels exact \
   --fused-subcode-mode cached \
-  --fused-cache-unroll-steps "" \
-  --fused-cache-decode-unroll-steps "" \
-  --fused-cache-stateful-mask-steps "" \
-  --fused-cache-norepeat-steps "" \
   --export-paged-kv-seed \
-  --paged-kv-unroll-steps "" \
-  --paged-kv-subcode-attention-kernels sdpa \
-  --decoder-tokens 256 \
-  --stream-decoder-chunks 12,24 \
-  --stream-decoder-first-chunks 8,12 \
-  --stream-decoder-left-context 25
-```
-
-## CustomVoice
-
-```bash
-uv run python -m qwen3_tts_ov export \
-  --model models/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-  --model-type custom_voice \
-  --out-dir openvino/custom_voice \
-  --skip-fixed-cache-graphs \
-  --cache-buckets 96 \
-  --cache-kernels exact \
-  --fused-cache-kernels exact \
-  --fused-subcode-mode cached \
-  --fused-cache-unroll-steps "" \
-  --fused-cache-decode-unroll-steps "" \
-  --fused-cache-stateful-mask-steps "" \
-  --fused-cache-norepeat-steps "" \
-  --export-paged-kv-seed \
-  --paged-kv-unroll-steps "" \
-  --paged-kv-subcode-attention-kernels sdpa \
-  --decoder-tokens 256 \
-  --stream-decoder-chunks 12,24 \
-  --stream-decoder-first-chunks 8,12 \
-  --stream-decoder-left-context 25
-```
-
-## Base / VoiceClone
-
-```bash
-uv run python -m qwen3_tts_ov export \
-  --model models/Qwen3-TTS-12Hz-1.7B-Base \
-  --model-type base \
-  --out-dir openvino/base \
-  --skip-fixed-cache-graphs \
-  --cache-buckets 96 \
-  --cache-kernels exact \
-  --fused-cache-kernels exact \
-  --fused-subcode-mode cached \
-  --fused-cache-unroll-steps "" \
-  --fused-cache-decode-unroll-steps "" \
-  --fused-cache-stateful-mask-steps "" \
-  --fused-cache-norepeat-steps "" \
-  --export-paged-kv-seed \
-  --paged-kv-unroll-steps "" \
   --paged-kv-subcode-attention-kernels sdpa \
   --decoder-tokens 256 \
   --stream-decoder-chunks 12,24 \
   --stream-decoder-first-chunks 8,12 \
   --stream-decoder-left-context 25 \
-  --export-clone-graphs
+  --stream-decoder-input-shape static
 ```
 
-## INT8_SYM 压缩
-
-对每个 IR 目录运行：
+压缩生产 variant：
 
 ```bash
 uv run python scripts/compress_openvino_weights.py \
   --ir-dir openvino/voice_design \
   --preset fastest
-```
 
-压缩不会覆盖 FP16 原图，会在 manifest 中写入 `graph_variants.int8_sym_paged_talker_split`。
-
-## 验证
-
-```bash
-uv run python -m qwen3_tts_ov cache-warmup \
+uv run python scripts/compress_openvino_weights.py \
   --ir-dir openvino/voice_design \
-  --device GPU \
-  --realtime-profile fastest \
-  --dry-run
+  --preset minimal-online-gqa
 ```
 
-如果缺少必需 graph，`fastest` 会报错。不要通过切换到旧 profile 绕过错误；应重新导出或重新压缩对应 IR。
+## 产物策略
+
+`openvino/` 和 `models/` 不进入 git。公开 release 使用 Hugging Face 上的 runtime-minimal IR，源码仓库只保留导出代码和文档。

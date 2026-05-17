@@ -38,3 +38,4 @@ local-debs/
 local-root/
 compute-runtime-gh-debs/
 compute-runtime-gh-root/
+tmp/

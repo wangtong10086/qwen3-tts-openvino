@@ -42,6 +42,21 @@ def test_extract_json_object_accepts_markdown_fenced_json():
     assert parsed["noise"] == 5
 
 
+def test_extract_json_object_uses_first_complete_object_when_model_adds_extra_json():
+    parsed = quality.extract_json_object(
+        '{"verdict":"pass","intelligibility":4} trailing {"ignored": true}'
+    )
+
+    assert parsed == {"verdict": "pass", "intelligibility": 4}
+
+
+def test_extract_json_object_allows_omni_control_chars():
+    parsed = quality.extract_json_object('{"verdict":"fail","failure_reason":"line one\nline two"}')
+
+    assert parsed["verdict"] == "fail"
+    assert "line two" in parsed["failure_reason"]
+
+
 def test_build_omni_messages_uses_input_audio_data_url():
     messages = quality.build_omni_messages(
         "hello",
@@ -189,3 +204,52 @@ def test_server_can_select_quality_summary_winner(tmp_path):
     assert selected["runtime"] == {"mode": "no-cache", "graph_variant": "fp16"}
     assert selected["profile_env"] == {"native_paged_kv_gqa": "0"}
     assert select_long_text_quality_profile(tmp_path / "other_ir", summary_path) is None
+
+
+def test_default_policy_gate_combines_quality_and_sampled_online_benchmark():
+    namespace = {"__name__": "not_main"}
+    source = Path("scripts/evaluate_default_policy_quality.py").read_text(encoding="utf-8")
+    exec(compile(source, "evaluate_default_policy_quality.py", "exec"), namespace)
+
+    quality_ok, quality_reason = namespace["quality_summary_passed"](
+        {"winner": {"passed": True, "omni": {"pass": True}}},
+        require_omni=True,
+    )
+    online_ok, online_reason, metrics = namespace["online_benchmark_passed"](
+        {
+            "runs": [
+                {
+                    "batch_size": 4,
+                    "do_sample": True,
+                    "ttft_ms_p90": 900.0,
+                    "aggregate_tps": 20.0,
+                    "requests": [{"generated_tokens": 12}],
+                }
+            ]
+        },
+        max_ttft_p90_ms=1500.0,
+        min_aggregate_tps=12.0,
+        require_sampled=True,
+    )
+    single_ok, single_reason, single_metrics = namespace["single_arch_gate_passed"](
+        {
+            "passed": True,
+            "modes": {
+                "voice_design": {"passed": True, "computed_rtf_p90": 0.8, "ttft_ms_p90": 900.0},
+                "custom_voice": {"passed": True, "computed_rtf_p90": 0.9, "ttft_ms_p90": 1000.0},
+                "voice_clone": {"passed": True, "computed_rtf_p90": 0.95, "ttft_ms_p90": 1200.0},
+            },
+        },
+        required_modes=("voice_design", "custom_voice", "voice_clone"),
+        max_rtf_p90=1.0,
+        max_ttft_p90_ms=1500.0,
+    )
+
+    assert quality_ok is True
+    assert quality_reason == "winner_passed"
+    assert online_ok is True
+    assert online_reason == "online_benchmark_passed"
+    assert metrics["largest_batch"] == 4
+    assert single_ok is True
+    assert single_reason == "single_arch_gate_passed"
+    assert single_metrics["voice_clone"]["computed_rtf_p90"] == 0.95

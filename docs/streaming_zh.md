@@ -1,147 +1,95 @@
-# 流式合成与长文本
+# 流式与长文本
 
-本页只说明流式协议、浏览器播放策略和长文本 full-AR 策略。具体 CLI、Python API、HTTP 和 WebSocket 调用方式见 [运行接口](runtime_zh.md)。
+当前实现只保留生产流式路径：完整上下文自回归生成 codec token，音频 decoder 按 chunk 输出给播放器。输入文本不会被自动切段。
 
-## 当前生产路径
+## 流式输出
 
-短文本和长文本共用 `fastest` profile：
+默认输出：
 
-- native C++ pipeline
-- paged-KV seed graph
-- cached standalone subcode graph
-- streaming decoder graph
-- `int8_sym_paged_talker_split` graph variant
+- `pcm_s16le`
+- mono
+- 24 kHz
+- WebSocket binary audio chunk
+- final JSON 包含总耗时、RTF、online batching 统计和 fallback counter
 
-缺少这些图时，`fastest` 应直接报错。不要在生产路径中静默切到 legacy profile，否则 RTF 和音质结论会失真。
-
-## WebSocket 消息顺序
-
-客户端连接 `/v1/tts/stream` 后先发送请求 JSON。服务端返回顺序固定为：
-
-1. metadata JSON
-2. 多个 binary `pcm_s16le` 音频块
-3. final JSON
-
-metadata 会包含 `realtime_profile`、`chunk_strategy`、`recommended_playback_buffer_ms`、`graph_variant`、`paged_kv`、`continuous_long_output`、`effective_max_continuous_prompt_tokens` 等运行状态。前端必须以 final JSON 作为本次合成结束信号，不要用连接关闭或最后一个音频块判断结束。
-
-## 播放缓冲
-
-浏览器 demo 使用 jitter buffer 播放连续 PCM chunk。建议调用方也采用类似策略：
-
-- 首次播放前先累积 `recommended_playback_buffer_ms`。
-- 如果队列低于安全水位，短暂提高目标缓冲，而不是立刻中断播放。
-- 不要对每个 chunk 单独创建 `<audio>` 元素；应把 PCM 连续推入同一条播放队列。
-- final JSON 到达后，等播放队列消耗完再结束 UI 计时。
-
-如果服务端 `stream_rtf < 1.0` 但浏览器仍卡顿，优先检查播放队列是否归零；如果 `stream_rtf >= 1.0`，瓶颈在生成速度。
-
-## 长文本 full-AR
-
-长文本必须保持同一条自回归链路。默认策略是：
-
-- `long_text_mode=full_ar`
-- `segmented=false`
-- `continuous_long_output=true`
-- codec 生成来自同一个 prompt 和同一条 autoregressive 序列
-- decoder 可以按 chunk 输出音频，但不能把文本拆成多个独立 prompt
-
-这样可以避免分段生成导致的音色、语气和韵律不连续。
-
-## VoiceClone 流式
-
-VoiceClone 默认使用 ICL 克隆路径，也就是 `x_vector_only=false`。请求必须提供参考音频和对应的 `ref_text`，服务端会先从参考音频提取 codec prompt 和 speaker embedding，再从同一条自回归链路生成目标文本；流式 decoder 只输出目标文本对应的新音频，不播放参考音频。
-
-`x_vector_only=true` 只适合做 speaker embedding-only 的对照实验。它不会把参考音频 codec prompt 拼入生成上下文，因此通常不如默认 ICL 路径稳定地保留参考音频的韵律和说话风格。
-
-## 长文本 prompt 预算
-
-服务端默认使用 `--max-continuous-prompt-tokens auto` 做推理前保护，避免极长 prompt 在部分 GPU/驱动上触发 OpenVINO USM 分配失败。GPU 路径会根据模型上下文、KV/cache-input 精度、block size、GPU 总显存、`--max-vram-ratio` 和保留显存计算可用 KV blocks；CPU-only 路径使用保守固定预算。
-
-长文本 full-AR 不再根据文本长度预估 `max_new_tokens`。服务端会先计算精确 prompt tokens，再将运行时 `max_new_tokens` 设置为 `effective_max_total_tokens - prompt_len - 1`，让模型生成直到 EOS 或上下文/KV 上限。metadata 中的 `max_generation_tokens_available` 和 `generation_stop_condition=eos_or_context_limit` 可用于确认当前请求的真实生成上限。
-
-如果 metadata 或错误信息显示文本超过预算，可以先提高显存比例或降低保留显存：
-
-```bash
-qwen3-tts-ov-server --device GPU --max-vram-ratio 90 --kv-cache-reserve-mb 1024
-```
-
-也可以显式设置 `--max-continuous-prompt-tokens N`，或设置为 `0` 关闭 prompt 预算保护。关闭后仍不会自动分段，后续如果显存不足会由 OpenVINO/USM 错误和 retry 机制处理。
-
-显存压力主要来自长 prompt 的 paged-KV cache 和运行时中间 buffer。默认生产路径使用 `u8` KV cache；如果需要显式指定或配合更低 prompt 预算，可以启动时使用：
-
-```bash
-qwen3-tts-ov-server --device GPU --kv-cache-profile u8 --max-vram-ratio 70
-```
-
-`u8` 会把 KV cache 存储元素从 FP16 的 2 bytes 降为 1 byte，`/health` 中 `kv_cache_relative_to_fp16` 应显示为 `0.5`。但默认 `u8` 的 cache input 仍为 FP32，planner 会按实际 cache input 做保守预算；需要保守对照时使用 `--kv-cache-profile fp16`，切换到 `u8-all` 前需要重新做长文本质量评测。
-
-流式 metadata 会返回 `effective_max_total_tokens`、`effective_max_continuous_prompt_tokens`、`preallocated_kv_blocks`、`kv_cache_limit_source`。Web Demo 会用 tokenizer 实时计算 prompt token，并用这些字段判断当前文本是否超过预算。
-
-## 长文本采样参数
-
-默认生成参数跟随上游习惯：
-
-- `do_sample=true`
-- `top_k=50`
-- `top_p=1.0`
-- `temperature=0.9`
-- `repetition_penalty>=1.05`
-
-服务端会优先使用 manifest 中的 sampled paged-KV full-AR 加速图。缺图时才回退到 FP16 no-cache sampled reference。
-
-## 质量门禁
-
-部署新 IR、切换硬件或修改生成逻辑后，先跑长文本质量评测：
-
-```bash
-uv pip install -e ".[quality]"
-
-uv run python scripts/evaluate_long_text_quality.py \
-  --ir-dir auto \
-  --device GPU \
-  --text-file examples/long_text_zh.example.txt \
-  --profiles quality \
-  --runs 1
-```
-
-只做本地客观检查时可跳过外部 Omni 评测：
-
-```bash
-uv run python scripts/evaluate_long_text_quality.py \
-  --ir-dir auto \
-  --device GPU \
-  --text-file examples/long_text_zh.example.txt \
-  --profiles quality \
-  --runs 1 \
-  --skip-omni
-```
-
-结果写入 `outputs/long_text_quality/quality_summary.json`。sidecar 会在可用时读取该结果，用于选择长文本 runtime/env 配置。
-
-## 自动分段
-
-自动分段只用于诊断或非常规 fallback，不是默认路径。请求中必须同时传：
+推荐参数：
 
 ```json
 {
-  "auto_segment_text": true,
-  "allow_auto_segment_text": true
+  "stream": {
+    "chunk_strategy": "smooth",
+    "initial_chunk_frames": 8,
+    "chunk_frames": 24,
+    "left_context_frames": 25,
+    "format": "pcm_s16le"
+  }
 }
 ```
 
-或设置 `QWEN3_TTS_OV_ENABLE_AUTO_SEGMENT=1`。分段路径会启动多个短 prompt，不能保证长文本音色和语气连续。
+服务端会根据短文本/长文本和显存预算调整生成上限，但不会通过切分文本绕过上下文限制。
 
-## 性能门禁
+## 长文本策略
 
-短文本实时性能使用 isolated benchmark：
+长文本路径必须满足：
+
+- `full_context_text=true`
+- `segmented=false`
+- `auto_segment_text=false`
+- 生成直到 EOS 或达到显存/上下文预算
+
+Web Demo 会实时显示 tokenizer 统计、上下文使用量、KV cache 预算和已生成 token。用户看到的最大 token 不是“语音必然长度”，只是当前模型上下文和显存允许的上限。
+
+## Online Batching
+
+sidecar 默认启用 native online batching：
 
 ```bash
-uv run python scripts/benchmark_streaming_realtime.py \
-  --ir-dir openvino/voice_design \
+uv run python -m qwen3_tts_ov serve \
+  --model-root openvino \
   --device GPU \
-  --profile-set fastest-gate \
-  --runs 3 \
-  --warmup-generations 1
+  --realtime-profile fastest \
+  --online-batching on \
+  --online-batch-scheduler layered \
+  --online-batch-max-num-batched-tokens 32
 ```
 
-不要用 `PERF_COUNT` 下的结果作为线上 RTF。OpenVINO operator profiling 会显著放慢小图自回归循环，只适合定位算子热点。
+调度层采用 vLLM-like 分层：
+
+- prefill 和 decode 分开调度。
+- decode 使用 active batch bucket。
+- `max_num_batched_tokens` 控制每轮 decode token budget。
+- 并发大于 1 时关注 aggregate TPS/RTF；不要求每个请求单路 RTF 都小于 1。
+
+## 质量与性能 Gate
+
+三模式统一 gate：
+
+```bash
+uv run python scripts/evaluate_single_arch_gate.py \
+  --server-url http://127.0.0.1:17860 \
+  --modes voice_design,custom_voice,voice_clone \
+  --runs 3 \
+  --concurrency 1,2,4,8 \
+  --require-omni
+```
+
+性能矩阵：
+
+```bash
+uv run python scripts/benchmark_prompt_batch_matrix.py \
+  --ir-dir openvino/voice_design \
+  --device GPU \
+  --profile-set baseline \
+  --batch-sizes 1,2,4,8,16 \
+  --prompt-lengths short,medium,long,xlong \
+  --scenarios offline,online \
+  --runs 3
+```
+
+验收重点：
+
+- 并发 1 下三模式 RTF 达标。
+- 长文本仍为 full-AR。
+- metadata 中无 generation fallback、无自动分段。
+- online batching 命中 `scheduler=layered`。
+- Omni gate 通过。

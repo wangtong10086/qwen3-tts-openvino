@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from .default_policy import resolve_generation_defaults
 from .profiles import (
     CODEGEN_SCHEDULE_CHOICES,
     CODEGEN_UNROLL_CHOICES,
@@ -18,7 +19,9 @@ from .profiles import (
     FASTEST_CACHE_KERNEL,
     FASTEST_CACHE_STEP,
     FASTEST_GRAPH_VARIANT,
+    FASTEST_NATIVE_CODEGEN_FUSION,
     FASTEST_NATIVE_CODEGEN_DEVICE,
+    FASTEST_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE,
     FASTEST_MODE,
     FASTEST_NATIVE_BUFFER_REUSE,
     FASTEST_NATIVE_PAGED_KV,
@@ -31,6 +34,7 @@ from .profiles import (
     FASTEST_PREFERRED_CACHE_BUCKET,
     FASTEST_PROFILE_NAME,
     KV_CACHE_PROFILE_CHOICES,
+    NPU_OFFLOAD_CHOICES,
     PUBLIC_REALTIME_PROFILE_CHOICES,
     REALTIME_PROFILE_CHOICES,
     RUNTIME_MODE_CHOICES,
@@ -43,6 +47,7 @@ from .model_download import (
     DEFAULT_RELEASE_MODEL_REVISION,
     DEFAULT_RELEASE_MODEL_SUBDIR,
 )
+from .npu_offload_profile import NPU_OFFLOAD_POLICY_CHOICES, load_npu_offload_profile
 
 
 def add_runtime_args(
@@ -58,6 +63,8 @@ def add_runtime_args(
     )
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
+    parser.add_argument("--encoder-device", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--prompt-device", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--realtime-profile",
         default=FASTEST_PROFILE_NAME,
@@ -103,6 +110,7 @@ def add_runtime_args(
     parser.add_argument("--native-paged-kv-experimental-unroll", default=None, choices=["off", "on"], help=advanced)
     parser.add_argument("--native-paged-kv-subcode-attention", default=None, choices=["auto", "sdpa", "exact"], help=advanced)
     parser.add_argument("--native-paged-kv-split-subcode", default=None, choices=["off", "on"], help=advanced)
+    parser.add_argument("--native-codegen-fusion", default=None, choices=["off", "split", "auto", "graph"], help=advanced)
     parser.add_argument(
         "--native-paged-kv-split-subcode-mode",
         default=None,
@@ -113,15 +121,17 @@ def add_runtime_args(
     parser.add_argument("--native-paged-kv-hybrid", default=None, choices=["off", "on"], help=advanced)
     parser.add_argument("--native-paged-kv-hybrid-prefix-frames", default=None, type=int, help=advanced)
     parser.add_argument("--native-codegen-device", default=None, help=advanced)
+    parser.add_argument("--native-dynamic-quantization-group-size", default=None, type=int, help=advanced)
     parser.add_argument("--native-ov-profile", action="store_true", help=advanced)
     if not include_generation:
         return
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--min-new-tokens", type=int, default=2)
-    parser.add_argument("--repetition-penalty", type=float, default=1.05)
+    parser.add_argument("--repetition-penalty", type=float, default=None)
     parser.add_argument("--max-prompt-tokens", type=int, default=512)
     parser.add_argument("--progress-interval", type=int, default=8)
-    parser.add_argument("--do-sample", action="store_true")
+    parser.add_argument("--do-sample", dest="do_sample", action="store_true", default=None)
+    parser.add_argument("--no-sample", dest="do_sample", action="store_false")
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=0.9)
@@ -135,7 +145,8 @@ def build_runtime(args):
     apply_profile_defaults(args)
     apply_native_env(args)
     cache_step = args.cache_step
-    if getattr(args, "do_sample", False) and args.mode == "cache" and cache_step == "fused":
+    effective_gen = generation_kwargs(args) if hasattr(args, "max_new_tokens") else {}
+    if effective_gen.get("do_sample", False) and args.mode == "cache" and cache_step == "fused":
         cache_step = "split"
     return OpenVINOQwen3TTS(
         args.ir_dir,
@@ -154,6 +165,8 @@ def build_runtime(args):
         ov_cache_mode=args.ov_cache_mode,
         disable_ov_cache=args.disable_ov_cache,
         profile=args.profile,
+        encoder_device=getattr(args, "encoder_device", None),
+        prompt_device=getattr(args, "prompt_device", None) or getattr(args, "native_prompt_device", None),
     )
 
 
@@ -206,8 +219,11 @@ def apply_profile_defaults(args):
         if getattr(args, "native_paged_kv_block_size", None) is None:
             args.native_paged_kv_block_size = FASTEST_NATIVE_PAGED_KV_BLOCK_SIZE
         args.native_paged_kv_split_subcode = FASTEST_NATIVE_PAGED_KV_SPLIT_SUBCODE
+        if getattr(args, "native_codegen_fusion", None) is None:
+            args.native_codegen_fusion = FASTEST_NATIVE_CODEGEN_FUSION
         args.native_paged_kv_score_aggregation = FASTEST_NATIVE_PAGED_KV_SCORE_AGGREGATION
         args.native_codegen_device = FASTEST_NATIVE_CODEGEN_DEVICE
+        args.native_dynamic_quantization_group_size = FASTEST_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE
         apply_kv_cache_profile_defaults(args)
         return
     apply_kv_cache_profile_defaults(args)
@@ -309,6 +325,12 @@ def apply_native_env(args):
         os.environ.pop("QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE", None)
     elif paged_kv_split_subcode == "on":
         os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE"] = "1"
+    native_codegen_fusion = getattr(args, "native_codegen_fusion", None)
+    if native_codegen_fusion:
+        if native_codegen_fusion == "off":
+            os.environ.pop("QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION", None)
+        else:
+            os.environ["QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION"] = str(native_codegen_fusion)
     paged_kv_split_subcode_mode = getattr(args, "native_paged_kv_split_subcode_mode", None)
     if paged_kv_split_subcode_mode:
         os.environ["QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE_MODE"] = str(paged_kv_split_subcode_mode)
@@ -328,24 +350,43 @@ def apply_native_env(args):
     native_codegen_device = getattr(args, "native_codegen_device", None)
     if native_codegen_device:
         os.environ["QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE"] = str(native_codegen_device)
+    native_dynamic_quantization_group_size = getattr(args, "native_dynamic_quantization_group_size", None)
+    if native_dynamic_quantization_group_size is not None:
+        if int(native_dynamic_quantization_group_size) <= 0:
+            os.environ.pop("QWEN3_TTS_OV_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE", None)
+        else:
+            os.environ["QWEN3_TTS_OV_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE"] = str(
+                int(native_dynamic_quantization_group_size)
+            )
     if getattr(args, "native_ov_profile", False):
         os.environ["QWEN3_TTS_OV_NATIVE_PERF_COUNT"] = "1"
 
 
 def generation_kwargs(args):
-    repetition_penalty = args.repetition_penalty
+    fallback_repetition_penalty = 1.05
     if (
         getattr(args, "realtime_profile", None) == FASTEST_PROFILE_NAME
         or is_fastest_or_norepeat_mode(getattr(args, "mode", None))
-    ) and repetition_penalty == 1.05:
-        repetition_penalty = 1.0
+    ):
+        fallback_repetition_penalty = 1.0
+    explicit_do_sample = getattr(args, "do_sample", None)
+    if getattr(args, "x_vector_only", False) and explicit_do_sample is None:
+        explicit_do_sample = False
+    do_sample, repetition_penalty, metadata = resolve_generation_defaults(
+        explicit_do_sample=explicit_do_sample,
+        explicit_repetition_penalty=getattr(args, "repetition_penalty", None),
+        fallback_do_sample=False,
+        fallback_repetition_penalty=fallback_repetition_penalty,
+        sampled_repetition_penalty=1.05,
+    )
+    setattr(args, "_generation_default_metadata", metadata)
     return {
         "max_new_tokens": args.max_new_tokens,
         "min_new_tokens": args.min_new_tokens,
         "repetition_penalty": repetition_penalty,
         "max_prompt_tokens": args.max_prompt_tokens,
         "progress_interval": args.progress_interval,
-        "do_sample": args.do_sample,
+        "do_sample": do_sample,
         "top_k": args.top_k,
         "top_p": args.top_p,
         "temperature": args.temperature,
@@ -587,6 +628,7 @@ def run_stream_voice_clone(args):
 def run_serve(args):
     from .server import serve
 
+    apply_npu_offload_profile_summary(args)
     apply_profile_defaults(args)
     apply_native_env(args)
     serve(
@@ -595,6 +637,9 @@ def run_serve(args):
         port=args.port,
         device=args.device,
         decoder_device=args.decoder_device,
+        encoder_device=args.encoder_device,
+        prompt_device=args.prompt_device,
+        npu_offload=args.npu_offload,
         allow_cpu_fallback=args.allow_cpu_fallback,
         mode=args.mode,
         cache_kernel=args.cache_kernel,
@@ -612,8 +657,31 @@ def run_serve(args):
         preload_modes=args.preload_modes,
         preload_buckets=args.preload_buckets,
         warmup_text=args.warmup_text,
+        warmup_speaker=args.warmup_speaker,
+        warmup_ref_audio=args.warmup_ref_audio,
+        warmup_ref_text=args.warmup_ref_text,
+        warmup_ref_text_file=args.warmup_ref_text_file,
         warmup_strategy=args.warmup_strategy,
+        runtime_residency=args.runtime_residency,
         max_concurrent_tts=args.max_concurrent_tts,
+        online_batching=args.online_batching,
+        online_batch_policy=args.online_batch_policy,
+        online_batch_max_size=args.online_batch_max_size,
+        online_batch_wait_ms=args.online_batch_wait_ms,
+        online_batch_max_queue_delay_ms=args.online_batch_max_queue_delay_ms,
+        online_batch_scheduler=args.online_batch_scheduler,
+        online_batch_prefill_mode=args.online_batch_prefill_mode,
+        online_batch_prefill_quality_summary=args.online_batch_prefill_quality_summary,
+        online_batch_prefill_seq_buckets=args.online_batch_prefill_seq_buckets,
+        online_batch_prefill_batch_buckets=args.online_batch_prefill_batch_buckets,
+        online_batch_decode_batch_buckets=args.online_batch_decode_batch_buckets,
+        online_batch_max_num_batched_tokens=args.online_batch_max_num_batched_tokens,
+        online_batch_fused_decode=args.online_batch_fused_decode,
+        online_batch_warmup_requests=args.online_batch_warmup_requests,
+        online_batch_warmup_tokens=args.online_batch_warmup_tokens,
+        sampled_batch_subcode=args.sampled_batch_subcode,
+        online_batch_continuous_subcode=args.online_batch_continuous_subcode,
+        online_batch_max_cache_blocks=args.online_batch_max_cache_blocks,
         long_output_memory_policy=args.long_output_memory_policy,
         max_continuous_prompt_tokens=args.max_continuous_prompt_tokens,
         max_vram_ratio=args.max_vram_ratio,
@@ -629,11 +697,60 @@ def run_serve(args):
     )
 
 
+def apply_npu_offload_profile_summary(args):
+    summary_path = getattr(args, "npu_offload_summary", None)
+    if not summary_path:
+        return None
+    profile = load_npu_offload_profile(summary_path, policy=getattr(args, "npu_offload_policy", "balanced"))
+    args.npu_offload = profile["npu_offload"]
+    print(
+        "using Windows NPU benchmark recommendation: "
+        f"policy={profile['policy']} scenario={profile['scenario']} npu_offload={profile['npu_offload']}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return profile
+
+
+def apply_npu_offload(args):
+    npu_offload = getattr(args, "npu_offload", "off")
+    if npu_offload is None:
+        return
+    from .server import is_npu_device, resolve_npu_offload
+
+    decision = resolve_npu_offload(
+        device=getattr(args, "device", "GPU"),
+        decoder_device=getattr(args, "decoder_device", None),
+        prompt_device=getattr(args, "prompt_device", None),
+        npu_offload=npu_offload,
+    )
+    args.decoder_device = decision["decoder_device"]
+    if decision.get("effective_npu_offload") in {"audio", "all"} and getattr(args, "encoder_device", None):
+        if not is_npu_device(args.encoder_device):
+            raise ValueError(
+                "npu audio/all offload requested but --encoder-device is not NPU. "
+                "Use --encoder-device NPU, omit --encoder-device, or set --npu-offload off/decoder."
+            )
+    if decision.get("effective_npu_offload") == "all" and getattr(args, "prompt_device", None):
+        if not is_npu_device(args.prompt_device):
+            raise ValueError(
+                "npu all offload requested but --prompt-device is not NPU. "
+                "Use --prompt-device NPU, omit --prompt-device, or set --npu-offload off/decoder/audio."
+            )
+    if not getattr(args, "encoder_device", None):
+        args.encoder_device = decision.get("encoder_device")
+    if not getattr(args, "prompt_device", None):
+        args.prompt_device = decision.get("prompt_device")
+    args.npu_offload_decision = decision
+
+
 def run_cache_warmup_command(args):
     from .cache_warmup import run_cache_warmup, run_single_task
 
     apply_profile_defaults(args)
     apply_native_env(args)
+    apply_npu_offload_profile_summary(args)
+    apply_npu_offload(args)
     if args.single_task_json:
         result = run_single_task(args)
         print(json.dumps(result, ensure_ascii=False), flush=True)
@@ -667,6 +784,25 @@ def add_cache_warmup_args(parser):
     )
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
+    parser.add_argument("--encoder-device", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--prompt-device", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--npu-offload",
+        default="off",
+        choices=NPU_OFFLOAD_CHOICES,
+        help="Warm cache for Windows GPU+NPU mode. all also warms prompt/text embedding on NPU.",
+    )
+    parser.add_argument(
+        "--npu-offload-summary",
+        default=None,
+        help="Path to benchmark-summary.json; selected recommendation is used as --npu-offload.",
+    )
+    parser.add_argument(
+        "--npu-offload-policy",
+        default="balanced",
+        choices=NPU_OFFLOAD_POLICY_CHOICES,
+        help="Recommendation policy used with --npu-offload-summary.",
+    )
     parser.add_argument(
         "--realtime-profile",
         default=FASTEST_PROFILE_NAME,
@@ -681,6 +817,7 @@ def add_cache_warmup_args(parser):
     parser.add_argument("--codegen-unroll", default="profile", choices=CODEGEN_UNROLL_CHOICES, help=advanced)
     parser.add_argument("--codegen-schedule", default="current", choices=CODEGEN_SCHEDULE_CHOICES, help=advanced)
     parser.add_argument("--codegen-decode-unroll", default="off", choices=["off", "auto", "on"], help=advanced)
+    parser.add_argument("--native-codegen-fusion", default=None, choices=["off", "split", "auto", "graph"], help=advanced)
     parser.add_argument("--preferred-cache-bucket", default="112", help=advanced)
     parser.add_argument("--precision-hint", default="f16", choices=["f16", "f32"])
     parser.add_argument("--ov-cache-dir", default=None)
@@ -690,7 +827,7 @@ def add_cache_warmup_args(parser):
     parser.add_argument("--graphs", default="core,stream,buckets")
     parser.add_argument("--preload-buckets", default="warmup")
     parser.add_argument("--stream-decoders", default="strategy", choices=["strategy", "all"])
-    parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["realtime", "low_latency", "smooth", "balanced", "stable"])
+    parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["auto", "short_compute", "realtime", "low_latency", "smooth", "balanced", "stable"])
     parser.add_argument("--subprocess", dest="subprocess", action="store_true", default=True)
     parser.add_argument("--no-subprocess", dest="subprocess", action="store_false")
     parser.add_argument("--dry-run", action="store_true")
@@ -718,17 +855,15 @@ def add_build_fastest_args(parser):
     )
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default=None)
+    parser.add_argument("--encoder-device", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--prompt-device", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--npu-offload", default="off", choices=NPU_OFFLOAD_CHOICES)
     parser.add_argument("--ov-cache-dir", default=None)
     parser.add_argument("--disable-ov-cache", action="store_true")
     parser.add_argument("--preload-buckets", default="warmup")
     parser.add_argument("--warmup-graphs", default="core,stream,buckets")
-    parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["realtime", "low_latency", "smooth", "balanced", "stable"])
-    parser.add_argument(
-        "--graph-set",
-        default="production",
-        choices=["production", "compat"],
-        help="production exports only the fastest runtime graphs; compat also exports legacy fixed-bucket/unroll diagnostic graphs.",
-    )
+    parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["auto", "short_compute", "realtime", "low_latency", "smooth", "balanced", "stable"])
+    parser.add_argument("--graph-set", default="production", choices=["production"], help=argparse.SUPPRESS)
     parser.add_argument("--clean", action="store_true", help="Remove the output IR directory before building.")
     parser.add_argument("--clean-native", action="store_true", help="Remove native/build before compiling the native pipeline.")
     parser.add_argument("--skip-submodule", action="store_true")
@@ -839,12 +974,100 @@ def main(argv=None):
     serve_parser.add_argument("--model-cache-dir", default=None)
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=17860)
+    serve_parser.add_argument(
+        "--npu-offload",
+        default="off",
+        choices=NPU_OFFLOAD_CHOICES,
+        help="Windows heterogeneous mode: off, auto, decoder, audio, all, or require.",
+    )
+    serve_parser.add_argument(
+        "--npu-offload-summary",
+        default=None,
+        help="Path to benchmark-summary.json; selected recommendation is used as --npu-offload.",
+    )
+    serve_parser.add_argument(
+        "--npu-offload-policy",
+        default="balanced",
+        choices=NPU_OFFLOAD_POLICY_CHOICES,
+        help="Recommendation policy used with --npu-offload-summary.",
+    )
     serve_parser.add_argument("--no-warmup", action="store_true")
     serve_parser.add_argument("--preload-modes", default="voice_design")
     serve_parser.add_argument("--preload-buckets", default="warmup")
     serve_parser.add_argument("--warmup-text", default="你好，这是一次流式预热。")
-    serve_parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["realtime", "low_latency", "smooth", "balanced", "stable"])
-    serve_parser.add_argument("--max-concurrent-tts", type=int, default=1)
+    serve_parser.add_argument("--warmup-speaker", default="Vivian")
+    serve_parser.add_argument("--warmup-ref-audio", default=None)
+    serve_parser.add_argument("--warmup-ref-text", default=None)
+    serve_parser.add_argument("--warmup-ref-text-file", default=None)
+    serve_parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["auto", "short_compute", "realtime", "low_latency", "smooth", "balanced", "stable"])
+    serve_parser.add_argument("--runtime-residency", default="lazy", choices=["lazy", "all"])
+    serve_parser.add_argument(
+        "--max-concurrent-tts",
+        type=int,
+        default=0,
+        help="0=auto: 8 when online batching is enabled by gate or explicitly on, otherwise 1.",
+    )
+    serve_parser.add_argument(
+        "--online-batching",
+        default="on",
+        choices=["auto", "on"],
+        help="Native online continuous batching. Default on uses the vLLM-like production backend.",
+    )
+    serve_parser.add_argument(
+        "--online-batch-policy",
+        default="balanced",
+        choices=["low_latency", "balanced", "throughput"],
+        help="Admission defaults for online batching. balanced uses batch=4/wait=2ms.",
+    )
+    serve_parser.add_argument("--online-batch-max-size", type=int, default=0, help="0=use --online-batch-policy default.")
+    serve_parser.add_argument("--online-batch-wait-ms", type=float, default=-1.0, help="-1=use --online-batch-policy default.")
+    serve_parser.add_argument("--online-batch-max-queue-delay-ms", type=float, default=0.0)
+    serve_parser.add_argument(
+        "--online-batch-scheduler",
+        default="layered",
+        choices=["layered"],
+        help="Native online batching scheduler. Production sidecar is fixed to layered vLLM-like scheduling.",
+    )
+    serve_parser.add_argument("--online-batch-prefill-seq-buckets", default="128,256,512,1024")
+    serve_parser.add_argument("--online-batch-prefill-batch-buckets", default="1,2,4,8")
+    serve_parser.add_argument("--online-batch-decode-batch-buckets", default="1,2,4,8,16")
+    serve_parser.add_argument("--online-batch-max-num-batched-tokens", type=int, default=32)
+    serve_parser.add_argument(
+        "--online-batch-fused-decode",
+        default="off",
+        choices=["auto", "on", "off"],
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument("--online-batch-warmup-requests", type=int, default=4)
+    serve_parser.add_argument("--online-batch-warmup-tokens", type=int, default=16)
+    serve_parser.add_argument(
+        "--online-batch-continuous-subcode",
+        default="auto",
+        choices=["auto", "on", "off"],
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--online-batch-prefill-mode",
+        default="serial",
+        choices=["serial", "dynamic-ragged", "bucketed-padded", "auto"],
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--online-batch-prefill-quality-summary",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--sampled-batch-subcode",
+        default="off",
+        choices=["auto", "off", "verify", "on"],
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--online-batch-max-cache-blocks",
+        default="auto",
+        help="Paged-KV blocks reserved for online batching, or auto.",
+    )
     serve_parser.add_argument("--long-output-memory-policy", default="stable", choices=["stable", "fast"])
     serve_parser.add_argument(
         "--max-continuous-prompt-tokens",
