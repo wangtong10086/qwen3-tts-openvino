@@ -14,16 +14,16 @@ vLLM-like 加速仓库。
 Linux：
 
 ```bash
-tar --zstd -xf qwen3-tts-ov-server-linux-x64-0.1.3-runtime-minimal.tar.zst
-cd qwen3-tts-ov-server-linux-x64-0.1.3-runtime-minimal
+tar --zstd -xf qwen3-tts-ov-server-linux-x64-0.1.4-runtime-minimal.tar.zst
+cd qwen3-tts-ov-server-linux-x64-0.1.4-runtime-minimal
 ./qwen3-tts-ov-server --device GPU
 ```
 
 Windows：
 
 ```powershell
-Expand-Archive qwen3-tts-ov-server-windows-x64-0.1.3-runtime-minimal.zip -DestinationPath .
-cd qwen3-tts-ov-server-windows-x64-0.1.3-runtime-minimal
+Expand-Archive qwen3-tts-ov-server-windows-x64-0.1.4-runtime-minimal.zip -DestinationPath .
+cd qwen3-tts-ov-server-windows-x64-0.1.4-runtime-minimal
 .\qwen3-tts-ov-server.exe --device GPU
 ```
 

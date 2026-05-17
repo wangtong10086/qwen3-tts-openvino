@@ -222,7 +222,7 @@ def build_pyinstaller_command(args, target: str, native_lib: Path, entry_script:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", default=current_target(), choices=["linux-x64", "windows-x64"])
-    parser.add_argument("--version", default="0.1.3")
+    parser.add_argument("--version", default="0.1.4")
     parser.add_argument("--out-dir", default="dist/release")
     parser.add_argument("--work-dir", default="build/release")
     parser.add_argument("--native-lib", default=None)
