@@ -68,4 +68,13 @@ GitHub Actions 在普通提交上执行检查和构建，在 `v*` tag 上发布 
 uv run python scripts/package_release.py --help
 ```
 
+版本更新 checklist：
+
+1. 更新 `pyproject.toml` 中的 `version`。
+2. 更新 `docs/release_zh.md`、`docs/release.md`、根 README 中的版本号、下载文件名和 release 链接。
+3. 新增 `docs/releases/vX.X.X.md` release notes。
+4. 更新 `docs/releases/README.zh-CN.md` 和 `docs/README.md` 中的 release notes 入口。
+5. 确认 `scripts/package_release.py`、`scripts/package_ir.py` 默认版本或 workflow 输入与目标版本一致。
+6. 运行文档链接检查和必要 smoke 后打 `git tag vX.X.X`，再推送 tag。
+
 提交前不要把以下目录加入 git：`models/`、`openvino/`、`openvino_full/`、`outputs/`、`native/build/`、`dist/release/`、`.venv/`、`.uv-cache/`。

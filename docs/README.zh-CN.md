@@ -8,18 +8,22 @@ English entry: [Documentation](README.md). 示例入口：[examples](../examples
 
 | 角色 | 先读 | 内容 |
 | --- | --- | --- |
+| 新机器/新用户 | [前置条件](prerequisites_zh.md) | Python/uv、OpenVINO、Intel GPU/NPU 驱动和首次编译缓存 |
 | 最终用户 | [Release 使用说明](release_zh.md) | 下载预编译 runtime，自动下载 Hugging Face IR，启动 Web Demo |
 | 源码开发者 | [Quick Start](quick_start_zh.md) | 从 PyTorch 模型导出生产 IR，构建 native backend |
-| 集成方 | [运行接口](runtime_zh.md) | HTTP、WebSocket、OpenAI-compatible Speech API |
+| 集成方 | [API Reference](api_reference_zh.md) | HTTP、WebSocket、OpenAI-compatible Speech API 和 Python API 字段 |
 | 发布维护者 | [开发说明](development_zh.md) | 本地检查、打包、GitHub Actions release |
 | 性能/质量验证 | [流式与长文本](streaming_zh.md) | full-AR 长文本、online batching、benchmark、Omni gate |
 
 ## 文档列表
 
+- [前置条件](prerequisites_zh.md)
+- [Troubleshooting / FAQ](troubleshooting_zh.md)
 - [Release 使用说明](release_zh.md)
 - [Release Notes](releases/README.zh-CN.md)
 - [Quick Start](quick_start_zh.md)
 - [运行接口](runtime_zh.md)
+- [API Reference](api_reference_zh.md)
 - [导出与构建](export_zh.md)
 - [流式与长文本](streaming_zh.md)
 - [OpenVINO 编译缓存](cache_zh.md)
@@ -29,6 +33,7 @@ English entry: [Documentation](README.md). 示例入口：[examples](../examples
 - [native backend](../native/qwen3_tts_ov_genai/README.md)
 - [安全说明](security_zh.md)
 - [示例请求与 Python 客户端](../examples/README.zh-CN.md)
+- [贡献指南](../CONTRIBUTING.md)
 
 ## 已清理内容
 

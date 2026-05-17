@@ -4,7 +4,25 @@
 
 普通用户请优先阅读 [Release 使用说明](release_zh.md)，不需要安装 PyTorch 或重新导出模型。
 
+新机器先确认 [前置条件](prerequisites_zh.md)，尤其是 Python `>=3.12`、`uv`、Intel GPU 驱动和 OpenVINO 可见设备。
+
 ## 1. 安装依赖
+
+如果尚未安装 `uv`：
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv --version
+```
+
+Windows PowerShell：
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+uv --version
+```
+
+然后安装项目依赖：
 
 ```bash
 uv sync --extra native --extra server --extra export
@@ -125,6 +143,18 @@ uv run python scripts/benchmark_prompt_batch_matrix.py --dry-run
 python -m py_compile examples/python/*.py
 ```
 
+确认 OpenVINO 能看到目标设备：
+
+```bash
+uv run python - <<'PY'
+import openvino as ov
+core = ov.Core()
+print(core.available_devices)
+for name in core.available_devices:
+    print(name, core.get_property(name, "FULL_DEVICE_NAME"))
+PY
+```
+
 端到端质量和架构 gate：
 
 ```bash
@@ -134,3 +164,5 @@ uv run python scripts/evaluate_single_arch_gate.py \
   --runs 1 \
   --concurrency 1
 ```
+
+接口字段详见 [API Reference](api_reference_zh.md)，常见错误见 [Troubleshooting](troubleshooting_zh.md)。

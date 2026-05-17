@@ -2,6 +2,8 @@
 
 当前生产路径固定为 `fastest` profile：native C++ codec generation、OpenVINO paged-KV、vLLM-like online batching、长文本 full autoregressive。
 
+本页保留运行入口和集成示例。完整字段表、默认值和返回格式见 [API Reference](api_reference_zh.md)；常见错误见 [Troubleshooting](troubleshooting_zh.md)。
+
 ## Sidecar
 
 推荐所有桌面应用和 Web 应用通过本地 HTTP/WebSocket sidecar 集成：
@@ -60,6 +62,8 @@ curl http://127.0.0.1:17860/health
 | `/v1/tts/stream` | WebSocket | 先发请求 JSON，再接收 metadata、PCM binary chunk、final |
 | `/v1/audio/voices` | GET | 返回 CustomVoice speaker 列表和模式可用性 |
 | `/v1/audio/speech` | POST | OpenAI-compatible Speech API |
+
+请求字段说明见 [API Reference](api_reference_zh.md#通用-tts-请求)。集成方不应只依赖示例 JSON；`generation`、`stream`、VoiceClone 和 OpenAI-compatible 字段都以 API Reference 为准。
 
 模型状态与一键下载：
 
@@ -129,6 +133,7 @@ VoiceClone：
 ```
 
 VoiceClone 使用 Base IR，不能用 VoiceDesign IR 代替。默认 `x_vector_only=false`，即使用参考音频 codec prompt 和 speaker embedding。
+默认 ICL 路径要求同时提供准确 `ref_text`。参考音频可使用本地路径、HTTP(S) URL、base64 或 `data:audio/...`；运行时会转单声道并按模型需要重采样。更完整的参考音频建议见 [API Reference](api_reference_zh.md#voiceclone-参考音频)。
 
 ## HTTP
 
@@ -148,6 +153,12 @@ curl -X POST http://127.0.0.1:17860/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -o out.wav \
   -d '{"model":"qwen3-tts-openvino","voice":"voice_design","input":"你好。","language":"Chinese","instructions":"自然朗读。"}'
+```
+
+CustomVoice 的 `speaker` 列表建议先查询：
+
+```bash
+curl http://127.0.0.1:17860/v1/audio/voices
 ```
 
 Python examples:

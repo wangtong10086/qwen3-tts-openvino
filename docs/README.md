@@ -8,21 +8,25 @@ autoregressive long-text generation.
 
 | Role | Start Here | Purpose |
 | --- | --- | --- |
-| End user | [Release usage](release_zh.md) | Download the prebuilt runtime, auto-download the public OpenVINO IR, and open the Web Demo |
-| Source developer | [Source quick start](quick_start_zh.md) | Export production IR from PyTorch weights and build the native backend |
-| Integrator | [Runtime APIs](runtime_zh.md) | Use HTTP, WebSocket, and OpenAI-compatible Speech APIs |
-| Maintainer | [Development](development_zh.md) | Run checks, package releases, and understand CI workflows |
+| New machine | [Prerequisites](prerequisites.md) | Install uv, verify Python/OpenVINO, and confirm Intel GPU visibility |
+| End user | [Release usage](release.md) | Download the prebuilt runtime, auto-download the public OpenVINO IR, and open the Web Demo |
+| Source developer | [Source quick start](quick_start.md) | Export production IR from PyTorch weights and build the native backend |
+| Integrator | [API Reference](api_reference.md) | Use HTTP, WebSocket, OpenAI-compatible Speech, and Python APIs |
+| Maintainer | [Contributing](../CONTRIBUTING.md) | Run checks, update docs, and prepare PRs |
 | Performance/quality | [Streaming and long text](streaming_zh.md) | Validate full-AR long text, online batching, benchmarks, and quality gates |
 
-Most detailed documents are currently written in Chinese because the active
-development and validation notes are Chinese-first. The root [README.md](../README.md)
-and [examples](../examples/README.md) provide English entry points.
+Core setup, troubleshooting, API, release, and source quick-start docs have
+English entry points. Deeper development and validation notes remain
+Chinese-first for now and are marked with `_zh`.
 
 ## Documents
 
-- [Release usage](release_zh.md)
+- [Prerequisites](prerequisites.md) / [前置条件](prerequisites_zh.md)
+- [Troubleshooting](troubleshooting.md) / [Troubleshooting / FAQ](troubleshooting_zh.md)
+- [Release usage](release.md) / [Release 使用说明](release_zh.md)
 - [Release notes](releases/v0.1.4.md)
-- [Source quick start](quick_start_zh.md)
+- [Source quick start](quick_start.md) / [Quick Start](quick_start_zh.md)
+- [API Reference](api_reference.md) / [API Reference 中文](api_reference_zh.md)
 - [Runtime APIs](runtime_zh.md)
 - [Export and build](export_zh.md)
 - [Streaming and long text](streaming_zh.md)
@@ -32,6 +36,7 @@ and [examples](../examples/README.md) provide English entry points.
 - [Scripts](../scripts/README.zh-CN.md)
 - [Native backend](../native/qwen3_tts_ov_genai/README.md)
 - [Security](security_zh.md)
+- [Contributing](../CONTRIBUTING.md)
 
 ## Current Scope
 

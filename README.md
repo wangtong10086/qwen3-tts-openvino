@@ -13,6 +13,10 @@ OpenVINO IR, generated audio, compile caches, or native build outputs.
 For normal use, download the prebuilt runtime from GitHub Releases. The server
 auto-downloads the public OpenVINO IR from Hugging Face on first start.
 
+Check [Prerequisites](docs/prerequisites.md) first if this is a new machine,
+especially for `uv`, Intel GPU drivers, OpenVINO device visibility, and the
+first compile cache.
+
 Linux:
 
 ```bash
@@ -82,7 +86,7 @@ uv run python -m qwen3_tts_ov serve \
 qwen3_tts_ov/  runtime, exporter, CLI, sidecar, web demo
 native/        native OpenVINO C++ codec generation backend
 scripts/       production build, release, benchmark, and quality gates
-docs/          Chinese documentation
+docs/          documentation
 examples/      request examples
 tests/         unit tests
 ```
@@ -93,15 +97,20 @@ Ignored local artifacts include `models/`, `openvino/`, `openvino_full/`,
 ## Documentation
 
 - [Documentation index](docs/README.md)
-- [Release usage](docs/release_zh.md)
-- [Source quick start](docs/quick_start_zh.md)
+- [Prerequisites](docs/prerequisites.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Release usage](docs/release.md)
+- [Source quick start](docs/quick_start.md)
+- [API Reference](docs/api_reference.md)
 - [Runtime APIs](docs/runtime_zh.md)
 - [Export and build](docs/export_zh.md)
 - [Artifacts policy](docs/artifacts_zh.md)
 - [Security](docs/security_zh.md)
+- [Contributing](CONTRIBUTING.md)
 
-The detailed docs are Chinese-first; English quick entry points are provided in
-this README, [docs/README.md](docs/README.md), and [examples/README.md](examples/README.md).
+The core setup, troubleshooting, API, release, and source quick-start docs now
+have English entry points. Some deeper development and validation notes remain
+Chinese-first and are linked from [docs/README.md](docs/README.md).
 
 ## License
 

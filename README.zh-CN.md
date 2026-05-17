@@ -11,6 +11,8 @@ vLLM-like 加速仓库。
 
 普通用户优先使用 GitHub Release 里的预编译 runtime。首次启动时，如果本地没有模型 IR，服务会自动从 Hugging Face 下载公开的 OpenVINO IR。
 
+新机器先看 [前置条件](docs/prerequisites_zh.md)：里面包含 Python/uv、Intel GPU 驱动、OpenVINO 设备可见性和首次编译缓存说明。遇到启动或下载问题看 [Troubleshooting](docs/troubleshooting_zh.md)。
+
 Linux：
 
 ```bash
@@ -97,14 +99,18 @@ models/Qwen3-TTS-12Hz-1.7B-Base        -> openvino/base
 ## 文档
 
 - [英文文档索引](docs/README.md)
+- [前置条件](docs/prerequisites_zh.md)
+- [Troubleshooting / FAQ](docs/troubleshooting_zh.md)
 - [Release 使用说明](docs/release_zh.md)
 - [源码 Quick Start](docs/quick_start_zh.md)
 - [运行接口](docs/runtime_zh.md)
+- [API Reference](docs/api_reference_zh.md)
 - [导出与构建](docs/export_zh.md)
 - [流式与长文本](docs/streaming_zh.md)
 - [大文件与产物策略](docs/artifacts_zh.md)
 - [安全说明](docs/security_zh.md)
 - [示例请求与 Python 客户端](examples/README.zh-CN.md)
+- [贡献指南](CONTRIBUTING.md)
 
 ## 仓库结构
 
@@ -112,7 +118,7 @@ models/Qwen3-TTS-12Hz-1.7B-Base        -> openvino/base
 qwen3_tts_ov/    runtime、exporter、CLI、sidecar、web demo
 native/          native OpenVINO C++ codec generation backend
 scripts/         生产构建、release、benchmark、质量门禁脚本
-docs/            中文文档
+docs/            文档
 examples/        JSON/JSONL/文本示例
 tests/           单元测试
 ```

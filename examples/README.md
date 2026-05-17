@@ -6,7 +6,8 @@ paths.
 
 ## Prerequisites
 
-Start the sidecar first. For release users:
+Review [project prerequisites](../docs/prerequisites.md), then start the
+sidecar first. For release users:
 
 ```bash
 ./qwen3-tts-ov-server --device GPU

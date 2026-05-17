@@ -6,7 +6,7 @@ English version: [README.md](README.md)。
 
 ## 前置条件
 
-Release 用户直接启动预编译服务；源码开发者先按 [Quick Start](../docs/quick_start_zh.md) 构建 `fastest` 所需 IR。
+先确认 [前置条件](../docs/prerequisites_zh.md)。Release 用户直接启动预编译服务；源码开发者先按 [Quick Start](../docs/quick_start_zh.md) 构建 `fastest` 所需 IR。
 
 Release 包：
 
