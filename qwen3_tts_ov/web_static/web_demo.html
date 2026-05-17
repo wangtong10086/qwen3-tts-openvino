@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Qwen3-TTS OpenVINO 控制台</title>
+  <style>
+{{WEB_DEMO_CSS}}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <h1>Qwen3-TTS OpenVINO 控制台</h1>
+        <p>面向本地 sidecar 的流式合成测试台。配置请求、监听 WebSocket、播放 PCM chunk，并实时观察 RTF、队列和长文本 full-AR 状态。</p>
+      </div>
+      <div class="health-card">
+        <div class="health-row">
+          <div>
+            <strong>服务状态</strong>
+            <div id="healthDetail" class="health-detail">正在检查 /health</div>
+          </div>
+          <div id="health" class="status-pill">检查中</div>
+        </div>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 id="modelTitle">VoiceDesign</h2>
+            <div id="modelSubtitle" class="head-subtitle">text + instruct + language</div>
+          </div>
+          <span id="longModeBadge" class="tag">short_ar</span>
+        </div>
+        <div class="panel-body">
+          <div class="section-label"><span>Endpoint</span><span id="modelRootLine" class="hint">-</span></div>
+          <div class="field">
+            <label for="wsUrl">WebSocket 地址</label>
+            <input id="wsUrl" autocomplete="off" spellcheck="false">
+          </div>
+
+          <div class="section-label"><span>模型</span><span class="tag">/v1/tts/stream</span></div>
+          <div class="field">
+            <div id="modeButtons" class="model-switch">
+              <button type="button" data-mode="voice_design" class="active">VoiceDesign</button>
+              <button type="button" data-mode="custom_voice">CustomVoice</button>
+              <button type="button" data-mode="voice_clone">VoiceClone</button>
+            </div>
+            <select id="mode" class="hidden" aria-label="mode">
+              <option value="voice_design">VoiceDesign</option>
+              <option value="custom_voice">CustomVoice</option>
+              <option value="voice_clone">VoiceClone</option>
+            </select>
+            <div id="modelManager" class="model-manager" aria-live="polite"></div>
+          </div>
+
+          <div class="grid-2">
+            <div class="field">
+              <label for="language">语言</label>
+              <select id="language">
+                <option value="Chinese">Chinese</option>
+                <option value="English">English</option>
+                <option value="Auto">Auto</option>
+                <option value="Japanese">Japanese</option>
+                <option value="Korean">Korean</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="presetText">默认填充文本</label>
+              <select id="presetText">
+                <option value="">不替换当前文本</option>
+                <option value="mode_short">短文本（当前模型）</option>
+                <option value="mode_long">长文本 full-AR（当前模型）</option>
+                <option value="english">English short</option>
+                <option value="desktop">桌面应用短文本</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="text">文本</label>
+            <textarea id="text">你好，欢迎使用 OpenVINO 流式语音合成。</textarea>
+            <div id="textStats" class="hint">-</div>
+          </div>
+
+          <div class="helper">
+            <div class="helper-item"><span>文本 tokens</span><strong id="textUnitsValue">0</strong></div>
+            <div class="helper-item"><span>Prompt tokens</span><strong id="effectiveTokens">-</strong></div>
+            <div class="helper-item"><span>生成预算</span><strong id="budgetValue">auto</strong></div>
+            <div class="helper-item"><span>预算状态</span><strong id="requestKind">short_ar</strong></div>
+          </div>
+
+          <div class="field" id="instructField">
+            <label for="instruct">Instruct</label>
+            <textarea id="instruct">用自然、清晰的中文女声朗读。</textarea>
+          </div>
+
+          <div class="field hidden" id="speakerField">
+            <label for="speaker">Speaker</label>
+            <input id="speaker" list="speakerOptions" placeholder="Vivian">
+            <datalist id="speakerOptions"></datalist>
+          </div>
+
+          <div class="hidden" id="cloneFields">
+            <div class="field">
+              <label for="refAudioUpload">上传参考音频</label>
+              <input id="refAudioUpload" type="file" accept="audio/*,.wav,.mp3,.flac,.m4a,.ogg">
+              <div class="row" style="margin-top: 8px;">
+                <span id="refAudioInfo" class="hint">未选择文件；可使用下方路径或 URL。</span>
+                <button id="clearRefAudioBtn" type="button" class="ghost hidden">清除上传</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="refAudio">参考音频路径或 URL</label>
+              <input id="refAudio" placeholder="/path/to/reference.wav">
+            </div>
+            <div class="field">
+              <label for="refText">参考文本</label>
+              <textarea id="refText" placeholder="Reference transcript"></textarea>
+            </div>
+            <div class="field">
+              <label class="check"><input id="xVectorOnly" type="checkbox"> x_vector_only（默认关闭）</label>
+              <span class="hint">关闭时使用参考音频 codec prompt；开启后只使用 speaker embedding。</span>
+            </div>
+          </div>
+
+          <div class="section-label"><span>生成参数</span><span class="hint">默认长文本采样</span></div>
+          <div class="grid-3">
+            <div class="field">
+              <label for="maxNewTokens">max_new_tokens</label>
+              <input id="maxNewTokens" type="number" min="1" value="48">
+            </div>
+            <div class="field">
+              <label for="minNewTokens">min_new_tokens</label>
+              <input id="minNewTokens" type="number" min="0" value="12">
+            </div>
+            <div class="field">
+              <label for="requestCount">同时请求数</label>
+              <input id="requestCount" type="number" min="1" max="16" value="1">
+            </div>
+          </div>
+          <div class="field">
+            <label for="requestStaggerMs">请求间隔 ms</label>
+            <input id="requestStaggerMs" type="number" min="0" max="5000" value="0">
+            <div class="hint">大于 1 时会同时发起多个 WebSocket 请求；第一个请求用于播放，其余请求只统计 TTFT/RTF。</div>
+          </div>
+          <div class="field">
+            <label for="maxVramPercent">最大显存占比 <span id="maxVramPercentValue" class="mono">80%</span></label>
+            <input id="maxVramPercent" type="range" min="20" max="100" step="5" value="80">
+            <div class="hint">服务端会按该比例计算本次请求可用的最大 prompt token 数。</div>
+          </div>
+
+          <details>
+            <summary>流式与调试参数</summary>
+            <div class="details-body">
+              <div class="grid-3">
+                <div class="field">
+                  <label for="chunkStrategy">chunk_strategy</label>
+                  <select id="chunkStrategy">
+                    <option value="realtime">realtime</option>
+                    <option value="low_latency">low_latency</option>
+                    <option value="smooth" selected>smooth</option>
+                    <option value="balanced">balanced</option>
+                    <option value="stable">stable</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="chunkFrames">chunk_frames</label>
+                  <input id="chunkFrames" type="number" min="1" value="24">
+                </div>
+                <div class="field">
+                  <label for="leftContextFrames">left_context</label>
+                  <input id="leftContextFrames" type="number" min="0" value="25">
+                </div>
+              </div>
+              <div class="row">
+                <label class="check"><input id="verboseLog" type="checkbox"> 详细日志</label>
+              </div>
+            </div>
+          </details>
+
+          <div class="action-bar">
+            <button id="startBtn">开始合成</button>
+            <button id="stopBtn" class="danger" disabled>停止</button>
+          </div>
+          <div class="secondary-actions">
+            <button id="downloadBtn" class="secondary" disabled>下载 WAV</button>
+            <button id="copyBtn" class="ghost">复制请求</button>
+            <button id="copyCurlBtn" class="ghost">复制 curl</button>
+            <button id="exportSummaryBtn" class="ghost" disabled>导出 summary</button>
+            <button id="clearBtn" class="ghost">清空日志</button>
+          </div>
+
+          <details id="requestPreviewDetails" class="debug-block">
+            <summary>调试与自定义请求</summary>
+            <div class="details-body">
+              <div class="field">
+                <label for="requestPreview">生成的 WebSocket /v1/tts/stream JSON</label>
+                <textarea id="requestPreview" class="preview" readonly spellcheck="false"></textarea>
+              </div>
+              <div class="field">
+                <label class="check"><input id="customJsonEnabled" type="checkbox"> 使用自定义请求 JSON</label>
+                <span class="hint">开启后，“开始合成”和复制 curl 都使用下方 JSON。上传的参考音频不会自动合入自定义 JSON。</span>
+              </div>
+              <div class="field">
+                <label for="customRequestJson">自定义请求 JSON</label>
+                <textarea id="customRequestJson" class="preview" spellcheck="false"></textarea>
+                <div id="customJsonStatus" class="hint">未启用自定义 JSON。</div>
+              </div>
+              <div class="secondary-actions">
+                <button id="fillCustomJsonBtn" type="button" class="ghost">填入当前请求</button>
+                <button id="formatCustomJsonBtn" type="button" class="ghost">格式化 JSON</button>
+              </div>
+              <div class="field">
+                <label for="openaiPreview">OpenAI-compatible /v1/audio/speech JSON</label>
+                <textarea id="openaiPreview" class="preview" readonly spellcheck="false"></textarea>
+              </div>
+            </div>
+          </details>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>播放与运行状态</h2>
+          <span id="playState" class="tag">空闲</span>
+        </div>
+        <div class="panel-body">
+          <div class="status-strip">
+            <div class="status-box"><span>Runtime</span><strong id="profileValue">fastest</strong></div>
+            <div class="status-box"><span>Graph</span><strong id="graphValue">-</strong></div>
+            <div class="status-box"><span>Schedule</span><strong id="scheduleValue">current</strong></div>
+            <div class="status-box"><span>Unroll</span><strong id="unrollValue">1</strong></div>
+          </div>
+
+          <div class="output-grid">
+            <div class="metric primary"><span>首包延迟</span><strong id="firstLatency">-</strong></div>
+            <div class="metric primary"><span>首次出声</span><strong id="firstAudible">-</strong></div>
+            <div class="metric primary"><span>RTF</span><strong id="rtfValue">-</strong></div>
+            <div class="metric"><span>播放队列</span><strong id="queueDepth">0ms</strong></div>
+            <div class="metric"><span>音频块</span><strong id="chunkCount">0</strong></div>
+            <div class="metric"><span>音频时长</span><strong id="audioDuration">0.00s</strong></div>
+            <div class="metric"><span>总耗时</span><strong id="totalTime">0.00s</strong></div>
+            <div class="metric"><span>块间隔</span><strong id="chunkInterval">-</strong></div>
+            <div class="metric"><span>Underrun</span><strong id="underrunCount">0</strong></div>
+            <div class="metric"><span>策略</span><strong id="strategyValue">smooth</strong></div>
+            <div class="metric"><span>连续性</span><strong id="continuityValue">-</strong></div>
+            <div class="metric"><span>采样</span><strong id="samplingValue">-</strong></div>
+            <div class="metric primary"><span>上下文</span><strong id="contextUsage">-</strong></div>
+            <div class="metric"><span>已生成 tokens</span><strong id="contextGenerated">0</strong></div>
+          </div>
+
+          <div class="meters">
+            <div>
+              <label>接收进度</label>
+              <div class="bar"><i id="receiveBar"></i></div>
+            </div>
+            <div>
+              <label>播放队列</label>
+              <div class="bar"><i id="queueBar"></i></div>
+            </div>
+            <div>
+              <label id="contextLine">上下文使用</label>
+              <div class="bar"><i id="contextBar"></i></div>
+            </div>
+          </div>
+
+          <div id="multiPanel" class="multi-panel hidden">
+            <div class="section-label"><span>多请求结果</span><span id="multiSummary" class="hint">等待请求</span></div>
+            <div class="table-wrap">
+              <table class="bench-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>状态</th>
+                    <th>TTFT</th>
+                    <th>RTF</th>
+                    <th>音频</th>
+                    <th>错误</th>
+                  </tr>
+                </thead>
+                <tbody id="multiResults"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="section-label"><span>事件日志</span><span id="runtimeLine" class="hint">等待请求</span></div>
+          <div id="log" class="console"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+{{WEB_DEMO_JS}}
+  </script>
+</body>
+</html>

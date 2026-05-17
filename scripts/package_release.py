@@ -205,6 +205,10 @@ def build_pyinstaller_command(args, target: str, native_lib: Path, entry_script:
         "uvicorn.protocols.websockets.auto",
         "--add-binary",
         add_data_arg(native_lib, "native/build"),
+        "--add-data",
+        add_data_arg(REPO_ROOT / "qwen3_tts_ov" / "default_policy_summary.json", "qwen3_tts_ov"),
+        "--add-data",
+        add_data_arg(REPO_ROOT / "qwen3_tts_ov" / "web_static", "qwen3_tts_ov/web_static"),
         str(entry_script),
     ]
     excluded_modules = list(EXCLUDED_DEV_MODULES)

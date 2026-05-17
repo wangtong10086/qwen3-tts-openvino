@@ -120,6 +120,20 @@ def evaluate_fast_path(
                 continue
             if parsed != 0:
                 failures.append(f"{key}={parsed}")
+        for key in (
+            "split_subcode_remote_next_embed_fallback_count",
+            "decode_step_prebind_fallback_count",
+        ):
+            value = lookup(metrics, key)
+            if value is None:
+                continue
+            parsed = _as_int(value)
+            if parsed is None:
+                if require_request_metrics:
+                    missing.append(key)
+                continue
+            if parsed != 0:
+                failures.append(f"{key}={parsed}")
 
     ok = not failures and not missing
     reason_parts = failures + [f"missing:{item}" for item in missing]

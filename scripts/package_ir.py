@@ -15,8 +15,9 @@ from pathlib import Path
 from typing import Iterable
 
 
-IR_PROFILES = ("full", "runtime-minimal")
-MINIMAL_GRAPH_VARIANT = "int8_sym_paged_talker_split"
+PRODUCTION_PROFILE = "minimal-online-paged-kv"
+IR_PROFILES = ("full", "runtime-minimal", PRODUCTION_PROFILE)
+MINIMAL_GRAPH_VARIANT = "int8_sym_batch_fused_gqa"
 TOKENIZER_FILES = ("vocab.json", "merges.txt", "tokenizer_config.json")
 
 
@@ -68,6 +69,17 @@ def _require_stream_graph(stream_config: dict, context_frames: int, chunk_frames
     return graph
 
 
+def _select_paged_seed_graph(variant_paged: dict) -> tuple[str, str]:
+    for key in ("talker_stateful_batch_gqa", "talker_stateful_batch"):
+        value = variant_paged.get(key)
+        if isinstance(value, str) and value:
+            return key, value
+    raise ValueError(
+        f"runtime-minimal IR requires graph_variants.{MINIMAL_GRAPH_VARIANT}.graphs.paged_kv_seed."
+        "talker_stateful_batch_gqa or talker_stateful_batch"
+    )
+
+
 def runtime_minimal_manifest(manifest: dict, model_type: str) -> dict:
     source_graphs = manifest.get("graphs") or {}
     source_variants = manifest.get("graph_variants") or {}
@@ -83,15 +95,17 @@ def runtime_minimal_manifest(manifest: dict, model_type: str) -> dict:
     if not isinstance(variant_paged, dict) or not variant_paged:
         raise ValueError(f"runtime-minimal IR requires graph_variants.{MINIMAL_GRAPH_VARIANT}.graphs.paged_kv_seed")
 
+    seed_key, seed_graph = _select_paged_seed_graph(variant_paged)
     first_decoder = _require_stream_graph(source_stream, 0, 8)
+    prefix_decoder = _require_stream_graph(source_stream, 25, 12)
     steady_decoder = _require_stream_graph(source_stream, 25, 24)
     graphs = {
         "text_embedding": _require_graph(source_graphs, "text_embedding"),
         "codec_embedding": _require_graph(source_graphs, "codec_embedding"),
-        "paged_kv_seed": {},
+        "paged_kv_seed": {seed_key: seed_graph},
         "subcode_greedy_cached": _require_graph(source_graphs, "subcode_greedy_cached"),
         "speech_decoder": {},
-        "streaming_decoder": {"24": steady_decoder},
+        "streaming_decoder": {"12": prefix_decoder, "24": steady_decoder},
     }
 
     normalized_model_type = str(manifest.get("tts_model_type") or model_type).replace("-", "_").lower()
@@ -102,29 +116,30 @@ def runtime_minimal_manifest(manifest: dict, model_type: str) -> dict:
 
     minimal = copy.deepcopy(manifest)
     minimal["model_dir"] = "."
+    minimal["production_profile"] = PRODUCTION_PROFILE
     minimal.pop("tokenizer_ir", None)
     minimal["graphs"] = graphs
     minimal["graph_variants"] = {
         MINIMAL_GRAPH_VARIANT: {
             **{key: value for key, value in variant.items() if key != "graphs"},
-            "graphs": {"paged_kv_seed": variant_paged},
+            "graphs": {"paged_kv_seed": {seed_key: seed_graph}},
         }
     }
     minimal["streaming_decoder"] = {
         "left_context_frames": 25,
-        "chunk_frames": [24],
+        "chunk_frames": [12, 24],
         "first_chunk_frames": [8],
         "default_strategy": "smooth",
         "strategies": {"smooth": {"initial_chunk_frames": 8, "chunk_frames": 24, "left_context_frames": 25}},
-        "graphs": {"24": steady_decoder},
-        "contexts": {"0": {"8": first_decoder}, "25": {"24": steady_decoder}},
+        "graphs": {"12": prefix_decoder, "24": steady_decoder},
+        "contexts": {"0": {"8": first_decoder}, "25": {"12": prefix_decoder, "24": steady_decoder}},
         "output_format": source_stream.get("output_format", "pcm_f32"),
     }
     return minimal
 
 
 def manifest_for_profile(manifest: dict, profile: str, model_type: str) -> dict:
-    if profile == "runtime-minimal":
+    if profile in {"runtime-minimal", PRODUCTION_PROFILE}:
         return runtime_minimal_manifest(manifest, model_type)
     packaged = copy.deepcopy(manifest)
     packaged["model_dir"] = "."

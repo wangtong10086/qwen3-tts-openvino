@@ -185,28 +185,34 @@ def upload_folder(
     commit_message: str,
     clean_remote: bool,
 ) -> None:
-    kwargs = {
-        "repo_id": repo_id,
-        "repo_type": "model",
-        "folder_path": str(folder),
-        "path_in_repo": path_in_repo,
-        "commit_message": commit_message,
-        "token": token,
-        "ignore_patterns": [
-            "**/ov_cache/**",
-            "**/__pycache__/**",
-            "**/.DS_Store",
-            "**/*.wav",
-            "**/*.tmp",
-        ],
-    }
-    if clean_remote:
-        kwargs["delete_patterns"] = [f"{path_in_repo}/**"]
+    ignore_patterns = [
+        "**/ov_cache/**",
+        "**/__pycache__/**",
+        "**/.DS_Store",
+        "**/*.wav",
+        "**/*.tmp",
+    ]
     try:
-        api.upload_folder(**kwargs)
+        api.upload_folder(
+            repo_id=repo_id,
+            repo_type="model",
+            folder_path=str(folder),
+            path_in_repo=path_in_repo,
+            commit_message=commit_message,
+            token=token,
+            ignore_patterns=ignore_patterns,
+            delete_patterns=[f"{path_in_repo}/**"] if clean_remote else None,
+        )
     except TypeError:
-        kwargs.pop("delete_patterns", None)
-        api.upload_folder(**kwargs)
+        api.upload_folder(
+            repo_id=repo_id,
+            repo_type="model",
+            folder_path=str(folder),
+            path_in_repo=path_in_repo,
+            commit_message=commit_message,
+            token=token,
+            ignore_patterns=ignore_patterns,
+        )
     if clean_remote:
         deleted = prune_remote_folder(
             api,
@@ -257,15 +263,15 @@ def write_repo_readme(api: HfApi, *, repo_id: str, repo_subdir: str, token: str 
             "",
             f"Current public profile: `{profile}`.",
             "",
-            "For `runtime-minimal`, each mode keeps only the validated `fastest` runtime graphs:",
+            "For `runtime-minimal`, each mode keeps only the validated low-memory production graph set:",
             "",
             "- text and codec embedding graphs",
-            "- `int8_sym_paged_talker_split` paged-KV talker seed graph",
-            "- cached standalone subcode graph",
-            "- streaming decoders `c0_t8` and `c25_t24`",
+            "- `int8_sym_batch_fused_gqa` paged-KV batch talker seed graph",
+            "- cached standalone subcode graph, executed row-by-row by the online scheduler",
+            "- streaming decoders `c0_t8`, `c25_t12`, and `c25_t24`",
             "- VoiceClone/Base additionally keeps `speech_encoder`, `speaker_encoder`, and `code_frame_embedding`",
             "",
-            "Legacy full decoders, alternate streaming chunks, no-cache talker graphs, fixed-bucket/unroll diagnostic graphs, and OpenVINO compile caches are intentionally not published here.",
+            "Legacy full decoders, alternate streaming chunks, no-cache talker graphs, batch-fused decode graphs, sampled batch subcode graphs, fixed-bucket/unroll diagnostic graphs, and OpenVINO compile caches are intentionally not published here.",
             "",
         ]
     )

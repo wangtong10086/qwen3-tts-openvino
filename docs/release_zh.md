@@ -90,6 +90,22 @@ Web Demo：
 http://127.0.0.1:17860/
 ```
 
+Web Demo 可以直接测试 VoiceDesign、CustomVoice、VoiceClone、长文本 full-AR、参考音频上传、模型一键下载、请求 JSON/curl 复制、自定义最终请求 JSON 和同时多请求 smoke。多请求 smoke 只用于现场观察，正式性能报告仍以源码仓库中的 benchmark 脚本为准。
+
+查看模型是否已下载：
+
+```bash
+curl http://127.0.0.1:17860/v1/models
+```
+
+手动触发某个模式下载：
+
+```bash
+curl -X POST http://127.0.0.1:17860/v1/models/download \
+  -H "content-type: application/json" \
+  -d '{"mode":"voice_clone","sync":false}'
+```
+
 HTTP NDJSON：
 
 ```bash
@@ -109,11 +125,18 @@ curl -N http://127.0.0.1:17860/v1/audio/speech \
 
 更多 CLI、HTTP、WebSocket 和 Python API 说明见 [运行接口](runtime_zh.md)。
 
+仓库内还有最小 Python 客户端，适合桌面应用或其他本地程序参考：
+
+```bash
+python examples/python/http_tts_wav.py --output outputs/example_http.wav
+uv run --with websockets python examples/python/websocket_stream_pcm.py --output outputs/example_ws.wav
+```
+
 ## 发布物边界
 
 - GitHub Release 只包含 runtime App 包，不包含模型权重或 OpenVINO IR。
 - Hugging Face model repo 存放已编译 OpenVINO IR，当前公开包含 VoiceDesign、CustomVoice 和 Base/VoiceClone realtime IR。release server 默认在缺少本地 IR 时自动下载 `openvino_realtime/`。
-- 公开 HF IR 使用 `runtime-minimal` profile，只保留 `fastest` 生产路径需要的图；额外 `speech_decoder_t*`、`c25_t12`、legacy `talker_stateful*`、`talker_no_cache`、unroll/fixed-bucket 诊断图不发布，避免下载体积和用户理解成本膨胀。
+- 公开 HF IR 使用 `runtime-minimal` profile，只保留当前 `fastest` 生产路径需要的图；旧实验图和诊断图不发布，避免下载体积和用户理解成本膨胀。
 - CustomVoice 需要 `custom_voice/manifest.json`，VoiceClone 需要 Base/VoiceClone IR 的 `base/manifest.json`。服务端 `/health` 会返回 `available_modes`，Web Demo 会显示缺失/已就绪，并可一键下载对应模式。
 - VoiceClone 默认走 `ref_audio + ref_text` ICL 克隆路径，`x_vector_only` 默认关闭。最终用户在 Web Demo 中上传参考音频时，应同时填写对应参考文本；只有做 speaker embedding-only 对照实验时才开启 `x_vector_only`。
 - OpenVINO compile cache 会在用户机器首次运行时生成，不随 release 分发。

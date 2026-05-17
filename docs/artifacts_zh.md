@@ -40,7 +40,9 @@ runtime 打包有两种 profile：
 
 当前公开 OpenVINO IR 位于 Hugging Face：`waston10086/qwen3-tts-openvino-voice-design`，推荐使用其中的 `openvino_realtime/` 目录进行最终用户部署和 release smoke。该目录包含 `voice_design`、`custom_voice` 和用于 VoiceClone 的 `base`。
 
-公开 Hugging Face IR 也按 `runtime-minimal` 策略发布：只保留 `fastest` profile 实际需要的 `int8_sym_paged_talker_split` talker seed、cached subcode、`c0_t8/c25_t24` streaming decoder、embedding 图和 VoiceClone 必需 encoder。旧 fixed-bucket、legacy no-cache、额外 decoder chunk 和诊断图不进入公开模型仓库。
+公开 Hugging Face IR 也按 `runtime-minimal` 策略发布：只保留当前 `fastest` 生产路径需要的 native paged-KV、minimal online-batching、streaming decoder、embedding 图和 VoiceClone 必需 encoder；旧实验图和诊断图不进入公开模型仓库。
+
+仓库中的 `examples/` 只保留小型请求和客户端示例。示例输出默认写入 `outputs/`，因此不会进入 git。
 
 ## 检查命令
 

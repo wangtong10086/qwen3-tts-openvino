@@ -228,7 +228,6 @@ def test_windows_gpu_npu_benchmark_parses_runtime_profiles():
     benchmark = load_script("benchmark_windows_gpu_npu_release.py")
 
     assert benchmark.parse_profiles(None) == ["fastest"]
-    assert benchmark.parse_profiles("fastest,split_next_embed_graph") == ["fastest", "split_next_embed_graph"]
     with pytest.raises(ValueError, match="unknown profiles"):
         benchmark.parse_profiles("fastest,missing_profile")
 
@@ -483,7 +482,7 @@ def test_release_server_loads_windows_npu_offload_summary(monkeypatch, tmp_path)
     assert captured["npu_offload"] == "all"
 
 
-def test_release_server_applies_hidden_benchmark_profile(monkeypatch, tmp_path):
+def test_release_server_accepts_only_fastest_benchmark_profile(monkeypatch, tmp_path):
     from qwen3_tts_ov import release_server
     from qwen3_tts_ov.model_download import ModelDownloadResult
 
@@ -512,7 +511,7 @@ def test_release_server_applies_hidden_benchmark_profile(monkeypatch, tmp_path):
                 str(tmp_path / "openvino"),
                 "--no-auto-download-model",
                 "--benchmark-profile",
-                "split_next_embed_graph",
+                "fastest",
                 "--no-warmup",
             ]
         )
@@ -525,7 +524,7 @@ def test_release_server_applies_hidden_benchmark_profile(monkeypatch, tmp_path):
 
     assert captured["mode"] == "no-cache"
     assert captured["graph_variant"] == "int8_sym_paged_talker_split"
-    assert captured["realtime_profile"] == "fp16"
+    assert captured["realtime_profile"] == "fastest"
 
 
 def test_cli_applies_windows_npu_offload_summary(tmp_path):
@@ -617,6 +616,8 @@ def test_fast_path_helper_accepts_native_paged_kv_stream_path():
                 "host_copy_fallback_count": 0,
                 "subcode_host_copy_fallback_count": 0,
                 "split_subcode_hidden_bind_fallback_count": 0,
+                "split_subcode_remote_next_embed_fallback_count": 0,
+                "decode_step_prebind_fallback_count": 0,
             },
         }
     )

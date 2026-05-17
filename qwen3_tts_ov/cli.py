@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from .default_policy import resolve_generation_defaults
 from .profiles import (
     CODEGEN_SCHEDULE_CHOICES,
     CODEGEN_UNROLL_CHOICES,
@@ -126,10 +127,11 @@ def add_runtime_args(
         return
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--min-new-tokens", type=int, default=2)
-    parser.add_argument("--repetition-penalty", type=float, default=1.05)
+    parser.add_argument("--repetition-penalty", type=float, default=None)
     parser.add_argument("--max-prompt-tokens", type=int, default=512)
     parser.add_argument("--progress-interval", type=int, default=8)
-    parser.add_argument("--do-sample", action="store_true")
+    parser.add_argument("--do-sample", dest="do_sample", action="store_true", default=None)
+    parser.add_argument("--no-sample", dest="do_sample", action="store_false")
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=0.9)
@@ -143,7 +145,8 @@ def build_runtime(args):
     apply_profile_defaults(args)
     apply_native_env(args)
     cache_step = args.cache_step
-    if getattr(args, "do_sample", False) and args.mode == "cache" and cache_step == "fused":
+    effective_gen = generation_kwargs(args) if hasattr(args, "max_new_tokens") else {}
+    if effective_gen.get("do_sample", False) and args.mode == "cache" and cache_step == "fused":
         cache_step = "split"
     return OpenVINOQwen3TTS(
         args.ir_dir,
@@ -360,19 +363,30 @@ def apply_native_env(args):
 
 
 def generation_kwargs(args):
-    repetition_penalty = args.repetition_penalty
+    fallback_repetition_penalty = 1.05
     if (
         getattr(args, "realtime_profile", None) == FASTEST_PROFILE_NAME
         or is_fastest_or_norepeat_mode(getattr(args, "mode", None))
-    ) and repetition_penalty == 1.05:
-        repetition_penalty = 1.0
+    ):
+        fallback_repetition_penalty = 1.0
+    explicit_do_sample = getattr(args, "do_sample", None)
+    if getattr(args, "x_vector_only", False) and explicit_do_sample is None:
+        explicit_do_sample = False
+    do_sample, repetition_penalty, metadata = resolve_generation_defaults(
+        explicit_do_sample=explicit_do_sample,
+        explicit_repetition_penalty=getattr(args, "repetition_penalty", None),
+        fallback_do_sample=False,
+        fallback_repetition_penalty=fallback_repetition_penalty,
+        sampled_repetition_penalty=1.05,
+    )
+    setattr(args, "_generation_default_metadata", metadata)
     return {
         "max_new_tokens": args.max_new_tokens,
         "min_new_tokens": args.min_new_tokens,
         "repetition_penalty": repetition_penalty,
         "max_prompt_tokens": args.max_prompt_tokens,
         "progress_interval": args.progress_interval,
-        "do_sample": args.do_sample,
+        "do_sample": do_sample,
         "top_k": args.top_k,
         "top_p": args.top_p,
         "temperature": args.temperature,
@@ -643,8 +657,31 @@ def run_serve(args):
         preload_modes=args.preload_modes,
         preload_buckets=args.preload_buckets,
         warmup_text=args.warmup_text,
+        warmup_speaker=args.warmup_speaker,
+        warmup_ref_audio=args.warmup_ref_audio,
+        warmup_ref_text=args.warmup_ref_text,
+        warmup_ref_text_file=args.warmup_ref_text_file,
         warmup_strategy=args.warmup_strategy,
+        runtime_residency=args.runtime_residency,
         max_concurrent_tts=args.max_concurrent_tts,
+        online_batching=args.online_batching,
+        online_batch_policy=args.online_batch_policy,
+        online_batch_max_size=args.online_batch_max_size,
+        online_batch_wait_ms=args.online_batch_wait_ms,
+        online_batch_max_queue_delay_ms=args.online_batch_max_queue_delay_ms,
+        online_batch_scheduler=args.online_batch_scheduler,
+        online_batch_prefill_mode=args.online_batch_prefill_mode,
+        online_batch_prefill_quality_summary=args.online_batch_prefill_quality_summary,
+        online_batch_prefill_seq_buckets=args.online_batch_prefill_seq_buckets,
+        online_batch_prefill_batch_buckets=args.online_batch_prefill_batch_buckets,
+        online_batch_decode_batch_buckets=args.online_batch_decode_batch_buckets,
+        online_batch_max_num_batched_tokens=args.online_batch_max_num_batched_tokens,
+        online_batch_fused_decode=args.online_batch_fused_decode,
+        online_batch_warmup_requests=args.online_batch_warmup_requests,
+        online_batch_warmup_tokens=args.online_batch_warmup_tokens,
+        sampled_batch_subcode=args.sampled_batch_subcode,
+        online_batch_continuous_subcode=args.online_batch_continuous_subcode,
+        online_batch_max_cache_blocks=args.online_batch_max_cache_blocks,
         long_output_memory_policy=args.long_output_memory_policy,
         max_continuous_prompt_tokens=args.max_continuous_prompt_tokens,
         max_vram_ratio=args.max_vram_ratio,
@@ -790,7 +827,7 @@ def add_cache_warmup_args(parser):
     parser.add_argument("--graphs", default="core,stream,buckets")
     parser.add_argument("--preload-buckets", default="warmup")
     parser.add_argument("--stream-decoders", default="strategy", choices=["strategy", "all"])
-    parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["realtime", "low_latency", "smooth", "balanced", "stable"])
+    parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["auto", "short_compute", "realtime", "low_latency", "smooth", "balanced", "stable"])
     parser.add_argument("--subprocess", dest="subprocess", action="store_true", default=True)
     parser.add_argument("--no-subprocess", dest="subprocess", action="store_false")
     parser.add_argument("--dry-run", action="store_true")
@@ -825,13 +862,8 @@ def add_build_fastest_args(parser):
     parser.add_argument("--disable-ov-cache", action="store_true")
     parser.add_argument("--preload-buckets", default="warmup")
     parser.add_argument("--warmup-graphs", default="core,stream,buckets")
-    parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["realtime", "low_latency", "smooth", "balanced", "stable"])
-    parser.add_argument(
-        "--graph-set",
-        default="production",
-        choices=["production", "compat"],
-        help="production exports only the fastest runtime graphs; compat also exports legacy fixed-bucket/unroll diagnostic graphs.",
-    )
+    parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["auto", "short_compute", "realtime", "low_latency", "smooth", "balanced", "stable"])
+    parser.add_argument("--graph-set", default="production", choices=["production"], help=argparse.SUPPRESS)
     parser.add_argument("--clean", action="store_true", help="Remove the output IR directory before building.")
     parser.add_argument("--clean-native", action="store_true", help="Remove native/build before compiling the native pipeline.")
     parser.add_argument("--skip-submodule", action="store_true")
@@ -963,8 +995,79 @@ def main(argv=None):
     serve_parser.add_argument("--preload-modes", default="voice_design")
     serve_parser.add_argument("--preload-buckets", default="warmup")
     serve_parser.add_argument("--warmup-text", default="你好，这是一次流式预热。")
-    serve_parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["realtime", "low_latency", "smooth", "balanced", "stable"])
-    serve_parser.add_argument("--max-concurrent-tts", type=int, default=1)
+    serve_parser.add_argument("--warmup-speaker", default="Vivian")
+    serve_parser.add_argument("--warmup-ref-audio", default=None)
+    serve_parser.add_argument("--warmup-ref-text", default=None)
+    serve_parser.add_argument("--warmup-ref-text-file", default=None)
+    serve_parser.add_argument("--warmup-strategy", default=FASTEST_CHUNK_STRATEGY, choices=["auto", "short_compute", "realtime", "low_latency", "smooth", "balanced", "stable"])
+    serve_parser.add_argument("--runtime-residency", default="lazy", choices=["lazy", "all"])
+    serve_parser.add_argument(
+        "--max-concurrent-tts",
+        type=int,
+        default=0,
+        help="0=auto: 8 when online batching is enabled by gate or explicitly on, otherwise 1.",
+    )
+    serve_parser.add_argument(
+        "--online-batching",
+        default="on",
+        choices=["auto", "on"],
+        help="Native online continuous batching. Default on uses the vLLM-like production backend.",
+    )
+    serve_parser.add_argument(
+        "--online-batch-policy",
+        default="balanced",
+        choices=["low_latency", "balanced", "throughput"],
+        help="Admission defaults for online batching. balanced uses batch=4/wait=2ms.",
+    )
+    serve_parser.add_argument("--online-batch-max-size", type=int, default=0, help="0=use --online-batch-policy default.")
+    serve_parser.add_argument("--online-batch-wait-ms", type=float, default=-1.0, help="-1=use --online-batch-policy default.")
+    serve_parser.add_argument("--online-batch-max-queue-delay-ms", type=float, default=0.0)
+    serve_parser.add_argument(
+        "--online-batch-scheduler",
+        default="layered",
+        choices=["layered"],
+        help="Native online batching scheduler. Production sidecar is fixed to layered vLLM-like scheduling.",
+    )
+    serve_parser.add_argument("--online-batch-prefill-seq-buckets", default="128,256,512,1024")
+    serve_parser.add_argument("--online-batch-prefill-batch-buckets", default="1,2,4,8")
+    serve_parser.add_argument("--online-batch-decode-batch-buckets", default="1,2,4,8,16")
+    serve_parser.add_argument("--online-batch-max-num-batched-tokens", type=int, default=32)
+    serve_parser.add_argument(
+        "--online-batch-fused-decode",
+        default="off",
+        choices=["auto", "on", "off"],
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument("--online-batch-warmup-requests", type=int, default=4)
+    serve_parser.add_argument("--online-batch-warmup-tokens", type=int, default=16)
+    serve_parser.add_argument(
+        "--online-batch-continuous-subcode",
+        default="auto",
+        choices=["auto", "on", "off"],
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--online-batch-prefill-mode",
+        default="serial",
+        choices=["serial", "dynamic-ragged", "bucketed-padded", "auto"],
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--online-batch-prefill-quality-summary",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--sampled-batch-subcode",
+        default="off",
+        choices=["auto", "off", "verify", "on"],
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--online-batch-max-cache-blocks",
+        default="auto",
+        help="Paged-KV blocks reserved for online batching, or auto.",
+    )
     serve_parser.add_argument("--long-output-memory-policy", default="stable", choices=["stable", "fast"])
     serve_parser.add_argument(
         "--max-continuous-prompt-tokens",

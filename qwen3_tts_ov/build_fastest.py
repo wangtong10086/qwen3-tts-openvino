@@ -60,41 +60,6 @@ FASTEST_EXPORT_ARGS_PRODUCTION = (
     "static",
 )
 
-FASTEST_EXPORT_ARGS_COMPAT = (
-    "--cache-buckets",
-    "96,128,192,256,320,384",
-    "--cache-kernels",
-    "exact",
-    "--fused-cache-kernels",
-    "exact",
-    "--fused-subcode-mode",
-    "cached",
-    "--fused-cache-unroll-steps",
-    "4,6,8,12",
-    "--fused-cache-decode-unroll-steps",
-    "4,8,12",
-    "--fused-cache-stateful-mask-steps",
-    "4,8,12",
-    "--fused-cache-norepeat-steps",
-    "4",
-    "--export-paged-kv-seed",
-    "--paged-kv-unroll-steps",
-    "4",
-    "--paged-kv-subcode-attention-kernels",
-    "sdpa",
-    "--decoder-tokens",
-    "64,128,256",
-    "--stream-decoder-chunks",
-    "8,12,24",
-    "--stream-decoder-first-chunks",
-    "6,8,12",
-    "--stream-decoder-left-context",
-    "25",
-    "--stream-decoder-input-shape",
-    "static",
-)
-
-
 @dataclass(frozen=True)
 class BuildStep:
     name: str
@@ -139,6 +104,36 @@ def manifest_has_fastest_variant(manifest: dict | None) -> bool:
     )
 
 
+def manifest_has_online_batch_graphs(
+    manifest: dict | None,
+    *,
+    require_batch_subcode: bool = False,
+    require_fused_decode: bool = False,
+) -> bool:
+    if not manifest:
+        return False
+    graphs = manifest.get("graphs") or {}
+    paged_seed = dict(graphs.get("paged_kv_seed") or {})
+    variants = manifest.get("graph_variants") or {}
+    variant_graphs = ((variants.get("int8_sym_batch_fused_gqa") or {}).get("graphs") or {})
+    paged_seed.update(variant_graphs.get("paged_kv_seed") or {})
+    return bool(
+        paged_seed.get("talker_stateful_batch_gqa")
+        and (not require_fused_decode or paged_seed.get("fused_cache_step_batch_gqa"))
+        and graphs.get("subcode_greedy_cached")
+        and (not require_batch_subcode or graphs.get("subcode_greedy_cached_batch"))
+    )
+
+
+def manifest_has_online_batch_variant(manifest: dict | None) -> bool:
+    if not manifest:
+        return False
+    variants = manifest.get("graph_variants") or {}
+    variant_graphs = ((variants.get("int8_sym_batch_fused_gqa") or {}).get("graphs") or {})
+    paged_seed = variant_graphs.get("paged_kv_seed") or {}
+    return bool(paged_seed.get("talker_stateful_batch_gqa"))
+
+
 def build_fastest_steps(args: argparse.Namespace) -> list[BuildStep]:
     model_type = args.model_type
     model = args.model or DEFAULT_MODEL_BY_TYPE[model_type]
@@ -174,8 +169,26 @@ def build_fastest_steps(args: argparse.Namespace) -> list[BuildStep]:
         steps.append(BuildStep(name="export", command=[], skip_reason="disabled by --skip-export"))
     elif manifest and not args.force_export:
         steps.append(BuildStep(name="export", command=[], skip_reason=f"{out_dir / 'manifest.json'} already exists"))
+        if not manifest_has_online_batch_graphs(manifest):
+            steps.append(
+                BuildStep(
+                    name="export-online-batch-seed",
+                    command=[
+                        python,
+                        "-m",
+                        "qwen3_tts_ov",
+                        "export",
+                        "--model",
+                        str(model),
+                        "--model-type",
+                        model_type,
+                        "--out-dir",
+                        str(out_dir),
+                        "--paged-kv-batch-seed-only",
+                    ],
+                )
+            )
     else:
-        export_args = FASTEST_EXPORT_ARGS_COMPAT if args.graph_set == "compat" else FASTEST_EXPORT_ARGS_PRODUCTION
         export_cmd = [
             python,
             "-m",
@@ -187,7 +200,7 @@ def build_fastest_steps(args: argparse.Namespace) -> list[BuildStep]:
             model_type,
             "--out-dir",
             str(out_dir),
-            *export_args,
+            *FASTEST_EXPORT_ARGS_PRODUCTION,
         ]
         if model_type == "base":
             export_cmd.append("--export-clone-graphs")
@@ -211,6 +224,25 @@ def build_fastest_steps(args: argparse.Namespace) -> list[BuildStep]:
                     str(out_dir),
                     "--preset",
                     "fastest",
+                    *(["--force"] if args.force_compress else []),
+                ],
+            )
+        )
+    if args.skip_compress:
+        pass
+    elif manifest_has_online_batch_variant(manifest_after_export) and not args.force_compress:
+        steps.append(BuildStep(name="compress-online-batch", command=[], skip_reason="online batch graph variant already exists"))
+    else:
+        steps.append(
+            BuildStep(
+                name="compress-online-batch",
+                command=[
+                    python,
+                    "scripts/compress_openvino_weights.py",
+                    "--ir-dir",
+                    str(out_dir),
+                    "--preset",
+                    "minimal-online-gqa",
                     *(["--force"] if args.force_compress else []),
                 ],
             )
@@ -289,7 +321,7 @@ def run_build_fastest(args: argparse.Namespace) -> dict:
             subprocess.run(step.command, cwd=REPO_ROOT, check=True, env=build_subprocess_env())
     summary = {
         "dry_run": bool(args.dry_run),
-        "graph_set": args.graph_set,
+        "graph_set": "production",
         "clean": clean_actions,
         "executed": executed,
         "skipped": skipped,

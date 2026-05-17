@@ -526,10 +526,103 @@ class SubcodeGreedyCachedWrapper(torch.nn.Module):
         return codes, sum_embed
 
 
+class SubcodeSampledCachedWrapper(SubcodeGreedyCachedWrapper):
+    """Sample sub-codebooks inside one OpenVINO graph.
+
+    The upstream Qwen3-TTS talker samples the secondary codec groups by
+    default, even when the first codec group is generated greedily.  This graph
+    keeps that behavior in OpenVINO without fifteen host-side logits round
+    trips per audio frame.  It implements temperature + fixed top-k sampling
+    with externally supplied uniform noise via Gumbel-max.  The upstream
+    default uses top_k=50 and top_p=1.0, so top-p filtering is intentionally not
+    part of this graph.
+    """
+
+    def __init__(
+        self,
+        talker,
+        attention_kernel: str = "sdpa",
+        rms_export_mode: str = "default",
+        top_k: int = 50,
+    ):
+        super().__init__(talker, attention_kernel=attention_kernel, rms_export_mode=rms_export_mode)
+        self.vocab_size = int(talker.code_predictor.config.vocab_size)
+        self.top_k = max(1, min(int(top_k), self.vocab_size))
+
+    def _sample_next(self, logits, uniform_noise, temperature):
+        scores = logits.to(torch.float32)
+        temperature = torch.clamp(temperature.reshape(()).to(torch.float32), min=1.0e-6)
+        scores = scores / temperature
+        if self.top_k < self.vocab_size:
+            top_values = torch.topk(scores, self.top_k, dim=-1).values
+            threshold = top_values[:, -1:].contiguous()
+            scores = torch.where(scores < threshold, torch.full_like(scores, NEG_INF), scores)
+
+        noise = torch.clamp(uniform_noise.to(torch.float32), min=1.0e-6, max=0.999999)
+        gumbel = -torch.log(-torch.log(noise))
+        return torch.argmax(scores + gumbel, dim=-1, keepdim=True).to(torch.long)
+
+    def forward(self, past_hidden, first_code, uniform_noise, temperature):
+        first_embed = self.first_embedding(first_code)
+        cache_shape = (
+            past_hidden.shape[0],
+            self.predictor_model.config.num_key_value_heads,
+            self.max_sub_len,
+            self.predictor_model.config.head_dim,
+        )
+        past_key_values = [
+            torch.zeros(cache_shape, dtype=past_hidden.dtype, device=past_hidden.device)
+            for _ in range(self.predictor_model.config.num_hidden_layers * 2)
+        ]
+
+        hidden_states, past_key_values = self._run_predictor(
+            torch.cat([past_hidden, first_embed], dim=1),
+            torch.arange(2, dtype=torch.long, device=past_hidden.device),
+            past_key_values,
+        )
+
+        sub_codes = []
+        sub_embeds = []
+        logits = self.lm_head[0](hidden_states[:, -1:, :])[:, -1, :]
+
+        for index in range(len(self.lm_head)):
+            next_code = self._sample_next(logits, uniform_noise[:, index, :], temperature)
+            sub_codes.append(next_code)
+            next_embed = self.sub_embeddings[index](next_code)
+            sub_embeds.append(next_embed)
+            if index + 1 < len(self.lm_head):
+                hidden_states, past_key_values = self._run_predictor(
+                    next_embed,
+                    torch.tensor([index + 2], dtype=torch.long, device=past_hidden.device),
+                    past_key_values,
+                )
+                logits = self.lm_head[index + 1](hidden_states[:, -1:, :])[:, -1, :]
+
+        codes = torch.cat([first_code] + sub_codes, dim=1)
+        sum_embed = torch.cat([first_embed] + sub_embeds, dim=1).sum(1, keepdim=True)
+        return codes, sum_embed
+
+
 class SubcodeGreedyCachedNextEmbedWrapper(SubcodeGreedyCachedWrapper):
     def forward(self, past_hidden, first_code, tts_pad_embed):
         codes, sum_embed = super().forward(past_hidden, first_code)
         return codes, sum_embed + tts_pad_embed
+
+
+class SubcodeSampledCachedNextEmbedWrapper(SubcodeSampledCachedWrapper):
+    def forward(self, past_hidden, first_code, uniform_noise, temperature, tts_pad_embed):
+        codes, sum_embed = super().forward(past_hidden, first_code, uniform_noise, temperature)
+        return codes, sum_embed + tts_pad_embed
+
+
+def subcode_cached_batch_filename(attention_kernel: str = "sdpa") -> str:
+    kernel = normalize_attention_kernel(attention_kernel)
+    return "subcode_greedy_cached_batch.xml" if kernel == "sdpa" else f"subcode_greedy_cached_{kernel}_batch.xml"
+
+
+def subcode_cached_batch_key(attention_kernel: str = "sdpa") -> str:
+    kernel = normalize_attention_kernel(attention_kernel)
+    return "subcode_greedy_cached_batch" if kernel == "sdpa" else f"subcode_greedy_cached_{kernel}_batch"
 
 
 def make_subcode_wrapper(
@@ -927,6 +1020,34 @@ class DynamicStatefulTalkerPagedGQASeedWrapper(DynamicStatefulTalkerPositionIdsB
         return (logits[-1:, :], last_hidden[-1:, :, :], *present_key_values)
 
 
+class DynamicStatefulTalkerPagedBatchSeedWrapper(DynamicStatefulTalkerPagedSeedWrapper):
+    def _last_hidden(self, hidden_states):
+        return hidden_states
+
+    def _forward_position_ids(self, inputs_embeds, position_ids, attention_mask, *past_key_values):
+        return DynamicStatefulTalkerWrapper._forward_position_ids(
+            self,
+            inputs_embeds,
+            position_ids,
+            attention_mask,
+            *past_key_values,
+        )
+
+
+class DynamicStatefulTalkerPagedBatchGQASeedWrapper(DynamicStatefulTalkerPagedGQASeedWrapper):
+    def _last_hidden(self, hidden_states):
+        return hidden_states
+
+    def _forward_position_ids(self, inputs_embeds, position_ids, attention_mask, *past_key_values):
+        return DynamicStatefulTalkerWrapper._forward_position_ids(
+            self,
+            inputs_embeds,
+            position_ids,
+            attention_mask,
+            *past_key_values,
+        )
+
+
 class DynamicStatefulTalkerPagedTop1SeedWrapper(torch.nn.Module):
     def __init__(
         self,
@@ -1179,6 +1300,76 @@ class DynamicFusedCacheCodecStepPagedGQASeedWrapper(DynamicFusedCacheCodecStepPo
             no_repeat=no_repeat,
         )
         self.talker = DynamicStatefulTalkerPagedGQASeedWrapper(talker, rms_export_mode=rms_export_mode)
+
+
+class DynamicFusedCacheCodecStepPagedBatchSeedWrapper(DynamicFusedCacheCodecStepPositionIdsBeamWrapper):
+    def __init__(
+        self,
+        talker,
+        rms_export_mode: str = "default",
+        subcode_export_mode: str = "cached",
+        subcode_attention_kernel: str = "sdpa",
+        no_repeat: bool = True,
+    ):
+        super().__init__(
+            talker,
+            rms_export_mode=rms_export_mode,
+            subcode_export_mode=subcode_export_mode,
+            subcode_attention_kernel=subcode_attention_kernel,
+            no_repeat=no_repeat,
+        )
+        self.talker = DynamicStatefulTalkerPagedBatchSeedWrapper(talker, rms_export_mode=rms_export_mode)
+
+    def forward(
+        self,
+        inputs_embeds,
+        position_ids,
+        attention_mask,
+        beam_idx,
+        tts_pad_embed,
+        allow_eos,
+        *past_key_values,
+    ):
+        logits, last_hidden, *present_key_values = self.talker(
+            inputs_embeds,
+            position_ids,
+            attention_mask,
+            beam_idx,
+            *past_key_values,
+        )
+        scores = logits.to(torch.float32) + self.suppress_add
+        eos_score = torch.where(
+            allow_eos.view(-1) > 0,
+            logits[:, self.eos_id].to(torch.float32),
+            torch.full_like(logits[:, self.eos_id].to(torch.float32), NEG_INF),
+        )
+        scores = torch.cat(
+            [scores[:, : self.eos_id], eos_score.view(-1, 1), scores[:, self.eos_id + 1 :]],
+            dim=-1,
+        )
+        first_code = torch.argmax(scores, dim=-1, keepdim=True).to(torch.long)
+        codes, sum_embed = self.subcode(last_hidden, first_code)
+        frame_embed = sum_embed + tts_pad_embed
+        return (first_code, codes, frame_embed, *present_key_values)
+
+
+class DynamicFusedCacheCodecStepPagedBatchGQASeedWrapper(DynamicFusedCacheCodecStepPagedBatchSeedWrapper):
+    def __init__(
+        self,
+        talker,
+        rms_export_mode: str = "default",
+        subcode_export_mode: str = "cached",
+        subcode_attention_kernel: str = "sdpa",
+        no_repeat: bool = True,
+    ):
+        super().__init__(
+            talker,
+            rms_export_mode=rms_export_mode,
+            subcode_export_mode=subcode_export_mode,
+            subcode_attention_kernel=subcode_attention_kernel,
+            no_repeat=no_repeat,
+        )
+        self.talker = DynamicStatefulTalkerPagedBatchGQASeedWrapper(talker, rms_export_mode=rms_export_mode)
 
 
 class DynamicFusedCacheCodecUnrollPagedSeedWrapper(DynamicFusedCacheCodecStepPagedSeedWrapper):
@@ -1661,6 +1852,86 @@ def save_subcode_cached_next_embed_model(
     print(f"saved cached subcode next-embed {attention_kernel} {path} in {time.time() - started:.1f}s", flush=True)
 
 
+def save_subcode_sampled_cached_model(
+    talker,
+    path: Path,
+    attention_kernel: str = "sdpa",
+    rms_export_mode: str = "default",
+    force: bool = False,
+    next_embed: bool = False,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not force and path.exists() and path.with_suffix(".bin").exists():
+        return
+
+    started = time.time()
+    config = talker.config
+    subcode_vocab_size = int(talker.code_predictor.config.vocab_size)
+    subcode_groups = int(config.num_code_groups) - 1
+    wrapper_cls = SubcodeSampledCachedNextEmbedWrapper if next_embed else SubcodeSampledCachedWrapper
+    wrapper = wrapper_cls(
+        talker,
+        attention_kernel=attention_kernel,
+        rms_export_mode=rms_export_mode,
+    )
+    example_inputs = [
+        torch.zeros((1, 1, config.hidden_size), dtype=torch.float32),
+        torch.zeros((1, 1), dtype=torch.long),
+        torch.full((1, subcode_groups, subcode_vocab_size), 0.5, dtype=torch.float32),
+        torch.tensor([0.9], dtype=torch.float32),
+    ]
+    input_shapes = [
+        ov.PartialShape([-1, 1, config.hidden_size]),
+        ov.PartialShape([-1, 1]),
+        ov.PartialShape([-1, subcode_groups, subcode_vocab_size]),
+        ov.PartialShape([1]),
+    ]
+    input_names = ["past_hidden", "first_code", "uniform_noise", "temperature"]
+    output_names = ["codes", "next_embed" if next_embed else "sum_embed"]
+    if next_embed:
+        example_inputs.append(torch.zeros((1, 1, config.hidden_size), dtype=torch.float32))
+        input_shapes.append(ov.PartialShape([1, 1, config.hidden_size]))
+        input_names.append("tts_pad_embed")
+
+    ov_model = ov.convert_model(wrapper.eval(), example_input=tuple(example_inputs), input=input_shapes)
+    apply_io_names(ov_model, input_names, output_names)
+    ov.save_model(ov_model, path, compress_to_fp16=True)
+    kind = "sampled cached subcode next-embed" if next_embed else "sampled cached subcode"
+    print(f"saved {kind} {attention_kernel} {path} in {time.time() - started:.1f}s", flush=True)
+
+
+def save_subcode_cached_batch_model(
+    talker,
+    path: Path,
+    attention_kernel: str = "sdpa",
+    rms_export_mode: str = "default",
+    force: bool = False,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not force and path.exists() and path.with_suffix(".bin").exists():
+        return
+
+    started = time.time()
+    config = talker.config
+    wrapper = SubcodeGreedyCachedWrapper(
+        talker,
+        attention_kernel=attention_kernel,
+        rms_export_mode=rms_export_mode,
+    )
+    example_inputs = (
+        torch.zeros((2, 1, config.hidden_size), dtype=torch.float32),
+        torch.zeros((2, 1), dtype=torch.long),
+    )
+    input_shapes = [
+        ov.PartialShape([-1, 1, config.hidden_size]),
+        ov.PartialShape([-1, 1]),
+    ]
+    ov_model = ov.convert_model(wrapper.eval(), example_input=example_inputs, input=input_shapes)
+    apply_io_names(ov_model, ["past_hidden", "first_code"], ["codes", "sum_embed"])
+    ov.save_model(ov_model, path, compress_to_fp16=True)
+    print(f"saved cached batch subcode {attention_kernel} {path} in {time.time() - started:.1f}s", flush=True)
+
+
 def save_stateful_talker_model(
     talker,
     path: Path,
@@ -1825,6 +2096,49 @@ def save_paged_kv_seed_talker_model(
     print(f"saved paged-kv{suffix} seed talker {path} in {time.time() - started:.1f}s", flush=True)
 
 
+def save_paged_kv_seed_talker_batch_model(
+    talker,
+    path: Path,
+    example_seq_len: int,
+    rms_export_mode: str = "default",
+    gqa_cache: bool = False,
+    force: bool = False,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not force and path.exists() and path.with_suffix(".bin").exists():
+        return
+
+    started = time.time()
+    config = talker.config
+    kv_heads = config.num_key_value_heads if gqa_cache else config.num_attention_heads
+    head_dim = config.head_dim
+    past_shape = (1, kv_heads, 0, head_dim)
+    wrapper_cls = DynamicStatefulTalkerPagedBatchGQASeedWrapper if gqa_cache else DynamicStatefulTalkerPagedBatchSeedWrapper
+    wrapper = wrapper_cls(talker, rms_export_mode=rms_export_mode)
+    position_ids = torch.arange(example_seq_len, dtype=torch.long).view(1, -1, 1).expand(3, -1, 1)
+    example_inputs = (
+        torch.zeros((example_seq_len, 1, config.hidden_size), dtype=torch.float32),
+        position_ids,
+        torch.zeros((example_seq_len, 1, 1, 1), dtype=torch.float32),
+        torch.zeros((example_seq_len,), dtype=torch.long),
+        *[torch.zeros(past_shape, dtype=torch.float32) for _ in range(config.num_hidden_layers * 2)],
+    )
+    input_shapes = [
+        ov.PartialShape([-1, 1, config.hidden_size]),
+        ov.PartialShape([3, -1, 1]),
+        ov.PartialShape([-1, 1, 1, -1]),
+        ov.PartialShape([-1]),
+        *[ov.PartialShape([1, kv_heads, -1, head_dim]) for _ in range(config.num_hidden_layers * 2)],
+    ]
+    ov_model = ov.convert_model(wrapper.eval(), example_input=example_inputs, input=input_shapes)
+    input_names, output_names, state_pairs = make_stateful_names(config.num_hidden_layers)
+    input_names = ["inputs_embeds", "position_ids", "attention_mask", "beam_idx", *input_names[3:]]
+    apply_stateful_names(ov_model, input_names, output_names, state_pairs)
+    ov.save_model(ov_model, path, compress_to_fp16=True)
+    suffix = " gqa" if gqa_cache else ""
+    print(f"saved paged-kv{suffix} continuous-batch seed talker {path} in {time.time() - started:.1f}s", flush=True)
+
+
 def save_paged_kv_seed_talker_top1_model(
     talker,
     path: Path,
@@ -1938,6 +2252,75 @@ def save_paged_kv_seed_fused_model(
     suffix = " gqa" if gqa_cache else ""
     subcode_suffix = f" subcode-{normalize_attention_kernel(subcode_attention_kernel)}"
     print(f"saved paged-kv{suffix}{subcode_suffix} seed fused cache {path} in {time.time() - started:.1f}s", flush=True)
+
+
+def save_paged_kv_seed_fused_batch_model(
+    talker,
+    path: Path,
+    rms_export_mode: str = "default",
+    subcode_export_mode: str = "cached",
+    subcode_attention_kernel: str = "sdpa",
+    gqa_cache: bool = False,
+    force: bool = False,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not force and path.exists() and path.with_suffix(".bin").exists():
+        return
+
+    started = time.time()
+    config = talker.config
+    kv_heads = config.num_key_value_heads if gqa_cache else config.num_attention_heads
+    head_dim = config.head_dim
+    past_shape = (1, kv_heads, 0, head_dim)
+    wrapper_cls = (
+        DynamicFusedCacheCodecStepPagedBatchGQASeedWrapper
+        if gqa_cache
+        else DynamicFusedCacheCodecStepPagedBatchSeedWrapper
+    )
+    wrapper = wrapper_cls(
+        talker,
+        rms_export_mode=rms_export_mode,
+        subcode_export_mode=subcode_export_mode,
+        subcode_attention_kernel=subcode_attention_kernel,
+        no_repeat=True,
+    )
+    active = 2
+    position_ids = torch.zeros((3, active, 1), dtype=torch.long)
+    example_inputs = (
+        torch.zeros((active, 1, config.hidden_size), dtype=torch.float32),
+        position_ids,
+        torch.zeros((active, 1, 1, 1), dtype=torch.float32),
+        torch.zeros((active,), dtype=torch.long),
+        torch.zeros((1, 1, config.hidden_size), dtype=torch.float32),
+        torch.ones((active,), dtype=torch.float32),
+        *[torch.zeros(past_shape, dtype=torch.float32) for _ in range(config.num_hidden_layers * 2)],
+    )
+    input_shapes = [
+        ov.PartialShape([-1, 1, config.hidden_size]),
+        ov.PartialShape([3, -1, 1]),
+        ov.PartialShape([-1, 1, 1, -1]),
+        ov.PartialShape([-1]),
+        ov.PartialShape([1, 1, config.hidden_size]),
+        ov.PartialShape([-1]),
+        *[ov.PartialShape([1, kv_heads, -1, head_dim]) for _ in range(config.num_hidden_layers * 2)],
+    ]
+    ov_model = ov.convert_model(wrapper.eval(), example_input=example_inputs, input=input_shapes)
+    input_names, stateful_output_names, state_pairs = make_stateful_names(config.num_hidden_layers)
+    input_names = [
+        "inputs_embeds",
+        "position_ids",
+        "attention_mask",
+        "beam_idx",
+        "tts_pad_embed",
+        "allow_eos",
+        *input_names[3:],
+    ]
+    output_names = ["first_code", "codes", "frame_embed", *stateful_output_names[2:]]
+    apply_stateful_names(ov_model, input_names, output_names, state_pairs)
+    ov.save_model(ov_model, path, compress_to_fp16=True)
+    suffix = " gqa" if gqa_cache else ""
+    subcode_suffix = f" subcode-{normalize_attention_kernel(subcode_attention_kernel)}"
+    print(f"saved paged-kv{suffix}{subcode_suffix} batch fused cache {path} in {time.time() - started:.1f}s", flush=True)
 
 
 def save_paged_kv_seed_fused_unroll_model(
@@ -2438,12 +2821,20 @@ def update_manifest_subcode_graphs(out_dir: Path) -> None:
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
     graphs = manifest.setdefault("graphs", {})
+    talker_config = manifest.get("talker_config") or {}
+    code_predictor_config = talker_config.get("code_predictor_config") or {}
+    if code_predictor_config.get("vocab_size") is not None:
+        manifest["subcode_vocab_size"] = int(code_predictor_config["vocab_size"])
     for key, graph in {
         "subcode_greedy": "subcode_greedy.xml",
         "subcode_greedy_cached": "subcode_greedy_cached.xml",
+        "subcode_greedy_cached_batch": "subcode_greedy_cached_batch.xml",
         "subcode_greedy_cached_next_embed": "subcode_greedy_cached_next_embed.xml",
+        "subcode_sampled_cached": "subcode_sampled_cached.xml",
+        "subcode_sampled_cached_next_embed": "subcode_sampled_cached_next_embed.xml",
         "subcode_greedy_exact": "subcode_greedy_exact.xml",
         "subcode_greedy_cached_exact": "subcode_greedy_cached_exact.xml",
+        "subcode_greedy_cached_exact_batch": "subcode_greedy_cached_exact_batch.xml",
     }.items():
         if (out_dir / graph).exists() and (out_dir / graph).with_suffix(".bin").exists():
             graphs[key] = graph
@@ -2560,6 +2951,9 @@ def build_codegen_variant_graphs(
                 },
                 "subcode_greedy": maybe_graph(add_graph_suffix("subcode_greedy.xml", rms_suffix)),
                 "subcode_greedy_cached": maybe_graph(add_graph_suffix("subcode_greedy_cached.xml", rms_suffix)),
+                "subcode_greedy_cached_batch": maybe_graph(
+                    add_graph_suffix("subcode_greedy_cached_batch.xml", rms_suffix)
+                ),
                 "subcode_greedy_cached_next_embed": maybe_graph(
                     add_graph_suffix("subcode_greedy_cached_next_embed.xml", rms_suffix)
                 ),
@@ -2862,9 +3256,13 @@ def write_manifest(
                 key: graph
                 for key, graph in {
                     "talker_stateful": "talker_stateful_sdpa_paged_seed.xml",
+                    "talker_stateful_batch": "talker_stateful_batch_sdpa_paged_seed.xml",
+                    "fused_cache_step_batch": "fused_cache_step_batch_sdpa_paged_seed.xml",
                     "fused_cache_step": "fused_cache_step_sdpa_paged_seed.xml",
                     "talker_subcode_greedy": "fused_cache_step_sdpa_paged_seed.xml",
                     "talker_stateful_gqa": "talker_stateful_sdpa_paged_gqa_seed.xml",
+                    "talker_stateful_batch_gqa": "talker_stateful_batch_sdpa_paged_gqa_seed.xml",
+                    "fused_cache_step_batch_gqa": "fused_cache_step_batch_sdpa_paged_gqa_seed.xml",
                     "talker_top1": "talker_top1_sdpa_paged_seed.xml",
                     "talker_top1_gqa": "talker_top1_sdpa_paged_gqa_seed.xml",
                     "fused_cache_step_gqa": "fused_cache_step_sdpa_paged_gqa_seed.xml",
@@ -2913,8 +3311,23 @@ def write_manifest(
             "subcode_greedy": "subcode_greedy.xml",
             "subcode_greedy_cached": "subcode_greedy_cached.xml",
             **(
+                {"subcode_greedy_cached_batch": "subcode_greedy_cached_batch.xml"}
+                if (out_dir / "subcode_greedy_cached_batch.xml").exists()
+                else {}
+            ),
+            **(
                 {"subcode_greedy_cached_next_embed": "subcode_greedy_cached_next_embed.xml"}
                 if (out_dir / "subcode_greedy_cached_next_embed.xml").exists()
+                else {}
+            ),
+            **(
+                {"subcode_sampled_cached": "subcode_sampled_cached.xml"}
+                if (out_dir / "subcode_sampled_cached.xml").exists()
+                else {}
+            ),
+            **(
+                {"subcode_sampled_cached_next_embed": "subcode_sampled_cached_next_embed.xml"}
+                if (out_dir / "subcode_sampled_cached_next_embed.xml").exists()
                 else {}
             ),
             **{
@@ -2926,6 +3339,11 @@ def write_manifest(
                 f"subcode_greedy_cached_{kernel}": graph
                 for kernel in ["exact"]
                 if (graph := f"subcode_greedy_cached_{kernel}.xml") and (out_dir / graph).exists()
+            },
+            **{
+                f"subcode_greedy_cached_{kernel}_batch": graph
+                for kernel in ["exact"]
+                if (graph := f"subcode_greedy_cached_{kernel}_batch.xml") and (out_dir / graph).exists()
             },
             "code_frame_embedding": "code_frame_embedding.xml",
             "fused_no_cache_step": "fused_no_cache_step.xml",
@@ -2953,6 +3371,7 @@ def write_manifest(
             "suppress_from": config["talker_config"]["vocab_size"] - 1024,
         },
         "num_code_groups": config["talker_config"]["num_code_groups"],
+        "subcode_vocab_size": config["talker_config"]["code_predictor_config"]["vocab_size"],
         "sample_rate": speech_config["output_sample_rate"],
         "input_sample_rate": speech_config.get("input_sample_rate", speech_config["output_sample_rate"]),
         "encode_downsample_rate": speech_config.get("encode_downsample_rate", speech_config["decode_upsample_rate"]),
@@ -3083,7 +3502,7 @@ def main() -> None:
         "--skip-fixed-cache-graphs",
         action="store_true",
         help=(
-            "Skip legacy fixed-bucket stateful/fused cache graphs. "
+            "Skip non-production fixed-bucket stateful/fused cache graphs. "
             "Use this for the production fastest paged-KV split-subcode path to reduce export memory."
         ),
     )
@@ -3111,7 +3530,7 @@ def main() -> None:
         "--stream-decoder-input-shape",
         default="static",
         choices=["static", "dynamic"],
-        help="Export streaming decoder graphs with fixed input frames for NPU or dynamic frames for legacy runtimes.",
+        help="Export streaming decoder graphs with fixed input frames for GPU/NPU or dynamic frames for diagnostics.",
     )
     parser.add_argument(
         "--rms-export-mode",
@@ -3160,6 +3579,11 @@ def main() -> None:
     parser.add_argument("--force-tokenizer-ir", action="store_true", help="Re-export OpenVINO tokenizer/detokenizer IR.")
     parser.add_argument("--tokenizer-only", action="store_true", help="Only export OpenVINO tokenizer IR and update manifest.")
     parser.add_argument("--subcode-only", action="store_true", help="Only export standalone subcode graphs and update manifest.")
+    parser.add_argument(
+        "--paged-kv-batch-seed-only",
+        action="store_true",
+        help="Only export paged-KV continuous-batch seed graphs and update manifest.",
+    )
     args = parser.parse_args()
 
     with open(os.path.join(args.model, "config.json"), "r", encoding="utf-8") as f:
@@ -3252,6 +3676,13 @@ def main() -> None:
                 [ov.PartialShape([1, 1, talker.config.hidden_size]), ov.PartialShape([1, 1])],
                 force=args.force_cache_graphs,
             )
+            save_subcode_cached_batch_model(
+                talker,
+                out_dir / graph(subcode_cached_batch_filename(subcode_kernel)),
+                attention_kernel=subcode_kernel,
+                rms_export_mode=rms_export_mode,
+                force=args.force_cache_graphs,
+            )
             if subcode_kernel == "sdpa":
                 save_subcode_cached_next_embed_model(
                     talker,
@@ -3260,8 +3691,80 @@ def main() -> None:
                     rms_export_mode=rms_export_mode,
                     force=args.force_cache_graphs,
                 )
+                save_subcode_sampled_cached_model(
+                    talker,
+                    out_dir / graph("subcode_sampled_cached.xml"),
+                    attention_kernel=subcode_kernel,
+                    rms_export_mode=rms_export_mode,
+                    force=args.force_cache_graphs,
+                    next_embed=False,
+                )
+                save_subcode_sampled_cached_model(
+                    talker,
+                    out_dir / graph("subcode_sampled_cached_next_embed.xml"),
+                    attention_kernel=subcode_kernel,
+                    rms_export_mode=rms_export_mode,
+                    force=args.force_cache_graphs,
+                    next_embed=True,
+                )
         update_manifest_subcode_graphs(out_dir)
         print(f"subcode export complete: {out_dir / 'manifest.json'}", flush=True)
+        return
+    if args.paged_kv_batch_seed_only:
+        started = time.time()
+        model = load_model(args.model)
+        talker = model.talker
+        print(f"loaded PyTorch model for paged-KV batch seed export in {time.time() - started:.1f}s", flush=True)
+        save_paged_kv_seed_talker_batch_model(
+            talker,
+            out_dir / "talker_stateful_batch_sdpa_paged_seed.xml",
+            args.example_seq_len,
+            rms_export_mode=rms_export_mode,
+            force=args.force_paged_kv_seed or args.force_cache_graphs,
+        )
+        save_paged_kv_seed_talker_batch_model(
+            talker,
+            out_dir / "talker_stateful_batch_sdpa_paged_gqa_seed.xml",
+            args.example_seq_len,
+            rms_export_mode=rms_export_mode,
+            gqa_cache=True,
+            force=args.force_paged_kv_seed or args.force_cache_graphs,
+        )
+        save_paged_kv_seed_fused_batch_model(
+            talker,
+            out_dir / "fused_cache_step_batch_sdpa_paged_seed.xml",
+            rms_export_mode=rms_export_mode,
+            subcode_export_mode="cached",
+            subcode_attention_kernel="sdpa",
+            force=args.force_paged_kv_seed or args.force_cache_graphs,
+        )
+        save_paged_kv_seed_fused_batch_model(
+            talker,
+            out_dir / "fused_cache_step_batch_sdpa_paged_gqa_seed.xml",
+            rms_export_mode=rms_export_mode,
+            subcode_export_mode="cached",
+            subcode_attention_kernel="sdpa",
+            gqa_cache=True,
+            force=args.force_paged_kv_seed or args.force_cache_graphs,
+        )
+        write_manifest(
+            args.model,
+            out_dir,
+            decoder_tokens,
+            cache_buckets,
+            cache_kernels,
+            fused_cache_kernels,
+            fused_cache_unroll_steps,
+            fused_cache_decode_unroll_steps,
+            fused_cache_stateful_mask_steps,
+            fused_cache_norepeat_steps,
+            paged_kv_unroll_steps,
+            stream_decoder_chunks,
+            args.stream_decoder_left_context,
+            stream_decoder_first_chunks,
+            args.stream_decoder_input_shape,
+        )
+        print(f"paged-KV batch seed export complete: {out_dir / 'manifest.json'}", flush=True)
         return
 
     core_paths = [
@@ -3270,7 +3773,10 @@ def main() -> None:
         out_dir / graph("talker_no_cache.xml"),
         out_dir / graph("subcode_greedy.xml"),
         out_dir / graph("subcode_greedy_cached.xml"),
+        out_dir / graph("subcode_greedy_cached_batch.xml"),
         out_dir / graph("subcode_greedy_cached_next_embed.xml"),
+        out_dir / graph("subcode_sampled_cached.xml"),
+        out_dir / graph("subcode_sampled_cached_next_embed.xml"),
         out_dir / "code_frame_embedding.xml",
         out_dir / fused_graph("fused_no_cache_step.xml"),
     ]
@@ -3279,6 +3785,7 @@ def main() -> None:
             continue
         core_paths.append(out_dir / graph(f"subcode_greedy_{kernel}.xml"))
         core_paths.append(out_dir / graph(f"subcode_greedy_cached_{kernel}.xml"))
+        core_paths.append(out_dir / graph(subcode_cached_batch_filename(kernel)))
     if not skip_fixed_cache_graphs:
         core_paths.extend(
             out_dir / graph(f"talker_stateful_{kernel}_cache{length}.xml")
@@ -3325,6 +3832,10 @@ def main() -> None:
             [
                 out_dir / "talker_stateful_sdpa_paged_seed.xml",
                 out_dir / "talker_stateful_sdpa_paged_gqa_seed.xml",
+                out_dir / "talker_stateful_batch_sdpa_paged_seed.xml",
+                out_dir / "talker_stateful_batch_sdpa_paged_gqa_seed.xml",
+                out_dir / "fused_cache_step_batch_sdpa_paged_seed.xml",
+                out_dir / "fused_cache_step_batch_sdpa_paged_gqa_seed.xml",
                 out_dir / "talker_top1_sdpa_paged_seed.xml",
                 out_dir / "talker_top1_sdpa_paged_gqa_seed.xml",
             ]
@@ -3411,6 +3922,38 @@ def main() -> None:
                 gqa_cache=True,
                 force=force_paged_kv_seed,
             )
+            save_paged_kv_seed_talker_batch_model(
+                talker,
+                out_dir / "talker_stateful_batch_sdpa_paged_seed.xml",
+                args.example_seq_len,
+                rms_export_mode=rms_export_mode,
+                force=force_paged_kv_seed,
+            )
+            save_paged_kv_seed_talker_batch_model(
+                talker,
+                out_dir / "talker_stateful_batch_sdpa_paged_gqa_seed.xml",
+                args.example_seq_len,
+                rms_export_mode=rms_export_mode,
+                gqa_cache=True,
+                force=force_paged_kv_seed,
+            )
+            save_paged_kv_seed_fused_batch_model(
+                talker,
+                out_dir / "fused_cache_step_batch_sdpa_paged_seed.xml",
+                rms_export_mode=rms_export_mode,
+                subcode_export_mode="cached",
+                subcode_attention_kernel="sdpa",
+                force=force_paged_kv_seed,
+            )
+            save_paged_kv_seed_fused_batch_model(
+                talker,
+                out_dir / "fused_cache_step_batch_sdpa_paged_gqa_seed.xml",
+                rms_export_mode=rms_export_mode,
+                subcode_export_mode="cached",
+                subcode_attention_kernel="sdpa",
+                gqa_cache=True,
+                force=force_paged_kv_seed,
+            )
             save_paged_kv_seed_talker_top1_model(
                 talker,
                 out_dir / "talker_top1_sdpa_paged_seed.xml",
@@ -3444,10 +3987,27 @@ def main() -> None:
             out_dir / graph("subcode_greedy_cached.xml"),
             [ov.PartialShape([1, 1, talker.config.hidden_size]), ov.PartialShape([1, 1])],
         )
+        save_subcode_cached_batch_model(
+            talker,
+            out_dir / graph("subcode_greedy_cached_batch.xml"),
+            rms_export_mode=rms_export_mode,
+        )
         save_subcode_cached_next_embed_model(
             talker,
             out_dir / graph("subcode_greedy_cached_next_embed.xml"),
             rms_export_mode=rms_export_mode,
+        )
+        save_subcode_sampled_cached_model(
+            talker,
+            out_dir / graph("subcode_sampled_cached.xml"),
+            rms_export_mode=rms_export_mode,
+            next_embed=False,
+        )
+        save_subcode_sampled_cached_model(
+            talker,
+            out_dir / graph("subcode_sampled_cached_next_embed.xml"),
+            rms_export_mode=rms_export_mode,
+            next_embed=True,
         )
         for subcode_kernel in standalone_subcode_attention_kernels:
             if subcode_kernel == "sdpa":
@@ -3477,6 +4037,12 @@ def main() -> None:
                 ),
                 out_dir / graph(f"subcode_greedy_cached_{subcode_kernel}.xml"),
                 [ov.PartialShape([1, 1, talker.config.hidden_size]), ov.PartialShape([1, 1])],
+            )
+            save_subcode_cached_batch_model(
+                talker,
+                out_dir / graph(subcode_cached_batch_filename(subcode_kernel)),
+                attention_kernel=subcode_kernel,
+                rms_export_mode=rms_export_mode,
             )
         save_openvino_model(
             FusedNoCacheCodecStepWrapper(

@@ -25,7 +25,6 @@ export = [
   "nncf",
   "modelscope",
   "openvino-tokenizers",
-  "onnxruntime",
   "sox",
   "torchaudio",
 ]
@@ -41,7 +40,6 @@ quality = [
 native = [
   "openvino-genai",
   "openvino-tokenizers",
-  "onnxruntime",
 ]
 audio-full = [
   "librosa",
@@ -66,11 +64,23 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["qwen3_tts_ov"]
+packages = ["qwen3_tts_ov", "qwen3_tts_ov.web_static"]
+
+[tool.setuptools.package-data]
+qwen3_tts_ov = ["default_policy_summary.json"]
+"qwen3_tts_ov.web_static" = ["*.html", "*.css", "*.js"]
 
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+exclude = [
+  "third_party",
+  "models",
+  "openvino",
+  "openvino_full",
+  "outputs",
+  "native/build",
+]
 
 [tool.ty.src]
 include = [
@@ -81,10 +91,12 @@ include = [
   "qwen3_tts_ov/cache.py",
   "qwen3_tts_ov/cache_warmup.py",
   "qwen3_tts_ov/cli.py",
+  "qwen3_tts_ov/default_policy.py",
   "qwen3_tts_ov/fast_path.py",
   "qwen3_tts_ov/manifest.py",
   "qwen3_tts_ov/model_download.py",
   "qwen3_tts_ov/npu_offload_profile.py",
+  "qwen3_tts_ov/online_batch.py",
   "qwen3_tts_ov/profiles.py",
   "qwen3_tts_ov/release_server.py",
   "qwen3_tts_ov/web_client.py",

@@ -71,7 +71,7 @@ def test_continuous_long_output_metadata_defaults_to_full_ar(monkeypatch):
 
     assert metadata["long_text_mode"] == "full_ar"
     assert metadata["segmented"] is False
-    assert metadata["continuous_backend"] == "single_prompt_full_ar_reference"
+    assert metadata["continuous_backend"] == "vllm_like_online_scheduler"
     assert metadata["paged_kv"] is False
 
 
@@ -81,7 +81,7 @@ def test_paged_long_ar_requires_explicit_enable(monkeypatch):
 
     metadata = server.continuous_long_output_metadata(True)
 
-    assert metadata["continuous_backend"] == "native_paged_attention"
+    assert metadata["continuous_backend"] == "vllm_like_online_scheduler_paged_kv"
     assert metadata["paged_kv"] is True
 
 
@@ -225,7 +225,10 @@ def test_sidecar_long_text_uses_builtin_paged_sample_profile_without_outputs_sum
             )
 
     monkeypatch.setattr(server, "OpenVINOQwen3TTS", FakeRuntime)
-    app = server.create_app(model_root=tmp_path / "openvino", warmup=False)
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+    )
     client = fastapi_testclient.TestClient(app)
 
     with client.websocket_connect("/v1/tts/stream") as websocket:
@@ -233,14 +236,15 @@ def test_sidecar_long_text_uses_builtin_paged_sample_profile_without_outputs_sum
             {
                 "mode": "voice_design",
                 "text": "这是一段长文本，用来验证整理仓库之后不会因为 outputs 目录被清理而退回慢速 reference 路径。",
+                "online_batching": False,
                 "generation": {"max_new_tokens": 160},
                 "stream": {"include_chunk_metadata": True},
             }
         )
         assert websocket.receive_json()["type"] == "metadata"
-        assert websocket.receive_json()["type"] == "audio"
-        websocket.receive_bytes()
-        assert websocket.receive_json()["type"] == "final"
+        error = websocket.receive_json()
+        assert error["type"] == "error"
+        assert "online batching is the only sidecar generation backend" in error["message"]
 
     assert runtime_kwargs[0]["graph_variant"] == "int8_sym_paged_talker_split"
     assert runtime_kwargs[0]["mode"] == "no-cache"
@@ -601,7 +605,11 @@ def test_tokenize_endpoint_uses_real_tokenizer_budget(monkeypatch, tmp_path):
             return list(range(len(str(text))))
 
     monkeypatch.setattr(server, "Qwen2BPETokenizer", FakeTokenizer)
-    app = server.create_app(model_root=tmp_path / "openvino", warmup=False, device="GPU")
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        device="GPU",
+    )
     client = fastapi_testclient.TestClient(app)
 
     request = {
@@ -622,7 +630,7 @@ def test_tokenize_endpoint_uses_real_tokenizer_budget(monkeypatch, tmp_path):
     assert data["text_tokens"] == expected_text
     assert data["instruct_tokens"] == expected_instruct
     assert data["codec_prefill_tokens"] == 4
-    assert data["prompt_len"] == expected_text + expected_instruct + 4 - 3
+    assert data["prompt_len"] == expected_text + expected_instruct + 4 - 2
     assert data["effective_max_continuous_prompt_tokens"] == 1280
     assert data["max_vram_percent"] == 50
     assert data["over_prompt_budget"] is False
@@ -793,7 +801,11 @@ def test_default_auto_budget_allows_prompt_above_old_1024_limit(monkeypatch, tmp
             )
 
     monkeypatch.setattr(server, "OpenVINOQwen3TTS", FakeRuntime)
-    app = server.create_app(model_root=tmp_path / "openvino", warmup=False, device="GPU")
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        device="GPU",
+    )
     client = fastapi_testclient.TestClient(app)
 
     with client.websocket_connect("/v1/tts/stream") as websocket:
@@ -801,6 +813,7 @@ def test_default_auto_budget_allows_prompt_above_old_1024_limit(monkeypatch, tmp
             {
                 "mode": "voice_design",
                 "text": "长" * 1100,
+                "online_batching": False,
                 "generation": {"max_new_tokens": 2048},
                 "stream": {"include_chunk_metadata": True},
             }
@@ -808,12 +821,12 @@ def test_default_auto_budget_allows_prompt_above_old_1024_limit(monkeypatch, tmp
         metadata = websocket.receive_json()
         assert metadata["type"] == "metadata"
         assert metadata["effective_max_continuous_prompt_tokens"] == 2048
-        assert websocket.receive_json()["type"] == "audio"
-        websocket.receive_bytes()
-        assert websocket.receive_json()["type"] == "final"
+        error = websocket.receive_json()
+        assert error["type"] == "error"
+        assert "online batching is the only sidecar generation backend" in error["message"]
 
 
-def test_full_context_stream_runs_until_eos_or_context_capacity(monkeypatch, tmp_path):
+def test_full_context_stream_respects_explicit_max_new_tokens(monkeypatch, tmp_path):
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
 
     monkeypatch.chdir(tmp_path)
@@ -880,31 +893,70 @@ def test_full_context_stream_runs_until_eos_or_context_capacity(monkeypatch, tmp
                 "mode": "voice_design",
                 "text": text,
                 "full_context_text": True,
+                "online_batching": False,
                 "generation": {"max_new_tokens": 48},
                 "stream": {"include_chunk_metadata": True},
             }
         )
         metadata = websocket.receive_json()
         assert metadata["type"] == "metadata"
-        assert metadata["generation_stop_condition"] == "eos_or_context_limit"
-        assert metadata["max_new_tokens"] == metadata["max_generation_tokens_available"]
+        assert metadata["generation_stop_condition"] == "eos_or_effective_max_new_tokens_or_context_limit"
+        assert metadata["generation_max_new_tokens_source"] == "explicit_request"
+        assert metadata["requested_max_new_tokens"] == 48
+        assert metadata["max_new_tokens"] == 48
+        assert metadata["effective_max_new_tokens"] == 48
+        assert metadata["max_new_tokens"] < metadata["max_generation_tokens_available"]
+        assert metadata["context_generation_limit_tokens"] == 48
+        assert metadata["context_generation_remaining_tokens"] == 48
         assert metadata["context_generated_tokens"] == 0
         assert metadata["context_used_tokens"] == metadata["prompt_len"]
-        final = websocket.receive_json()
-        assert final["type"] == "final"
-        timings = final["timings"]
-        assert timings["context_limit_tokens"] == metadata["effective_max_total_tokens"]
-        assert abs(timings["context_prompt_tokens"] - metadata["prompt_len"]) <= 1
-        assert timings["context_generated_tokens"] == 1
-        assert timings["context_used_tokens"] == timings["context_prompt_tokens"] + 1
-        assert timings["context_remaining_tokens"] == (
-            timings["context_limit_tokens"] - timings["context_prompt_tokens"] - timings["context_generated_tokens"] - 1
-        )
-        assert timings["context_usage_percent"] >= metadata["context_usage_percent"]
-        assert final["timings"]["context_generated_tokens"] == 1
+        error = websocket.receive_json()
+        assert error["type"] == "error"
+        assert "online batching is the only sidecar generation backend" in error["message"]
 
-    assert abs(stream_kwargs[0]["max_new_tokens"] - metadata["max_generation_tokens_available"]) <= 1
-    assert stream_kwargs[0]["max_new_tokens"] > 48
+    assert stream_kwargs == []
+
+
+def test_full_context_budget_uses_text_estimate_when_max_new_tokens_is_omitted():
+    request = {
+        "mode": "voice_clone",
+        "text": "这是一段完整上下文长文本测试。" * 20,
+        "full_context_text": True,
+    }
+
+    metadata = server.full_context_generation_budget(
+        request,
+        "voice_clone",
+        512,
+        max_generation_tokens_available=32768,
+    )
+
+    assert metadata["generation_max_new_tokens_source"] == "text_token_estimate"
+    assert metadata["effective_max_new_tokens"] == metadata["estimated_full_context_max_new_tokens"]
+    assert metadata["effective_max_new_tokens"] < 32768
+    assert metadata["requested_generation_over_budget"] is False
+
+
+def test_full_context_budget_clamps_to_context_capacity():
+    request = {
+        "mode": "voice_design",
+        "text": "长文本测试。",
+        "full_context_text": True,
+        "generation": {"max_new_tokens": 5000},
+    }
+
+    metadata = server.full_context_generation_budget(
+        request,
+        "voice_design",
+        5000,
+        max_generation_tokens_available=128,
+    )
+
+    assert metadata["generation_max_new_tokens_source"] == "explicit_request"
+    assert metadata["requested_max_new_tokens"] == 5000
+    assert metadata["effective_max_new_tokens"] == 128
+    assert metadata["remaining_generation_tokens"] == 0
+    assert metadata["requested_generation_over_budget"] is True
 
 
 def test_explicit_1024_budget_still_blocks_oversized_prompt(monkeypatch, tmp_path):

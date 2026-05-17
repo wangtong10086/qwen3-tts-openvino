@@ -1,61 +1,36 @@
-# 辅助脚本
+# scripts
 
-正式 CLI 入口是：
+本目录只保留生产构建、release、benchmark 和质量门禁脚本。
 
-```bash
-uv run python -m qwen3_tts_ov --help
-```
+## 构建与发布
 
-如果已执行 `uv pip install -e .`，也可以使用：
+- `build_native_codegen.py`: 构建 native C++ OpenVINO backend。
+- `compress_openvino_weights.py`: 生成生产 `fastest` / minimal online-batching graph variants。
+- `package_ir.py`: 打包 OpenVINO IR。
+- `package_release.py`: 打包 Linux/Windows runtime。
+- `upload_hf_ir.py` / `download_hf_ir.py`: Hugging Face IR 上传和下载。
 
-```bash
-uv run qwen3-tts-ov --help
-```
+## 性能
 
-## 生产流程脚本
+- `benchmark_online_continuous_batch.py`: 测量当前 layered vLLM-like online batching。
+- `benchmark_prompt_batch_matrix.py`: 按 batch、prompt 长度、离线/在线到达场景运行矩阵 benchmark。
+- `benchmark_windows_gpu_npu_release.py`: Windows release 包 GPU/NPU 对照。
 
-- `build_native_codegen.py`: 构建必需的 native C++ pipeline 共享库和 standalone smoke CLI。
-- `compress_openvino_weights.py`: 对已导出的 OpenVINO IR 做权重压缩，并更新 manifest variants。
-- `package_release.py`: 打包最终用户侧 Linux/Windows sidecar app 包。
-- `package_ir.py`: 打包独立 OpenVINO IR 模型包。
-- `upload_hf_ir.py`: 上传公开 Hugging Face IR。默认使用 `runtime-minimal` staging，并在上传前清理远端目标目录，避免遗留旧 `speech_decoder`、`talker_stateful` 或诊断图。
-- `benchmark_streaming_realtime.py`: 用子进程隔离验证 `fastest` profile 的短文本流式 RTF。
-- `evaluate_long_text_quality.py`: 对长文本 full-AR 候选 profile 做客观检查和可选 Omni 质量评测。
-- `probe_windows_gpu_npu.py`: 检查 Windows OpenVINO `GPU`/`NPU` 可用性，并尝试把 streaming decoder、VoiceDesign prompt graphs 和可选 Base/VoiceClone audio encoders 编译到 NPU。
-- `windows_gpu_npu_smoke.ps1`: Windows 本地 PowerShell 入口，串联 GPU+NPU probe 和真实 streaming TTS smoke；支持 `-Mode voice_clone -RefAudio ...` 来实际覆盖参考音频 encoder 的 NPU offload。
-- `collect_windows_accelerator_counters.ps1`: Windows 性能计数器采集器，自动发现 GPU/NPU utilization/usage/busy/load counter，优先按 release server PID 过滤进程级 counter，用于验证 NPU offload 是否降低 GPU 负载。
-- `benchmark_windows_gpu_npu_release.py`: 对同一个 release 包分别运行 GPU-only、NPU decoder、NPU audio 和可选 NPU all，输出首包、RTF、总耗时、实际设备、实际执行的 runtime stage 和可选 GPU/NPU 计数器；可选 `--mode voice_clone` 触发参考音频 encoder。
-- `analyze_windows_gpu_npu_results.py`: 离线审计 Windows GPU+NPU artifact，检查实际设备、probe 编译、RTF、GPU utilization 降幅和阈值门禁。
-- `windows_gpu_npu_benchmark.ps1`: Windows 本地 PowerShell benchmark 入口，会构建/下载模型、运行 GPU+NPU probe、执行 GPU-only/NPU 对比 benchmark，并生成 `analysis.json`；传入 `-CollectCounters` 可同时记录 GPU/NPU 利用率。
+## 质量
 
-GitHub Actions 只构建 Linux/Windows `runtime-minimal` 包并做无模型 package smoke，不验证 Windows NPU。GPU+NPU 真实 smoke、VoiceClone 参考音频 encoder 覆盖和性能计数器采样都需要在 Windows 原生机器上运行上述 PowerShell 脚本。
+- `evaluate_single_arch_gate.py`: 生产架构发布 gate，覆盖 VoiceDesign、CustomVoice、VoiceClone。
+- `evaluate_prefill_quality.py`: 与原始 PyTorch 输出对照，当前只保留 runtime candidate 路径。
+- `evaluate_default_policy_quality.py`: 汇总默认策略质量结果。
+- `audit_prefill_quality_coverage.py`: 审计 quality summary 是否满足发布覆盖要求。
+- `verify_long_autoregressive_parity.py`: 对比长文本 full-AR codec 行为。
+- `verify_paged_kv_correctness.py`: 检查 paged-KV 图和 runtime 行为。
 
-`benchmark_windows_gpu_npu_release.py` 生成的 `benchmark-summary.json` 可以直接传给 release server：
+## Windows GPU+NPU
 
-```powershell
-qwen3-tts-ov-server.exe --npu-offload-summary build\windows-gpu-npu-benchmark\benchmark-summary.json
-```
+- `probe_windows_gpu_npu.py`
+- `analyze_windows_gpu_npu_results.py`
+- `collect_windows_accelerator_counters.ps1`
+- `windows_gpu_npu_smoke.ps1`
+- `windows_gpu_npu_benchmark.ps1`
 
-服务端会按 `recommendation` 自动设置 `--npu-offload`；默认策略是 `balanced`。源码 CLI 的 `serve` 和 `cache-warmup` 也支持同样的 `--npu-offload-summary` / `--npu-offload-policy` 参数，方便先按 benchmark 结果预热缓存，再启动同配置服务。
-
-需要确认 NPU audio stage 被真实执行时，使用 `windows_gpu_npu_benchmark.ps1 -Mode voice_clone -RefAudio ... -RequireExercisedNpuStages`。
-
-日常不需要手动串联这些脚本，优先使用正式 CLI：
-
-```bash
-uv run python -m qwen3_tts_ov build-fastest --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign
-```
-
-`build-fastest` 默认使用低内存 production 图集合。只有需要旧 fixed-bucket/unroll 诊断图时才加 `--graph-set compat`。
-
-release 和 Hugging Face IR 上传默认使用 `--profile runtime-minimal`，只保留生产推荐路径；调试完整 manifest/fallback 时使用 `--profile full`。
-
-## 诊断脚本
-
-- `verify_long_autoregressive_parity.py`: 对比 OpenVINO full-AR codec 生成和上游 PyTorch 链路。
-- `verify_paged_kv_correctness.py`: 对比 paged-KV codec 结果和 reference profile。
-- `audit_paged_kv_conversion.py`: 检查 `SDPAToPagedAttention` 转换覆盖率。
-- `convert_paged_kv_graphs.py`: 离线转换 paged-KV seed graph，仅用于调试。
-- `build_paged_kv_tool.py`: 构建离线 paged-KV 诊断工具。
-
-历史 benchmark、PTQ 对照、profiling 和 legacy 入口放在 `devtools/`。这些脚本不属于生产主线，可能需要额外依赖或本机实验 IR。
+脚本输出默认写入 `outputs/`，不进入 git。

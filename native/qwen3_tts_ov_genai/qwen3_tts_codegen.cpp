@@ -28,6 +28,7 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -51,6 +52,35 @@ struct NamedTensor {
     ov::Tensor tensor;
 };
 
+struct OnlineBatchSequence {
+    int64_t id = 0;
+    int64_t prompt_len = 0;
+    int64_t hidden_size = 0;
+    int64_t max_new_tokens = 0;
+    int64_t min_new_tokens = 0;
+    int64_t vocab_size = 0;
+    int64_t num_code_groups = 0;
+    int64_t eos_token_id = 0;
+    int64_t generated = 0;
+    int64_t block_offset = 0;
+    int64_t block_capacity = 0;
+    float repetition_penalty = 1.0f;
+    bool do_sample = false;
+    int64_t top_k = 50;
+    float top_p = 1.0f;
+    float temperature = 0.9f;
+    uint64_t seed = 0;
+    bool stop = false;
+    bool pending_prefill = true;
+    std::vector<float> prompt;
+    std::vector<float> next_embed;
+    std::vector<uint8_t> repeated_first_codes;
+    std::mt19937_64 rng;
+    double queued_at_ms = 0.0;
+    double ttft_ms = -1.0;
+    double last_token_ms = 0.0;
+};
+
 struct NativeCodegen {
     ov::Core core;
     ov::CompiledModel prefill_model;
@@ -58,6 +88,7 @@ struct NativeCodegen {
     ov::CompiledModel text_embedding_model;
     ov::CompiledModel codec_embedding_model;
     ov::CompiledModel subcode_model;
+    ov::CompiledModel batch_subcode_model;
     ov::CompiledModel first_stream_decoder_model;
     ov::CompiledModel steady_stream_decoder_model;
     ov::InferRequest prefill_request;
@@ -65,6 +96,9 @@ struct NativeCodegen {
     ov::InferRequest text_embedding_request;
     ov::InferRequest codec_embedding_request;
     ov::InferRequest subcode_request;
+    ov::InferRequest batch_subcode_request;
+    std::vector<ov::InferRequest> sampled_subcode_row_requests;
+    ov::InferRequest online_logits_decode_request;
     ov::InferRequest first_stream_decoder_request;
     ov::InferRequest steady_stream_decoder_request;
     std::unique_ptr<ov::genai::Tokenizer> tokenizer;
@@ -80,16 +114,42 @@ struct NativeCodegen {
     bool subcode_outputs_next_embed = false;
     bool paged_static_decode_enabled = false;
     bool paged_static_decode_requested = false;
+    bool paged_fused_batch_decode_enabled = false;
+    bool batch_subcode_enabled = false;
+    std::string online_scheduler = "legacy";
+    std::vector<int64_t> prefill_seq_buckets{128, 256, 512, 1024};
+    std::vector<int64_t> prefill_batch_buckets{1, 2, 4, 8};
+    std::vector<int64_t> decode_batch_buckets{1, 2, 4, 8, 16};
+    std::string prefill_mode = "serial";
+    int64_t max_num_batched_tokens = 16;
+    std::string continuous_batch_policy = "raw_fused";
+    int64_t batch_decode_unroll_requested = 1;
+    int64_t batch_decode_unroll = 1;
     int64_t paged_kv_block_size = 8;
     int64_t paged_kv_heads = 16;
     int64_t paged_kv_head_dim = 128;
     int64_t paged_static_decode_block_capacity = 0;
     std::string paged_static_decode_mode = "dynamic";
     std::string paged_static_decode_failure;
+    std::string paged_fused_batch_decode_graph;
     std::string paged_kv_precision = "f16";
     std::string paged_kv_cache_input_precision = "f32";
     int64_t paged_kv_cache_tensor_blocks = 0;
     std::vector<NamedTensor> paged_kv_cache_tensors;
+    bool online_batch_ready = false;
+    int64_t online_batch_next_id = 1;
+    int64_t online_batch_hidden_size = 0;
+    int64_t online_batch_vocab_size = 0;
+    int64_t online_batch_num_code_groups = 0;
+    int64_t online_batch_eos_token_id = 0;
+    int64_t online_batch_cache_block_capacity = 0;
+    int64_t online_batch_next_block_offset = 0;
+    int64_t online_batch_total_requests = 0;
+    int64_t online_batch_finished_requests = 0;
+    std::vector<float> online_batch_tts_pad_embed;
+    std::map<int64_t, OnlineBatchSequence> online_batch_sequences;
+    std::deque<int64_t> online_batch_pending_ids;
+    std::vector<std::pair<int64_t, int64_t>> online_batch_free_blocks;
     int64_t tts_bos_token_id = 0;
     int64_t tts_eos_token_id = 0;
     int64_t tts_pad_token_id = 0;
@@ -144,6 +204,47 @@ struct NativeCodegen {
         int64_t split_subcode_hidden_direct_bind_count = 0;
         int64_t split_subcode_hidden_bind_fallback_count = 0;
         uint64_t split_subcode_hidden_copy_bytes = 0;
+        bool split_subcode_remote_next_embed_enabled = false;
+        int64_t split_subcode_remote_next_embed_fallback_count = 0;
+        int64_t split_subcode_next_embed_host_read_count = 0;
+        bool decode_step_prebind_enabled = false;
+        int64_t decode_step_prebind_fallback_count = 0;
+        double decode_step_prebind_update_ms = 0.0;
+        bool batch_prefill_enabled = false;
+        std::string prefill_mode = "serial";
+        bool batch_subcode_enabled = false;
+        std::string online_scheduler = "legacy";
+        int64_t max_num_batched_tokens = 0;
+        int64_t prefill_seq_bucket = 0;
+        int64_t prefill_batch_bucket = 0;
+        int64_t decode_batch_bucket = 0;
+        int64_t prefill_token_budget = 0;
+        int64_t decode_token_budget = 0;
+        std::vector<int64_t> prefill_seq_bucket_histogram;
+        std::vector<int64_t> prefill_batch_bucket_histogram;
+        std::vector<int64_t> decode_batch_bucket_histogram;
+        std::string sampled_batch_subcode_policy = "off";
+        bool sampled_batch_subcode_used = false;
+        bool sampled_batch_subcode_verified = false;
+        int64_t sampled_batch_subcode_fallback_count = 0;
+        int64_t sampled_batch_subcode_mismatch_count = 0;
+        int64_t sampled_batch_subcode_code_mismatch_count = 0;
+        int64_t sampled_batch_subcode_embed_mismatch_count = 0;
+        double sampled_batch_subcode_max_abs_diff = 0.0;
+        std::string sampled_batch_subcode_fallback_reason;
+        bool sampled_subcode_parallel_rows = false;
+        int64_t sampled_subcode_parallel_row_count = 0;
+        bool batch_buffer_reuse = false;
+        int64_t batch_decode_unroll = 1;
+        int64_t batch_decode_unroll_requested = 1;
+        int64_t batch_decode_unroll_fallback_count = 0;
+        int64_t batch_fused_decode_step_count = 0;
+        int64_t batch_fused_decode_token_count = 0;
+        int64_t batch_single_decode_step_count = 0;
+        int64_t batch_single_decode_token_count = 0;
+        int64_t batch_fused_decode_active1_bypass_count = 0;
+        int64_t batch_fused_decode_logits_bypass_count = 0;
+        std::vector<int64_t> active_batch_histogram;
         double sampling_ms = 0.0;
         double decode_infer_ms = 0.0;
         double callback_ms = 0.0;
@@ -173,6 +274,7 @@ struct NativeCodegen {
         std::vector<double> subcode_infer_step_ms;
         std::vector<double> subcode_output_read_step_ms;
         std::vector<double> subcode_next_embed_step_ms;
+        std::vector<double> decode_step_prebind_update_step_ms;
         double pcm_convert_ms = 0.0;
         double total_ms = 0.0;
     };
@@ -187,6 +289,8 @@ struct NativeCodegen {
         std::vector<float> penalty;
         std::vector<float> next_embed;
         std::vector<float> subcode_past_hidden;
+        std::vector<float> subcode_uniform_noise;
+        std::vector<float> subcode_temperature;
     };
     std::unordered_map<std::string, ProfileEntry> profile_ops;
     std::unordered_map<std::string, std::vector<float>> prompt_embedding_cache;
@@ -289,6 +393,44 @@ bool enabled_env(const char* name, bool default_value) {
         return true;
     }
     return default_value;
+}
+
+std::string normalize_continuous_batch_policy(std::string policy) {
+    policy = lower_text(policy);
+    std::replace(policy.begin(), policy.end(), '-', '_');
+    if (policy.empty()) {
+        return "raw_fused";
+    }
+    return policy;
+}
+
+bool valid_continuous_batch_policy(const std::string& policy) {
+    return
+        policy == "raw_fused" ||
+        policy == "adaptive" ||
+        policy == "adaptive_v2" ||
+        policy == "context_bucketed" ||
+        policy == "unified_vllm" ||
+        policy == "layered_vllm" ||
+        policy == "raw_fused_v2";
+}
+
+std::string continuous_batch_policy_error() {
+    return "QWEN3_TTS_OV_NATIVE_CONTINUOUS_BATCH_POLICY must be raw_fused, adaptive, adaptive_v2, "
+           "context_bucketed, unified_vllm, layered_vllm, or raw_fused_v2";
+}
+
+bool continuous_policy_uses_single_row_fast_path(const std::string& policy) {
+    return
+        policy == "adaptive" ||
+        policy == "adaptive_v2" ||
+        policy == "unified_vllm" ||
+        policy == "layered_vllm" ||
+        policy == "raw_fused_v2";
+}
+
+bool continuous_policy_uses_batched_prefill(const std::string& policy) {
+    return policy == "adaptive_v2" || policy == "unified_vllm" || policy == "layered_vllm" || policy == "raw_fused_v2";
 }
 
 void apply_env_property(ov::AnyMap& config, const char* env_name, const char* property_name) {
@@ -966,6 +1108,103 @@ int64_t env_int64(const char* name, int64_t default_value) {
     }
 }
 
+std::vector<int64_t> parse_int64_list(const std::string& text, const std::vector<int64_t>& defaults) {
+    std::vector<int64_t> values;
+    std::stringstream stream(text);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        item.erase(std::remove_if(item.begin(), item.end(), [](unsigned char ch) {
+            return std::isspace(ch) != 0;
+        }), item.end());
+        if (item.empty()) {
+            continue;
+        }
+        try {
+            const int64_t parsed = std::stoll(item);
+            if (parsed > 0) {
+                values.push_back(parsed);
+            }
+        } catch (...) {
+        }
+    }
+    if (values.empty()) {
+        values = defaults;
+    }
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    return values;
+}
+
+std::vector<int64_t> env_int64_list(const char* name, const std::vector<int64_t>& defaults) {
+    const char* value = std::getenv(name);
+    if (!value || std::strlen(value) == 0 || disabled_env_value(value)) {
+        return defaults;
+    }
+    return parse_int64_list(value, defaults);
+}
+
+int64_t bucket_ge(const std::vector<int64_t>& buckets, int64_t value) {
+    if (buckets.empty()) {
+        return std::max<int64_t>(1, value);
+    }
+    for (const int64_t bucket : buckets) {
+        if (bucket >= value) {
+            return bucket;
+        }
+    }
+    return buckets.back();
+}
+
+int64_t bucket_limit_le(const std::vector<int64_t>& buckets, int64_t limit) {
+    if (limit <= 0) {
+        return 0;
+    }
+    int64_t selected = 0;
+    for (const int64_t bucket : buckets) {
+        if (bucket <= limit) {
+            selected = bucket;
+        }
+    }
+    return selected > 0 ? selected : std::min<int64_t>(limit, buckets.empty() ? limit : buckets.front());
+}
+
+void increment_histogram(std::vector<int64_t>& histogram, int64_t index) {
+    if (index < 0) {
+        return;
+    }
+    if (histogram.size() <= static_cast<size_t>(index)) {
+        histogram.resize(static_cast<size_t>(index + 1), 0);
+    }
+    histogram[static_cast<size_t>(index)] += 1;
+}
+
+std::string env_string(const char* name, const std::string& default_value) {
+    const char* value = std::getenv(name);
+    if (!value || std::strlen(value) == 0) {
+        return default_value;
+    }
+    std::string out(value);
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    std::replace(out.begin(), out.end(), '-', '_');
+    return out;
+}
+
+std::string sampled_batch_subcode_policy_from_env() {
+    std::string policy = env_string("QWEN3_TTS_OV_NATIVE_SAMPLED_BATCH_SUBCODE", "off");
+    if (policy == "0" || policy == "false" || policy == "disabled") {
+        return "off";
+    }
+    if (policy == "1" || policy == "true" || policy == "enabled") {
+        return "on";
+    }
+    if (policy == "off" || policy == "verify" || policy == "on") {
+        return policy;
+    }
+    return "off";
+}
+
 double micros_to_ms(std::chrono::microseconds value) {
     return std::chrono::duration<double, std::milli>(value).count();
 }
@@ -1250,6 +1489,17 @@ void append_timing_distribution_json(std::string& json, const char* name, const 
     json += "}";
 }
 
+void append_int_vector_json(std::string& json, const char* name, const std::vector<int64_t>& values) {
+    json += ", \"" + std::string(name) + "\": [";
+    for (size_t index = 0; index < values.size(); ++index) {
+        if (index > 0) {
+            json += ", ";
+        }
+        json += std::to_string(values[index]);
+    }
+    json += "]";
+}
+
 std::string native_timing_json(const NativeCodegen& runner) {
     const auto& item = runner.last_timing;
     std::string json = "{";
@@ -1278,6 +1528,17 @@ std::string native_timing_json(const NativeCodegen& runner) {
     json += runner.paged_static_decode_requested ? "true" : "false";
     json += ", \"paged_static_decode_mode\": \"" + json_escape_native(runner.paged_static_decode_mode) + "\"";
     json += ", \"paged_static_decode_failure\": \"" + json_escape_native(runner.paged_static_decode_failure) + "\"";
+    json += ", \"paged_fused_batch_decode_enabled\": ";
+    json += runner.paged_fused_batch_decode_enabled ? "true" : "false";
+    json += ", \"paged_fused_batch_decode_graph\": \"" + json_escape_native(runner.paged_fused_batch_decode_graph) + "\"";
+    json += ", \"continuous_batch_policy\": \"" + json_escape_native(runner.continuous_batch_policy) + "\"";
+    json += ", \"online_scheduler\": \"" + json_escape_native(runner.online_scheduler) + "\"";
+    json += ", \"prefill_mode\": \"" + json_escape_native(runner.prefill_mode) + "\"";
+    json += ", \"max_num_batched_tokens\": " + std::to_string(runner.max_num_batched_tokens);
+    json += ", \"batch_subcode_compiled\": ";
+    json += runner.batch_subcode_enabled ? "true" : "false";
+    json += ", \"batch_decode_unroll_requested\": " + std::to_string(runner.batch_decode_unroll_requested);
+    json += ", \"batch_decode_unroll\": " + std::to_string(runner.batch_decode_unroll);
     json += ", \"host_prepare_ms\": " + std::to_string(item.host_prepare_ms);
     json += ", \"tensor_bind_ms\": " + std::to_string(item.tensor_bind_ms);
     json += ", \"codegen_infer_ms\": " + std::to_string(item.codegen_infer_ms);
@@ -1292,6 +1553,61 @@ std::string native_timing_json(const NativeCodegen& runner) {
     json += ", \"split_subcode_hidden_direct_bind_count\": " + std::to_string(item.split_subcode_hidden_direct_bind_count);
     json += ", \"split_subcode_hidden_bind_fallback_count\": " + std::to_string(item.split_subcode_hidden_bind_fallback_count);
     json += ", \"split_subcode_hidden_copy_bytes\": " + std::to_string(item.split_subcode_hidden_copy_bytes);
+    json += ", \"split_subcode_remote_next_embed_enabled\": ";
+    json += item.split_subcode_remote_next_embed_enabled ? "true" : "false";
+    json += ", \"split_subcode_remote_next_embed_fallback_count\": " +
+            std::to_string(item.split_subcode_remote_next_embed_fallback_count);
+    json += ", \"split_subcode_next_embed_host_read_count\": " +
+            std::to_string(item.split_subcode_next_embed_host_read_count);
+    json += ", \"decode_step_prebind_enabled\": ";
+    json += item.decode_step_prebind_enabled ? "true" : "false";
+    json += ", \"decode_step_prebind_fallback_count\": " +
+            std::to_string(item.decode_step_prebind_fallback_count);
+    json += ", \"decode_step_prebind_update_ms\": " + std::to_string(item.decode_step_prebind_update_ms);
+    json += ", \"batch_prefill_enabled\": ";
+    json += item.batch_prefill_enabled ? "true" : "false";
+    json += ", \"prefill_mode\": \"" + json_escape_native(item.prefill_mode) + "\"";
+    json += ", \"batch_subcode_enabled\": ";
+    json += item.batch_subcode_enabled ? "true" : "false";
+    json += ", \"scheduler_kind\": \"" + json_escape_native(item.online_scheduler) + "\"";
+    json += ", \"prefill_seq_bucket\": " + std::to_string(item.prefill_seq_bucket);
+    json += ", \"prefill_batch_bucket\": " + std::to_string(item.prefill_batch_bucket);
+    json += ", \"decode_batch_bucket\": " + std::to_string(item.decode_batch_bucket);
+    json += ", \"prefill_token_budget\": " + std::to_string(item.prefill_token_budget);
+    json += ", \"decode_token_budget\": " + std::to_string(item.decode_token_budget);
+    json += ", \"max_num_batched_tokens_effective\": " + std::to_string(item.max_num_batched_tokens);
+    json += ", \"sampled_batch_subcode_policy\": \"" + json_escape_native(item.sampled_batch_subcode_policy) + "\"";
+    json += ", \"sampled_batch_subcode_used\": ";
+    json += item.sampled_batch_subcode_used ? "true" : "false";
+    json += ", \"sampled_batch_subcode_verified\": ";
+    json += item.sampled_batch_subcode_verified ? "true" : "false";
+    json += ", \"sampled_batch_subcode_fallback_count\": " +
+            std::to_string(item.sampled_batch_subcode_fallback_count);
+    json += ", \"sampled_batch_subcode_mismatch_count\": " +
+            std::to_string(item.sampled_batch_subcode_mismatch_count);
+    json += ", \"sampled_batch_subcode_code_mismatch_count\": " +
+            std::to_string(item.sampled_batch_subcode_code_mismatch_count);
+    json += ", \"sampled_batch_subcode_embed_mismatch_count\": " +
+            std::to_string(item.sampled_batch_subcode_embed_mismatch_count);
+    json += ", \"sampled_batch_subcode_max_abs_diff\": " +
+            std::to_string(item.sampled_batch_subcode_max_abs_diff);
+    json += ", \"sampled_batch_subcode_fallback_reason\": \"" +
+            json_escape_native(item.sampled_batch_subcode_fallback_reason) + "\"";
+    json += ", \"sampled_subcode_parallel_rows\": ";
+    json += item.sampled_subcode_parallel_rows ? "true" : "false";
+    json += ", \"sampled_subcode_parallel_row_count\": " +
+            std::to_string(item.sampled_subcode_parallel_row_count);
+    json += ", \"batch_buffer_reuse\": ";
+    json += item.batch_buffer_reuse ? "true" : "false";
+    json += ", \"batch_decode_unroll_fallback_count\": " + std::to_string(item.batch_decode_unroll_fallback_count);
+    json += ", \"batch_fused_decode_step_count\": " + std::to_string(item.batch_fused_decode_step_count);
+    json += ", \"batch_fused_decode_token_count\": " + std::to_string(item.batch_fused_decode_token_count);
+    json += ", \"batch_single_decode_step_count\": " + std::to_string(item.batch_single_decode_step_count);
+    json += ", \"batch_single_decode_token_count\": " + std::to_string(item.batch_single_decode_token_count);
+    json += ", \"batch_fused_decode_active1_bypass_count\": " +
+            std::to_string(item.batch_fused_decode_active1_bypass_count);
+    json += ", \"batch_fused_decode_logits_bypass_count\": " +
+            std::to_string(item.batch_fused_decode_logits_bypass_count);
     json += ", \"subcode_outputs_next_embed\": ";
     json += runner.subcode_outputs_next_embed ? "true" : "false";
     json += ", \"sampling_ms\": " + std::to_string(item.sampling_ms);
@@ -1325,6 +1641,11 @@ std::string native_timing_json(const NativeCodegen& runner) {
     append_timing_distribution_json(json, "subcode_infer_step_stats", item.subcode_infer_step_ms);
     append_timing_distribution_json(json, "subcode_output_read_step_stats", item.subcode_output_read_step_ms);
     append_timing_distribution_json(json, "subcode_next_embed_step_stats", item.subcode_next_embed_step_ms);
+    append_timing_distribution_json(json, "decode_step_prebind_update_step_stats", item.decode_step_prebind_update_step_ms);
+    append_int_vector_json(json, "active_batch_histogram", item.active_batch_histogram);
+    append_int_vector_json(json, "prefill_seq_bucket_histogram", item.prefill_seq_bucket_histogram);
+    append_int_vector_json(json, "prefill_batch_bucket_histogram", item.prefill_batch_bucket_histogram);
+    append_int_vector_json(json, "decode_batch_bucket_histogram", item.decode_batch_bucket_histogram);
     append_codegen_trace_json(json, runner);
     json += "}";
     return json;
@@ -1347,6 +1668,53 @@ struct RemoteEmbedChain {
     std::array<ov::Tensor, 2> decode_outputs;
     size_t next_decode_output = 0;
     ov::Tensor next_input;
+};
+
+struct SplitSubcodeRemoteNextEmbedChain {
+    bool enabled = false;
+    bool requested = false;
+    bool required = false;
+    bool verified_decode_input = false;
+    std::array<ov::Tensor, 2> outputs;
+    size_t next_output = 0;
+    std::string failure;
+};
+
+struct PagedDecodeStepBindings {
+    bool enabled = false;
+    bool attempted = false;
+    bool has_tts_pad_embed = false;
+    bool has_allow_eos = false;
+    bool has_allow_eos_steps = false;
+    bool has_beam_idx = false;
+    bool has_score_aggregation_window = false;
+    int64_t hidden_size = 0;
+    int64_t block_size = 0;
+    int64_t position_rank = 0;
+    int64_t inputs_rank = 0;
+    int64_t block_indices_len = 0;
+    std::vector<int64_t> position_ids;
+    std::vector<int32_t> block_indices;
+    std::vector<float> allow_eos;
+    std::vector<int64_t> beam_idx;
+    std::vector<int32_t> score_aggregation_window;
+    std::vector<int32_t> past_lens;
+    std::vector<int32_t> subsequence_begins;
+    std::vector<int32_t> block_indices_begins;
+    std::vector<int32_t> max_context_len;
+    ov::Tensor inputs_embeds_tensor;
+    ov::Tensor position_ids_tensor;
+    ov::Tensor tts_pad_embed_tensor;
+    ov::Tensor allow_eos_tensor;
+    ov::Tensor allow_eos_steps_tensor;
+    ov::Tensor beam_idx_tensor;
+    ov::Tensor score_aggregation_window_tensor;
+    ov::Tensor past_lens_tensor;
+    ov::Tensor subsequence_begins_tensor;
+    ov::Tensor block_indices_tensor;
+    ov::Tensor block_indices_begins_tensor;
+    ov::Tensor max_context_len_tensor;
+    std::string failure;
 };
 
 struct PromptEmbeds {
@@ -1396,6 +1764,86 @@ RemoteEmbedChain make_paged_remote_embed_chain(NativeCodegen* runner, int64_t hi
     chain.decode_outputs[0] = try_create_remote_tensor(runner->prefill_model, ov::element::f32, frame_embed_shape);
     chain.decode_outputs[1] = try_create_remote_tensor(runner->prefill_model, ov::element::f32, frame_embed_shape);
     chain.enabled = static_cast<bool>(chain.decode_outputs[0]) && static_cast<bool>(chain.decode_outputs[1]);
+    return chain;
+}
+
+ov::Shape subcode_next_embed_output_shape(NativeCodegen* runner, int64_t hidden_size) {
+    if (runner && runner->subcode_model.outputs().size() > 1) {
+        try {
+            const auto pshape = runner->subcode_model.output(1).get_partial_shape();
+            if (!pshape.rank().is_dynamic()) {
+                ov::Shape shape;
+                shape.reserve(pshape.rank().get_length());
+                for (const auto& dim : pshape) {
+                    if (dim.is_static()) {
+                        shape.push_back(static_cast<size_t>(dim.get_length()));
+                    } else {
+                        shape.push_back(1);
+                    }
+                }
+                if (!shape.empty() && shape.back() == static_cast<size_t>(hidden_size)) {
+                    return shape;
+                }
+            }
+        } catch (...) {
+        }
+    }
+    return ov::Shape{1, 1, static_cast<size_t>(hidden_size)};
+}
+
+ov::Shape paged_single_embed_input_shape(NativeCodegen* runner, int64_t hidden_size) {
+    if (runner) {
+        try {
+            const int64_t rank = compiled_model_input_rank(runner->prefill_model, "inputs_embeds");
+            if (rank == 2) {
+                return ov::Shape{1, static_cast<size_t>(hidden_size)};
+            }
+        } catch (...) {
+        }
+    }
+    return ov::Shape{1, 1, static_cast<size_t>(hidden_size)};
+}
+
+size_t shape_element_count(const ov::Shape& shape) {
+    size_t count = 1;
+    for (size_t dim : shape) {
+        count *= dim;
+    }
+    return count;
+}
+
+SplitSubcodeRemoteNextEmbedChain make_split_subcode_remote_next_embed_chain(
+    NativeCodegen* runner,
+    int64_t hidden_size) {
+    SplitSubcodeRemoteNextEmbedChain chain;
+    chain.requested = env_enabled("QWEN3_TTS_OV_NATIVE_SPLIT_SUBCODE_REMOTE_NEXT_EMBED", false);
+    chain.required = env_enabled("QWEN3_TTS_OV_NATIVE_REQUIRE_SPLIT_SUBCODE_REMOTE_NEXT_EMBED", false);
+    if (!chain.requested || !runner || hidden_size <= 0) {
+        return chain;
+    }
+    if (!runner->paged_split_subcode) {
+        chain.failure = "paged split-subcode is disabled";
+        return chain;
+    }
+    if (!runner->subcode_outputs_next_embed) {
+        chain.failure = "subcode graph does not output next_embed";
+        return chain;
+    }
+    const ov::Shape shape = subcode_next_embed_output_shape(runner, hidden_size);
+    const ov::Shape input_shape = paged_single_embed_input_shape(runner, hidden_size);
+    if (shape_element_count(shape) != shape_element_count(input_shape)) {
+        std::ostringstream msg;
+        msg << "subcode next_embed output shape " << shape
+            << " has a different element count than paged inputs_embeds shape " << input_shape;
+        chain.failure = msg.str();
+        return chain;
+    }
+    chain.outputs[0] = try_create_remote_tensor(runner->subcode_model, ov::element::f32, input_shape);
+    chain.outputs[1] = try_create_remote_tensor(runner->subcode_model, ov::element::f32, input_shape);
+    chain.enabled = static_cast<bool>(chain.outputs[0]) && static_cast<bool>(chain.outputs[1]);
+    if (!chain.enabled) {
+        chain.failure = "failed to allocate split-subcode next_embed remote tensors";
+    }
     return chain;
 }
 
@@ -1945,7 +2393,8 @@ void bind_paged_step_inputs(
     std::vector<int64_t>& position_ids,
     std::vector<int32_t>& block_indices,
     std::vector<float>& allow_eos_buffer,
-    std::vector<int64_t>& beam_idx_buffer) {
+    std::vector<int64_t>& beam_idx_buffer,
+    bool bind_inputs_embeds = true) {
     if (seq_len <= 0 || hidden_size <= 0 || block_size <= 0) {
         throw std::runtime_error("invalid paged KV step shape");
     }
@@ -1968,20 +2417,25 @@ void bind_paged_step_inputs(
 
     const auto& compiled = request.get_compiled_model();
     const int64_t inputs_rank = compiled_model_input_rank(compiled, "inputs_embeds");
-    if (inputs_rank == 3) {
-        request.set_tensor(
-            "inputs_embeds",
-            ov::Tensor(
-                ov::element::f32,
-                ov::Shape{static_cast<size_t>(seq_len), 1, static_cast<size_t>(hidden_size)},
-                const_cast<float*>(embeds)));
-    } else {
-        request.set_tensor(
-            "inputs_embeds",
-            ov::Tensor(
-                ov::element::f32,
-                ov::Shape{static_cast<size_t>(seq_len), static_cast<size_t>(hidden_size)},
-                const_cast<float*>(embeds)));
+    if (bind_inputs_embeds) {
+        if (!embeds) {
+            throw std::runtime_error("inputs_embeds host buffer is null");
+        }
+        if (inputs_rank == 3) {
+            request.set_tensor(
+                "inputs_embeds",
+                ov::Tensor(
+                    ov::element::f32,
+                    ov::Shape{static_cast<size_t>(seq_len), 1, static_cast<size_t>(hidden_size)},
+                    const_cast<float*>(embeds)));
+        } else {
+            request.set_tensor(
+                "inputs_embeds",
+                ov::Tensor(
+                    ov::element::f32,
+                    ov::Shape{static_cast<size_t>(seq_len), static_cast<size_t>(hidden_size)},
+                    const_cast<float*>(embeds)));
+        }
     }
     const int64_t position_rank = compiled_model_input_rank(compiled, "position_ids");
     if (position_rank == 3) {
@@ -2022,6 +2476,825 @@ void bind_paged_step_inputs(
     request.set_tensor("block_indices", ov::Tensor(ov::element::i32, ov::Shape{block_indices.size()}, block_indices.data()));
     set_i32_tensor(request, "block_indices_begins", {0, static_cast<int32_t>(blocks_used)});
     set_scalar_i32_tensor(request, "max_context_len", static_cast<int32_t>(total_len));
+}
+
+struct PagedBatchSequenceState {
+    int64_t prompt_len = 0;
+    int64_t generated = 0;
+    bool stop = false;
+    int64_t block_offset = 0;
+    int64_t block_capacity = 0;
+    std::vector<float> next_embed;
+    double ttft_ms = -1.0;
+    double last_token_ms = 0.0;
+};
+
+void bind_paged_batch_step_inputs(
+    ov::InferRequest& request,
+    const float* embeds,
+    const std::vector<int64_t>& seq_lens,
+    int64_t hidden_size,
+    const std::vector<int64_t>& position_starts,
+    const std::vector<int64_t>& past_lens,
+    int64_t block_size,
+    const float* tts_pad_embed,
+    const std::vector<float>& allow_eos_values,
+    const std::vector<int64_t>& block_offsets,
+    const std::vector<int64_t>& block_counts,
+    std::vector<int64_t>& position_ids,
+    std::vector<int32_t>& past_lens_buffer,
+    std::vector<int32_t>& subsequence_begins,
+    std::vector<int32_t>& block_indices,
+    std::vector<int32_t>& block_indices_begins,
+    std::vector<float>& allow_eos_buffer,
+    std::vector<int64_t>& beam_idx_buffer,
+    std::vector<int32_t>& score_aggregation_window_buffer) {
+    const size_t batch = seq_lens.size();
+    if (
+        batch == 0 ||
+        !embeds ||
+        !tts_pad_embed ||
+        position_starts.size() != batch ||
+        past_lens.size() != batch ||
+        block_offsets.size() != batch ||
+        block_counts.size() != batch ||
+        hidden_size <= 0 ||
+        block_size <= 0) {
+        throw std::runtime_error("invalid paged KV batch step arguments");
+    }
+    int64_t total_tokens = 0;
+    int64_t max_total_len = 0;
+    for (size_t i = 0; i < batch; ++i) {
+        if (seq_lens[i] <= 0 || block_counts[i] <= 0) {
+            throw std::runtime_error("invalid paged KV batch sequence shape");
+        }
+        total_tokens += seq_lens[i];
+        max_total_len = std::max<int64_t>(max_total_len, past_lens[i] + seq_lens[i]);
+    }
+    position_ids.resize(static_cast<size_t>(3 * total_tokens));
+    subsequence_begins.resize(batch + 1);
+    past_lens_buffer.resize(batch);
+    block_indices.clear();
+    block_indices_begins.resize(batch + 1);
+    beam_idx_buffer.resize(static_cast<size_t>(total_tokens));
+
+    int64_t token_offset = 0;
+    int64_t block_offset = 0;
+    subsequence_begins[0] = 0;
+    block_indices_begins[0] = 0;
+    for (size_t seq = 0; seq < batch; ++seq) {
+        past_lens_buffer[seq] = static_cast<int32_t>(past_lens[seq]);
+        for (int64_t i = 0; i < seq_lens[seq]; ++i) {
+            beam_idx_buffer[static_cast<size_t>(token_offset + i)] = static_cast<int64_t>(seq);
+            for (int64_t row = 0; row < 3; ++row) {
+                position_ids[static_cast<size_t>(row * total_tokens + token_offset + i)] = position_starts[seq] + i;
+            }
+        }
+        token_offset += seq_lens[seq];
+        subsequence_begins[seq + 1] = static_cast<int32_t>(token_offset);
+        for (int64_t block = 0; block < block_counts[seq]; ++block) {
+            block_indices.push_back(static_cast<int32_t>(block_offsets[seq] + block));
+        }
+        block_offset += block_counts[seq];
+        block_indices_begins[seq + 1] = static_cast<int32_t>(block_offset);
+    }
+
+    const auto& compiled = request.get_compiled_model();
+    const int64_t inputs_rank = compiled_model_input_rank(compiled, "inputs_embeds");
+    if (inputs_rank == 3) {
+        request.set_tensor(
+            "inputs_embeds",
+            ov::Tensor(
+                ov::element::f32,
+                ov::Shape{static_cast<size_t>(total_tokens), 1, static_cast<size_t>(hidden_size)},
+                const_cast<float*>(embeds)));
+    } else {
+        request.set_tensor(
+            "inputs_embeds",
+            ov::Tensor(
+                ov::element::f32,
+                ov::Shape{static_cast<size_t>(total_tokens), static_cast<size_t>(hidden_size)},
+                const_cast<float*>(embeds)));
+    }
+    const int64_t position_rank = compiled_model_input_rank(compiled, "position_ids");
+    if (position_rank == 3) {
+        request.set_tensor(
+            "position_ids",
+            ov::Tensor(ov::element::i64, ov::Shape{3, static_cast<size_t>(total_tokens), 1}, position_ids.data()));
+    } else {
+        request.set_tensor(
+            "position_ids",
+            ov::Tensor(ov::element::i64, ov::Shape{3, static_cast<size_t>(total_tokens)}, position_ids.data()));
+    }
+    if (compiled_model_has_input(compiled, "tts_pad_embed")) {
+        request.set_tensor(
+            "tts_pad_embed",
+            ov::Tensor(ov::element::f32, ov::Shape{1, 1, static_cast<size_t>(hidden_size)}, const_cast<float*>(tts_pad_embed)));
+    }
+    allow_eos_buffer = allow_eos_values;
+    if (allow_eos_buffer.size() != batch) {
+        allow_eos_buffer.assign(batch, 0.0f);
+    }
+    if (compiled_model_has_input(compiled, "allow_eos")) {
+        request.set_tensor("allow_eos", ov::Tensor(ov::element::f32, ov::Shape{allow_eos_buffer.size()}, allow_eos_buffer.data()));
+    }
+    if (compiled_model_has_input(compiled, "allow_eos_steps")) {
+        request.set_tensor(
+            "allow_eos_steps",
+            ov::Tensor(ov::element::f32, ov::Shape{allow_eos_buffer.size()}, allow_eos_buffer.data()));
+    }
+    if (compiled_model_has_input(compiled, "beam_idx")) {
+        request.set_tensor("beam_idx", ov::Tensor(ov::element::i64, ov::Shape{beam_idx_buffer.size()}, beam_idx_buffer.data()));
+    }
+    if (compiled_model_has_input(compiled, "score_aggregation_window")) {
+        score_aggregation_window_buffer.assign(batch, 1);
+        request.set_tensor(
+            "score_aggregation_window",
+            ov::Tensor(
+                ov::element::i32,
+                ov::Shape{score_aggregation_window_buffer.size()},
+                score_aggregation_window_buffer.data()));
+    }
+    request.set_tensor("past_lens", ov::Tensor(ov::element::i32, ov::Shape{past_lens_buffer.size()}, past_lens_buffer.data()));
+    request.set_tensor(
+        "subsequence_begins",
+        ov::Tensor(ov::element::i32, ov::Shape{subsequence_begins.size()}, subsequence_begins.data()));
+    request.set_tensor("block_indices", ov::Tensor(ov::element::i32, ov::Shape{block_indices.size()}, block_indices.data()));
+    request.set_tensor(
+        "block_indices_begins",
+        ov::Tensor(ov::element::i32, ov::Shape{block_indices_begins.size()}, block_indices_begins.data()));
+    set_scalar_i32_tensor(request, "max_context_len", static_cast<int32_t>(max_total_len));
+}
+
+int64_t select_first_code_from_logits_row(
+    const float* logits,
+    int64_t vocab_size,
+    int64_t generated,
+    int64_t min_new_tokens,
+    int64_t eos_token_id,
+    const std::vector<uint8_t>* repeated_mask = nullptr,
+    float repetition_penalty = 1.0f,
+    const NativeSamplingConfig* sampling = nullptr,
+    std::mt19937_64* rng = nullptr) {
+    if (!logits || vocab_size <= 0) {
+        throw std::runtime_error("invalid logits row for batched first-code selection");
+    }
+    const int64_t suppress_from = std::max<int64_t>(0, vocab_size - 1024);
+    std::vector<std::pair<int64_t, float>> candidates;
+    candidates.reserve(static_cast<size_t>(vocab_size));
+    for (int64_t token_id = 0; token_id < vocab_size; ++token_id) {
+        float score = logits[static_cast<size_t>(token_id)];
+        if (token_id >= suppress_from && token_id != eos_token_id) {
+            score = NEG_INF;
+        }
+        if (token_id == eos_token_id && generated < min_new_tokens) {
+            score = NEG_INF;
+        }
+        if (
+            repeated_mask &&
+            repetition_penalty != 1.0f &&
+            token_id >= 0 &&
+            static_cast<size_t>(token_id) < repeated_mask->size() &&
+            (*repeated_mask)[static_cast<size_t>(token_id)] != 0 &&
+            score > NEG_INF / 2.0f) {
+            score = score < 0.0f ? score * repetition_penalty : score / repetition_penalty;
+        }
+        if (score > NEG_INF / 2.0f && std::isfinite(score)) {
+            candidates.emplace_back(token_id, score);
+        }
+    }
+    if (candidates.empty()) {
+        return eos_token_id;
+    }
+
+    const bool do_sample = sampling && sampling->do_sample;
+    if (!do_sample) {
+        return std::max_element(
+                   candidates.begin(),
+                   candidates.end(),
+                   [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; })
+            ->first;
+    }
+    if (!rng) {
+        throw std::runtime_error("sampling requested without RNG");
+    }
+
+    const float temperature = std::max<float>(1.0e-6f, sampling->temperature);
+    for (auto& item : candidates) {
+        item.second /= temperature;
+    }
+
+    const int64_t top_k = sampling->top_k;
+    if (top_k > 0 && static_cast<size_t>(top_k) < candidates.size()) {
+        std::nth_element(
+            candidates.begin(),
+            candidates.begin() + static_cast<std::ptrdiff_t>(top_k),
+            candidates.end(),
+            [](const auto& lhs, const auto& rhs) { return lhs.second > rhs.second; });
+        candidates.resize(static_cast<size_t>(top_k));
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.second > rhs.second;
+    });
+
+    const double max_score = static_cast<double>(candidates.front().second);
+    std::vector<double> weights;
+    weights.reserve(candidates.size());
+    double total = 0.0;
+    for (const auto& item : candidates) {
+        const double weight = std::exp(static_cast<double>(item.second) - max_score);
+        weights.push_back(weight);
+        total += weight;
+    }
+    if (!(total > 0.0) || !std::isfinite(total)) {
+        return candidates.front().first;
+    }
+
+    const float top_p = sampling->top_p;
+    if (top_p > 0.0f && top_p < 1.0f && candidates.size() > 1) {
+        double kept = 0.0;
+        size_t keep_count = 0;
+        for (; keep_count < weights.size(); ++keep_count) {
+            kept += weights[keep_count];
+            if (kept / total >= static_cast<double>(top_p)) {
+                ++keep_count;
+                break;
+            }
+        }
+        keep_count = std::max<size_t>(1, std::min(keep_count, candidates.size()));
+        candidates.resize(keep_count);
+        weights.resize(keep_count);
+    }
+
+    std::discrete_distribution<size_t> distribution(weights.begin(), weights.end());
+    return candidates[distribution(*rng)].first;
+}
+
+int64_t select_first_code_greedy_from_logits_row(
+    const float* logits,
+    int64_t vocab_size,
+    int64_t generated,
+    int64_t min_new_tokens,
+    int64_t eos_token_id) {
+    return select_first_code_from_logits_row(
+        logits,
+        vocab_size,
+        generated,
+        min_new_tokens,
+        eos_token_id,
+        nullptr,
+        1.0f,
+        nullptr,
+        nullptr);
+}
+
+void run_paged_split_subcode_batch(
+    NativeCodegen* runner,
+    const ov::Tensor& last_hidden_tensor,
+    const std::vector<int64_t>& first_codes,
+    const float* tts_pad_embed,
+    int64_t hidden_size,
+    int64_t num_code_groups,
+    std::vector<int64_t>& frame_codes,
+    std::vector<float>& next_embeds) {
+    if (!runner || !tts_pad_embed || hidden_size <= 0 || num_code_groups <= 0 || first_codes.empty()) {
+        throw std::runtime_error("invalid paged split subcode batch arguments");
+    }
+    const size_t batch = first_codes.size();
+    const bool use_batch_subcode = batch > 1 && runner->batch_subcode_enabled;
+    if (batch > 1 && !use_batch_subcode) {
+        const auto hidden_view = tensor_to_host_f32_view(runner, last_hidden_tensor, "paged split subcode fallback hidden");
+        if (!hidden_view.data || hidden_view.size < batch * static_cast<size_t>(hidden_size)) {
+            throw std::runtime_error("paged split subcode fallback hidden tensor is too small");
+        }
+        frame_codes.clear();
+        next_embeds.clear();
+        frame_codes.reserve(batch * static_cast<size_t>(num_code_groups));
+        next_embeds.reserve(batch * static_cast<size_t>(hidden_size));
+        for (size_t row = 0; row < batch; ++row) {
+            ov::Tensor row_hidden_tensor(
+                ov::element::f32,
+                ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
+                const_cast<float*>(hidden_view.data + row * static_cast<size_t>(hidden_size)));
+            std::vector<int64_t> row_first_code{first_codes[row]};
+            std::vector<int64_t> row_codes;
+            std::vector<float> row_next_embed;
+            run_paged_split_subcode_batch(
+                runner,
+                row_hidden_tensor,
+                row_first_code,
+                tts_pad_embed,
+                hidden_size,
+                num_code_groups,
+                row_codes,
+                row_next_embed);
+            frame_codes.insert(frame_codes.end(), row_codes.begin(), row_codes.end());
+            next_embeds.insert(next_embeds.end(), row_next_embed.begin(), row_next_embed.end());
+        }
+        return;
+    }
+    auto& request = use_batch_subcode ? runner->batch_subcode_request : runner->subcode_request;
+    auto& compiled_model = use_batch_subcode ? runner->batch_subcode_model : runner->subcode_model;
+    runner->last_timing.batch_subcode_enabled = runner->last_timing.batch_subcode_enabled || use_batch_subcode;
+    const uint64_t host_copy_bytes_before = runner->last_timing.host_copy_bytes;
+    const int64_t host_copy_fallbacks_before = runner->last_timing.host_copy_fallback_count;
+    double bind_ms = 0.0;
+    measure_ms(bind_ms, [&]() {
+        request.set_tensor("past_hidden", last_hidden_tensor);
+        request.set_tensor(
+            "first_code",
+            ov::Tensor(ov::element::i64, ov::Shape{batch, 1}, const_cast<int64_t*>(first_codes.data())));
+        if (compiled_model_has_input(compiled_model, "tts_pad_embed")) {
+            request.set_tensor(
+                "tts_pad_embed",
+                ov::Tensor(ov::element::f32, ov::Shape{1, 1, static_cast<size_t>(hidden_size)}, const_cast<float*>(tts_pad_embed)));
+        }
+    });
+    runner->last_timing.subcode_bind_ms += bind_ms;
+    runner->last_timing.subcode_bind_step_ms.push_back(bind_ms);
+    double subcode_infer_ms = 0.0;
+    measure_ms(subcode_infer_ms, [&]() {
+        request.infer();
+    });
+    runner->last_timing.codegen_infer_ms += subcode_infer_ms;
+    runner->last_timing.codegen_subcode_infer_ms += subcode_infer_ms;
+    runner->last_timing.codegen_subcode_count += 1;
+    runner->last_timing.subcode_infer_step_ms.push_back(subcode_infer_ms);
+    record_request_profile(
+        runner,
+        use_batch_subcode ? "codegen_paged_kv_subcode_batch" : "codegen_paged_kv_subcode_single",
+        request);
+
+    double output_read_ms = 0.0;
+    HostTensorView<int64_t> codes;
+    FloatTensorView embed;
+    measure_ms(output_read_ms, [&]() {
+        auto codes_tensor = request.get_output_tensor(0);
+        codes = tensor_to_host_view<int64_t>(runner, codes_tensor, "paged split subcode batch codes");
+        auto embed_tensor = request.get_output_tensor(1);
+        embed = tensor_to_host_f32_view(runner, embed_tensor, "paged split subcode batch embed");
+    });
+    runner->last_timing.subcode_output_read_ms += output_read_ms;
+    runner->last_timing.subcode_output_read_step_ms.push_back(output_read_ms);
+    runner->last_timing.subcode_host_copy_bytes += runner->last_timing.host_copy_bytes - host_copy_bytes_before;
+    runner->last_timing.subcode_host_copy_fallback_count +=
+        runner->last_timing.host_copy_fallback_count - host_copy_fallbacks_before;
+    if (!codes.data || codes.size < batch * static_cast<size_t>(num_code_groups)) {
+        throw std::runtime_error("paged split subcode batch returned too few codec groups");
+    }
+    if (!embed.data || embed.size < batch * static_cast<size_t>(hidden_size)) {
+        throw std::runtime_error("paged split subcode batch returned too small next_embed");
+    }
+
+    double next_embed_ms = 0.0;
+    measure_ms(next_embed_ms, [&]() {
+        frame_codes.assign(codes.data, codes.data + batch * static_cast<size_t>(num_code_groups));
+        next_embeds.resize(batch * static_cast<size_t>(hidden_size));
+        for (size_t seq = 0; seq < batch; ++seq) {
+            const float* src = embed.data + seq * static_cast<size_t>(hidden_size);
+            float* dst = next_embeds.data() + seq * static_cast<size_t>(hidden_size);
+            if (runner->subcode_outputs_next_embed) {
+                std::memcpy(dst, src, static_cast<size_t>(hidden_size) * sizeof(float));
+            } else {
+                for (int64_t i = 0; i < hidden_size; ++i) {
+                    dst[static_cast<size_t>(i)] =
+                        src[static_cast<size_t>(i)] + tts_pad_embed[static_cast<size_t>(i)];
+                }
+            }
+        }
+    });
+    runner->last_timing.subcode_next_embed_ms += next_embed_ms;
+    runner->last_timing.subcode_next_embed_step_ms.push_back(next_embed_ms);
+}
+
+void run_paged_split_subcode_rows(
+    NativeCodegen* runner,
+    const ov::Tensor& last_hidden_tensor,
+    const std::vector<int64_t>& first_codes,
+    const float* tts_pad_embed,
+    int64_t hidden_size,
+    int64_t num_code_groups,
+    std::vector<int64_t>& frame_codes,
+    std::vector<float>& next_embeds,
+    const char* hidden_label = "paged split subcode row fallback hidden") {
+    if (!runner || first_codes.empty() || hidden_size <= 0 || num_code_groups <= 0) {
+        throw std::runtime_error("invalid paged split subcode row arguments");
+    }
+    const size_t batch = first_codes.size();
+    const auto hidden_view = tensor_to_host_f32_view(runner, last_hidden_tensor, hidden_label);
+    if (!hidden_view.data || hidden_view.size < batch * static_cast<size_t>(hidden_size)) {
+        throw std::runtime_error("paged split subcode row hidden tensor is too small");
+    }
+    const bool parallel_rows =
+        batch > 1 &&
+        env_enabled("QWEN3_TTS_OV_NATIVE_SAMPLED_SUBCODE_PARALLEL_ROWS", false) &&
+        static_cast<bool>(runner->subcode_model);
+    if (parallel_rows) {
+        runner->last_timing.sampled_subcode_parallel_rows = true;
+        runner->last_timing.sampled_subcode_parallel_row_count += static_cast<int64_t>(batch);
+        while (runner->sampled_subcode_row_requests.size() < batch) {
+            runner->sampled_subcode_row_requests.push_back(runner->subcode_model.create_infer_request());
+        }
+        std::vector<int64_t> first_code_storage(batch, 0);
+        std::vector<ov::Tensor> hidden_tensors;
+        std::vector<ov::Tensor> first_code_tensors;
+        hidden_tensors.reserve(batch);
+        first_code_tensors.reserve(batch);
+        double bind_ms = 0.0;
+        measure_ms(bind_ms, [&]() {
+            for (size_t row = 0; row < batch; ++row) {
+                first_code_storage[row] = first_codes[row];
+                hidden_tensors.emplace_back(
+                    ov::element::f32,
+                    ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
+                    const_cast<float*>(hidden_view.data + row * static_cast<size_t>(hidden_size)));
+                first_code_tensors.emplace_back(
+                    ov::element::i64,
+                    ov::Shape{1, 1},
+                    first_code_storage.data() + row);
+                auto& request = runner->sampled_subcode_row_requests[row];
+                request.set_tensor("past_hidden", hidden_tensors.back());
+                request.set_tensor("first_code", first_code_tensors.back());
+                if (compiled_model_has_input(runner->subcode_model, "tts_pad_embed")) {
+                    request.set_tensor(
+                        "tts_pad_embed",
+                        ov::Tensor(
+                            ov::element::f32,
+                            ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
+                            const_cast<float*>(tts_pad_embed)));
+                }
+            }
+        });
+        runner->last_timing.subcode_bind_ms += bind_ms;
+        runner->last_timing.subcode_bind_step_ms.push_back(bind_ms);
+        double infer_ms = 0.0;
+        measure_ms(infer_ms, [&]() {
+            for (size_t row = 0; row < batch; ++row) {
+                runner->sampled_subcode_row_requests[row].start_async();
+            }
+            for (size_t row = 0; row < batch; ++row) {
+                runner->sampled_subcode_row_requests[row].wait();
+            }
+        });
+        runner->last_timing.codegen_infer_ms += infer_ms;
+        runner->last_timing.codegen_subcode_infer_ms += infer_ms;
+        runner->last_timing.codegen_subcode_count += 1;
+        runner->last_timing.subcode_infer_step_ms.push_back(infer_ms);
+        frame_codes.clear();
+        next_embeds.resize(batch * static_cast<size_t>(hidden_size));
+        frame_codes.reserve(batch * static_cast<size_t>(num_code_groups));
+        double output_read_ms = 0.0;
+        measure_ms(output_read_ms, [&]() {
+            for (size_t row = 0; row < batch; ++row) {
+                auto& request = runner->sampled_subcode_row_requests[row];
+                record_request_profile(runner, "codegen_paged_kv_subcode_parallel_row", request);
+                auto codes_tensor = request.get_output_tensor(0);
+                const auto codes = tensor_to_host_view<int64_t>(runner, codes_tensor, "paged split subcode parallel row codes");
+                auto embed_tensor = request.get_output_tensor(1);
+                const auto embed = tensor_to_host_f32_view(runner, embed_tensor, "paged split subcode parallel row embed");
+                if (!codes.data || codes.size < static_cast<size_t>(num_code_groups) ||
+                    !embed.data || embed.size < static_cast<size_t>(hidden_size)) {
+                    throw std::runtime_error("paged split subcode parallel row output is too small");
+                }
+                frame_codes.insert(frame_codes.end(), codes.data, codes.data + static_cast<size_t>(num_code_groups));
+                float* dst = next_embeds.data() + row * static_cast<size_t>(hidden_size);
+                if (runner->subcode_outputs_next_embed) {
+                    std::memcpy(dst, embed.data, static_cast<size_t>(hidden_size) * sizeof(float));
+                } else {
+                    for (int64_t i = 0; i < hidden_size; ++i) {
+                        dst[static_cast<size_t>(i)] =
+                            embed.data[static_cast<size_t>(i)] + tts_pad_embed[static_cast<size_t>(i)];
+                    }
+                }
+            }
+        });
+        runner->last_timing.subcode_output_read_ms += output_read_ms;
+        runner->last_timing.subcode_output_read_step_ms.push_back(output_read_ms);
+        return;
+    }
+    frame_codes.clear();
+    next_embeds.clear();
+    frame_codes.reserve(batch * static_cast<size_t>(num_code_groups));
+    next_embeds.reserve(batch * static_cast<size_t>(hidden_size));
+    for (size_t row = 0; row < batch; ++row) {
+        ov::Tensor row_hidden_tensor(
+            ov::element::f32,
+            ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
+            const_cast<float*>(hidden_view.data + row * static_cast<size_t>(hidden_size)));
+        std::vector<int64_t> row_first_code{first_codes[row]};
+        std::vector<int64_t> row_codes;
+        std::vector<float> row_next_embed;
+        run_paged_split_subcode_batch(
+            runner,
+            row_hidden_tensor,
+            row_first_code,
+            tts_pad_embed,
+            hidden_size,
+            num_code_groups,
+            row_codes,
+            row_next_embed);
+        frame_codes.insert(frame_codes.end(), row_codes.begin(), row_codes.end());
+        next_embeds.insert(next_embeds.end(), row_next_embed.begin(), row_next_embed.end());
+    }
+}
+
+double max_abs_diff(const std::vector<float>& lhs, const std::vector<float>& rhs) {
+    const size_t count = std::min(lhs.size(), rhs.size());
+    double max_diff = 0.0;
+    for (size_t index = 0; index < count; ++index) {
+        max_diff = std::max(max_diff, static_cast<double>(std::abs(lhs[index] - rhs[index])));
+    }
+    if (lhs.size() != rhs.size()) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return max_diff;
+}
+
+void run_online_sampled_subcode(
+    NativeCodegen* runner,
+    const ov::Tensor& hidden_tensor,
+    const std::vector<int64_t>& first_codes,
+    const float* tts_pad_embed,
+    int64_t hidden_size,
+    int64_t num_code_groups,
+    std::vector<int64_t>& frame_codes,
+    std::vector<float>& next_embeds) {
+    const std::string policy = sampled_batch_subcode_policy_from_env();
+    runner->last_timing.sampled_batch_subcode_policy = policy;
+    const size_t batch = first_codes.size();
+    const bool can_batch = batch > 1 && runner->batch_subcode_enabled;
+    if (policy == "off" || !can_batch) {
+        if (!can_batch && policy != "off") {
+            runner->last_timing.sampled_batch_subcode_fallback_count += 1;
+            runner->last_timing.sampled_batch_subcode_fallback_reason = "batch_subcode_unavailable";
+        }
+        run_paged_split_subcode_rows(
+            runner,
+            hidden_tensor,
+            first_codes,
+            tts_pad_embed,
+            hidden_size,
+            num_code_groups,
+            frame_codes,
+            next_embeds,
+            "online sampled row subcode hidden");
+        return;
+    }
+
+    if (policy == "on") {
+        run_paged_split_subcode_batch(
+            runner,
+            hidden_tensor,
+            first_codes,
+            tts_pad_embed,
+            hidden_size,
+            num_code_groups,
+            frame_codes,
+            next_embeds);
+        runner->last_timing.sampled_batch_subcode_used = true;
+        return;
+    }
+
+    std::vector<int64_t> row_codes;
+    std::vector<float> row_embeds;
+    run_paged_split_subcode_rows(
+        runner,
+        hidden_tensor,
+        first_codes,
+        tts_pad_embed,
+        hidden_size,
+        num_code_groups,
+        row_codes,
+        row_embeds,
+        "online sampled verify row hidden");
+
+    std::vector<int64_t> batch_codes;
+    std::vector<float> batch_embeds;
+    try {
+        run_paged_split_subcode_batch(
+            runner,
+            hidden_tensor,
+            first_codes,
+            tts_pad_embed,
+            hidden_size,
+            num_code_groups,
+            batch_codes,
+            batch_embeds);
+        const double embed_diff = max_abs_diff(row_embeds, batch_embeds);
+        runner->last_timing.sampled_batch_subcode_max_abs_diff =
+            std::max(runner->last_timing.sampled_batch_subcode_max_abs_diff, embed_diff);
+        const double tolerance =
+            static_cast<double>(env_int64("QWEN3_TTS_OV_NATIVE_SAMPLED_BATCH_SUBCODE_EMBED_TOLERANCE_MICRO", 1000)) /
+            1000000.0;
+        const bool codes_match = batch_codes == row_codes;
+        const bool embeds_match = embed_diff <= tolerance;
+        if (codes_match && embeds_match) {
+            frame_codes.swap(batch_codes);
+            next_embeds.swap(batch_embeds);
+            runner->last_timing.sampled_batch_subcode_used = true;
+            runner->last_timing.sampled_batch_subcode_verified = true;
+            return;
+        }
+        runner->last_timing.sampled_batch_subcode_mismatch_count += 1;
+        if (!codes_match) {
+            runner->last_timing.sampled_batch_subcode_code_mismatch_count += 1;
+        }
+        if (!embeds_match) {
+            runner->last_timing.sampled_batch_subcode_embed_mismatch_count += 1;
+        }
+        runner->last_timing.sampled_batch_subcode_fallback_count += 1;
+        runner->last_timing.sampled_batch_subcode_fallback_reason = "verify_mismatch";
+    } catch (const std::exception& exc) {
+        runner->last_timing.sampled_batch_subcode_fallback_count += 1;
+        runner->last_timing.sampled_batch_subcode_fallback_reason = std::string("verify_error:") + exc.what();
+    }
+    frame_codes.swap(row_codes);
+    next_embeds.swap(row_embeds);
+}
+
+bool prepare_decode_step_prebind(
+    PagedDecodeStepBindings& binding,
+    ov::InferRequest& request,
+    const float* embeds,
+    int64_t hidden_size,
+    int64_t block_size,
+    int64_t block_indices_capacity,
+    const float* tts_pad_embed,
+    size_t allow_eos_size,
+    std::string* error) {
+    binding.attempted = true;
+    binding.enabled = false;
+    binding.failure.clear();
+    if (!env_enabled("QWEN3_TTS_OV_NATIVE_DECODE_STEP_PREBIND", false)) {
+        binding.failure = "QWEN3_TTS_OV_NATIVE_DECODE_STEP_PREBIND=0";
+        return false;
+    }
+    if (!embeds || !tts_pad_embed || hidden_size <= 0 || block_size <= 0) {
+        binding.failure = "invalid prebind buffers";
+        if (error) {
+            *error = binding.failure;
+        }
+        return false;
+    }
+    try {
+        const auto& compiled = request.get_compiled_model();
+        binding.hidden_size = hidden_size;
+        binding.block_size = block_size;
+        binding.inputs_rank = compiled_model_input_rank(compiled, "inputs_embeds");
+        binding.position_rank = compiled_model_input_rank(compiled, "position_ids");
+        binding.block_indices_len = std::max<int64_t>(
+            1,
+            std::max<int64_t>(
+                compiled_model_static_input_size(compiled, "block_indices"),
+                block_indices_capacity));
+        binding.has_tts_pad_embed = compiled_model_has_input(compiled, "tts_pad_embed");
+        binding.has_allow_eos = compiled_model_has_input(compiled, "allow_eos");
+        binding.has_allow_eos_steps = compiled_model_has_input(compiled, "allow_eos_steps");
+        binding.has_beam_idx = compiled_model_has_input(compiled, "beam_idx");
+        binding.has_score_aggregation_window = compiled_model_has_input(compiled, "score_aggregation_window");
+
+        binding.position_ids.assign(3, 0);
+        binding.block_indices.assign(static_cast<size_t>(binding.block_indices_len), 0);
+        binding.allow_eos.assign(std::max<size_t>(1, allow_eos_size), 0.0f);
+        binding.beam_idx.assign(1, 0);
+        binding.score_aggregation_window.assign(1, 1);
+        binding.past_lens.assign(1, 0);
+        binding.subsequence_begins.assign({0, 1});
+        binding.block_indices_begins.assign({0, 1});
+        binding.max_context_len.assign(1, 1);
+
+        if (binding.inputs_rank == 3) {
+            binding.inputs_embeds_tensor = ov::Tensor(
+                ov::element::f32,
+                ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
+                const_cast<float*>(embeds));
+        } else {
+            binding.inputs_embeds_tensor = ov::Tensor(
+                ov::element::f32,
+                ov::Shape{1, static_cast<size_t>(hidden_size)},
+                const_cast<float*>(embeds));
+        }
+        if (binding.position_rank == 3) {
+            binding.position_ids_tensor = ov::Tensor(ov::element::i64, ov::Shape{3, 1, 1}, binding.position_ids.data());
+        } else {
+            binding.position_ids_tensor = ov::Tensor(ov::element::i64, ov::Shape{3, 1}, binding.position_ids.data());
+        }
+        binding.block_indices_tensor = ov::Tensor(
+            ov::element::i32,
+            ov::Shape{binding.block_indices.size()},
+            binding.block_indices.data());
+        binding.past_lens_tensor = ov::Tensor(ov::element::i32, ov::Shape{1}, binding.past_lens.data());
+        binding.subsequence_begins_tensor = ov::Tensor(
+            ov::element::i32,
+            ov::Shape{binding.subsequence_begins.size()},
+            binding.subsequence_begins.data());
+        binding.block_indices_begins_tensor = ov::Tensor(
+            ov::element::i32,
+            ov::Shape{binding.block_indices_begins.size()},
+            binding.block_indices_begins.data());
+        binding.max_context_len_tensor = ov::Tensor(ov::element::i32, ov::Shape{}, binding.max_context_len.data());
+        if (binding.has_tts_pad_embed) {
+            binding.tts_pad_embed_tensor = ov::Tensor(
+                ov::element::f32,
+                ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
+                const_cast<float*>(tts_pad_embed));
+        }
+        if (binding.has_allow_eos) {
+            binding.allow_eos_tensor = ov::Tensor(ov::element::f32, ov::Shape{1}, binding.allow_eos.data());
+        }
+        if (binding.has_allow_eos_steps) {
+            binding.allow_eos_steps_tensor = ov::Tensor(
+                ov::element::f32,
+                ov::Shape{binding.allow_eos.size()},
+                binding.allow_eos.data());
+        }
+        if (binding.has_beam_idx) {
+            binding.beam_idx_tensor = ov::Tensor(ov::element::i64, ov::Shape{1}, binding.beam_idx.data());
+        }
+        if (binding.has_score_aggregation_window) {
+            binding.score_aggregation_window_tensor = ov::Tensor(
+                ov::element::i32,
+                ov::Shape{1},
+                binding.score_aggregation_window.data());
+        }
+
+        request.set_tensor("inputs_embeds", binding.inputs_embeds_tensor);
+        request.set_tensor("position_ids", binding.position_ids_tensor);
+        if (binding.has_tts_pad_embed) {
+            request.set_tensor("tts_pad_embed", binding.tts_pad_embed_tensor);
+        }
+        if (binding.has_allow_eos) {
+            request.set_tensor("allow_eos", binding.allow_eos_tensor);
+        }
+        if (binding.has_allow_eos_steps) {
+            request.set_tensor("allow_eos_steps", binding.allow_eos_steps_tensor);
+        }
+        if (binding.has_beam_idx) {
+            request.set_tensor("beam_idx", binding.beam_idx_tensor);
+        }
+        if (binding.has_score_aggregation_window) {
+            request.set_tensor("score_aggregation_window", binding.score_aggregation_window_tensor);
+        }
+        request.set_tensor("past_lens", binding.past_lens_tensor);
+        request.set_tensor("subsequence_begins", binding.subsequence_begins_tensor);
+        request.set_tensor("block_indices", binding.block_indices_tensor);
+        request.set_tensor("block_indices_begins", binding.block_indices_begins_tensor);
+        request.set_tensor("max_context_len", binding.max_context_len_tensor);
+        binding.enabled = true;
+        return true;
+    } catch (const std::exception& exc) {
+        binding.failure = exc.what();
+    } catch (...) {
+        binding.failure = "unknown decode step prebind failure";
+    }
+    if (error) {
+        *error = binding.failure;
+    }
+    return false;
+}
+
+void update_prebound_decode_step_inputs(
+    PagedDecodeStepBindings& binding,
+    ov::InferRequest& request,
+    const float* embeds,
+    int64_t position_start,
+    int64_t past_len,
+    const std::vector<float>& allow_eos_values,
+    const ov::Tensor* remote_input) {
+    if (!binding.enabled) {
+        throw std::runtime_error("decode step prebind is not enabled");
+    }
+    const int64_t total_len = past_len + 1;
+    const int64_t blocks_used = std::max<int64_t>(1, (total_len + binding.block_size - 1) / binding.block_size);
+    if (blocks_used > binding.block_indices_len) {
+        throw std::runtime_error("decode step prebind block_indices buffer is too small");
+    }
+    for (int64_t row = 0; row < 3; ++row) {
+        binding.position_ids[static_cast<size_t>(row)] = position_start;
+    }
+    std::fill(binding.block_indices.begin(), binding.block_indices.end(), 0);
+    for (int64_t i = 0; i < blocks_used; ++i) {
+        binding.block_indices[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+    }
+    std::fill(binding.allow_eos.begin(), binding.allow_eos.end(), 0.0f);
+    for (size_t i = 0; i < binding.allow_eos.size() && i < allow_eos_values.size(); ++i) {
+        binding.allow_eos[i] = allow_eos_values[i];
+    }
+    binding.past_lens[0] = static_cast<int32_t>(past_len);
+    binding.subsequence_begins[0] = 0;
+    binding.subsequence_begins[1] = 1;
+    binding.block_indices_begins[0] = 0;
+    binding.block_indices_begins[1] = static_cast<int32_t>(blocks_used);
+    binding.max_context_len[0] = static_cast<int32_t>(total_len);
+    if (binding.has_beam_idx) {
+        binding.beam_idx[0] = 0;
+    }
+    if (remote_input && static_cast<bool>(*remote_input)) {
+        request.set_tensor("inputs_embeds", *remote_input);
+    } else if (embeds) {
+        request.set_tensor("inputs_embeds", binding.inputs_embeds_tensor);
+    }
 }
 
 int64_t select_first_code_from_logits(
@@ -2183,7 +3456,12 @@ void run_paged_split_subcode_step(
     int64_t hidden_size,
     int64_t num_code_groups,
     std::vector<int64_t>& frame_codes,
-    std::vector<float>& next_embed) {
+    std::vector<float>& next_embed,
+    ov::Tensor* remote_next_embed_output,
+    bool need_host_next_embed,
+    bool* remote_next_embed_written,
+    const NativeSamplingConfig* sampling = nullptr,
+    std::mt19937_64* rng = nullptr) {
     if (!runner || !tts_pad_embed || hidden_size <= 0 || num_code_groups <= 0) {
         throw std::runtime_error("invalid paged split subcode arguments");
     }
@@ -2191,6 +3469,9 @@ void run_paged_split_subcode_step(
         throw std::runtime_error("paged split subcode graph is not configured");
     }
     auto& request = runner->subcode_request;
+    if (remote_next_embed_written) {
+        *remote_next_embed_written = false;
+    }
     runner->scratch.subcode_first_code.resize(1);
     runner->scratch.subcode_first_code[0] = first_code;
     const uint64_t host_copy_bytes_before = runner->last_timing.host_copy_bytes;
@@ -2260,6 +3541,51 @@ void run_paged_split_subcode_step(
                 "first_code",
                 ov::Tensor(ov::element::i64, ov::Shape{1, 1}, runner->scratch.subcode_first_code.data()));
         }
+        if (compiled_model_has_input(runner->subcode_model, "uniform_noise")) {
+            int64_t subcode_groups = std::max<int64_t>(1, num_code_groups - 1);
+            int64_t subcode_vocab = 2048;
+            try {
+                const auto pshape = runner->subcode_model.input("uniform_noise").get_partial_shape();
+                if (pshape.rank().is_static() && pshape.rank().get_length() >= 3) {
+                    const auto groups_dim = pshape[1];
+                    const auto vocab_dim = pshape[2];
+                    if (groups_dim.is_static()) {
+                        subcode_groups = groups_dim.get_length();
+                    }
+                    if (vocab_dim.is_static()) {
+                        subcode_vocab = vocab_dim.get_length();
+                    }
+                }
+            } catch (...) {
+                subcode_groups = std::max<int64_t>(1, num_code_groups - 1);
+                subcode_vocab = 2048;
+            }
+            runner->scratch.subcode_uniform_noise.resize(
+                static_cast<size_t>(subcode_groups * subcode_vocab));
+            if (!rng) {
+                static thread_local std::mt19937_64 fallback_rng{
+                    static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count())};
+                rng = &fallback_rng;
+            }
+            std::uniform_real_distribution<float> dist(1.0e-6f, 0.999999f);
+            for (float& value : runner->scratch.subcode_uniform_noise) {
+                value = dist(*rng);
+            }
+            request.set_tensor(
+                "uniform_noise",
+                ov::Tensor(
+                    ov::element::f32,
+                    ov::Shape{1, static_cast<size_t>(subcode_groups), static_cast<size_t>(subcode_vocab)},
+                    runner->scratch.subcode_uniform_noise.data()));
+        }
+        if (compiled_model_has_input(runner->subcode_model, "temperature")) {
+            runner->scratch.subcode_temperature.assign(
+                1,
+                sampling ? std::max<float>(1.0e-6f, sampling->temperature) : 0.9f);
+            request.set_tensor(
+                "temperature",
+                ov::Tensor(ov::element::f32, ov::Shape{1}, runner->scratch.subcode_temperature.data()));
+        }
         if (runner->subcode_outputs_next_embed && compiled_model_has_input(runner->subcode_model, "tts_pad_embed")) {
             request.set_tensor(
                 "tts_pad_embed",
@@ -2267,6 +3593,27 @@ void run_paged_split_subcode_step(
                     ov::element::f32,
                     ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
                     const_cast<float*>(tts_pad_embed)));
+        }
+        if (remote_next_embed_output && static_cast<bool>(*remote_next_embed_output)) {
+            try {
+                request.set_output_tensor(1, *remote_next_embed_output);
+                if (remote_next_embed_written) {
+                    *remote_next_embed_written = true;
+                }
+                runner->last_timing.split_subcode_remote_next_embed_enabled = true;
+                runner->last_timing.zero_copy_count += 1;
+            } catch (const std::exception& exc) {
+                runner->last_timing.split_subcode_remote_next_embed_fallback_count += 1;
+                if (env_enabled("QWEN3_TTS_OV_NATIVE_REQUIRE_SPLIT_SUBCODE_REMOTE_NEXT_EMBED", false)) {
+                    throw std::runtime_error(
+                        std::string("required split-subcode remote next_embed output bind failed: ") + exc.what());
+                }
+            } catch (...) {
+                runner->last_timing.split_subcode_remote_next_embed_fallback_count += 1;
+                if (env_enabled("QWEN3_TTS_OV_NATIVE_REQUIRE_SPLIT_SUBCODE_REMOTE_NEXT_EMBED", false)) {
+                    throw std::runtime_error("required split-subcode remote next_embed output bind failed");
+                }
+            }
         }
     });
     runner->last_timing.tensor_bind_ms += bind_ms;
@@ -2285,12 +3632,17 @@ void run_paged_split_subcode_step(
     ov::Tensor embed_tensor;
     HostTensorView<int64_t> codes;
     FloatTensorView embed;
+    const bool read_host_next_embed =
+        need_host_next_embed || !(remote_next_embed_written && *remote_next_embed_written);
     double output_read_ms = 0.0;
     measure_ms(output_read_ms, [&]() {
         codes_tensor = request.get_output_tensor(0);
-        embed_tensor = request.get_output_tensor(1);
         codes = tensor_to_host_view<int64_t>(runner, codes_tensor, "paged split subcode codes");
-        embed = tensor_to_host_f32_view(runner, embed_tensor, "paged split subcode embed");
+        if (read_host_next_embed) {
+            embed_tensor = request.get_output_tensor(1);
+            embed = tensor_to_host_f32_view(runner, embed_tensor, "paged split subcode embed");
+            runner->last_timing.split_subcode_next_embed_host_read_count += 1;
+        }
     });
     runner->last_timing.subcode_output_read_ms += output_read_ms;
     runner->last_timing.subcode_output_read_step_ms.push_back(output_read_ms);
@@ -2303,7 +3655,7 @@ void run_paged_split_subcode_step(
             << ", expected_groups=" << num_code_groups << ")";
         throw std::runtime_error(msg.str());
     }
-    if (!embed.data || static_cast<int64_t>(embed.size) < hidden_size) {
+    if (read_host_next_embed && (!embed.data || static_cast<int64_t>(embed.size) < hidden_size)) {
         std::ostringstream msg;
         msg << "paged split subcode graph returned too small embed (" << tensor_debug_string(embed_tensor)
             << ", hidden_size=" << hidden_size << ")";
@@ -2313,13 +3665,15 @@ void run_paged_split_subcode_step(
     measure_ms(next_embed_ms, [&]() {
         frame_codes.resize(static_cast<size_t>(num_code_groups));
         std::memcpy(frame_codes.data(), codes.data, static_cast<size_t>(num_code_groups) * sizeof(int64_t));
-        next_embed.resize(static_cast<size_t>(hidden_size));
-        if (runner->subcode_outputs_next_embed) {
-            std::memcpy(next_embed.data(), embed.data, static_cast<size_t>(hidden_size) * sizeof(float));
-        } else {
-            for (int64_t i = 0; i < hidden_size; ++i) {
-                next_embed[static_cast<size_t>(i)] =
-                    embed.data[static_cast<size_t>(i)] + tts_pad_embed[static_cast<size_t>(i)];
+        if (read_host_next_embed) {
+            next_embed.resize(static_cast<size_t>(hidden_size));
+            if (runner->subcode_outputs_next_embed) {
+                std::memcpy(next_embed.data(), embed.data, static_cast<size_t>(hidden_size) * sizeof(float));
+            } else {
+                for (int64_t i = 0; i < hidden_size; ++i) {
+                    next_embed[static_cast<size_t>(i)] =
+                        embed.data[static_cast<size_t>(i)] + tts_pad_embed[static_cast<size_t>(i)];
+                }
             }
         }
     });
@@ -2401,16 +3755,35 @@ void run_paged_kv_impl(
     std::vector<float> allow_eos_buffer;
     std::vector<int64_t> beam_idx_buffer;
     std::vector<float> next_embed(static_cast<size_t>(hidden_size));
+    const int64_t graph_unroll = std::max<int64_t>(1, runner->unroll);
+    PagedDecodeStepBindings decode_prebind;
+    const bool decode_prebind_requested = env_enabled("QWEN3_TTS_OV_NATIVE_DECODE_STEP_PREBIND", false);
+    if (use_static_decode && decode_prebind_requested) {
+        std::string prebind_error;
+        if (prepare_decode_step_prebind(
+                decode_prebind,
+                *decode_request,
+                next_embed.data(),
+                hidden_size,
+                runner->paged_kv_block_size,
+                cache_blocks,
+                tts_pad_embed,
+                static_cast<size_t>(std::max<int64_t>(1, graph_unroll)),
+                &prebind_error)) {
+            runner->last_timing.decode_step_prebind_enabled = true;
+        } else {
+            runner->last_timing.decode_step_prebind_fallback_count += 1;
+            if (env_enabled("QWEN3_TTS_OV_NATIVE_REQUIRE_DECODE_STEP_PREBIND", false)) {
+                throw std::runtime_error("required decode step prebind failed: " + prebind_error);
+            }
+        }
+    }
     std::vector<uint8_t> repeated_first_codes;
     if (use_repetition_penalty) {
         repeated_first_codes.assign(static_cast<size_t>(vocab_size), 0);
         runner->last_timing.no_repeat_fast_path = false;
     }
-    std::mt19937_64 rng(
-        sampling.seed
-            ? sampling.seed
-            : static_cast<uint64_t>(
-                  std::chrono::high_resolution_clock::now().time_since_epoch().count()));
+    std::mt19937_64 rng(sampling.seed);
     RemoteEmbedChain remote_embed = make_paged_remote_embed_chain(runner, hidden_size);
     if (runner->paged_split_subcode) {
         remote_embed.enabled = false;
@@ -2418,8 +3791,16 @@ void run_paged_kv_impl(
     if (use_static_decode && !env_enabled("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_REMOTE_EMBED", false)) {
         remote_embed.enabled = false;
     }
+    SplitSubcodeRemoteNextEmbedChain split_remote_next_embed =
+        make_split_subcode_remote_next_embed_chain(runner, hidden_size);
+    if (split_remote_next_embed.requested && !split_remote_next_embed.enabled) {
+        runner->last_timing.split_subcode_remote_next_embed_fallback_count += 1;
+        if (split_remote_next_embed.required) {
+            throw std::runtime_error(
+                "required split-subcode remote next_embed setup failed: " + split_remote_next_embed.failure);
+        }
+    }
     runner->last_remote_embed_used = remote_embed.enabled;
-    const int64_t graph_unroll = std::max<int64_t>(1, runner->unroll);
     std::vector<int64_t>& split_frame_codes = runner->scratch.subcode_frame_codes;
 
     int64_t generated = 0;
@@ -2509,55 +3890,134 @@ void run_paged_kv_impl(
         runner->codegen_trace.push_back(std::move(item));
     };
 
-	    auto run_step = [&](
-	        ov::InferRequest& step_request,
-	        const std::string& step_request_label,
+    const ov::Tensor* next_remote_input = nullptr;
+    bool split_remote_host_backup_valid = false;
+
+    auto run_step = [&](
+        ov::InferRequest& step_request,
+        const std::string& step_request_label,
         const float* embeds,
         int64_t seq_len,
         int64_t position_start,
         int64_t past_len,
-	        const std::vector<float>& allow_eos_values,
-	        const ov::Tensor* remote_input,
-	        ov::Tensor* remote_output) {
-	        double bind_ms = 0.0;
-	        measure_ms(bind_ms, [&]() {
-	            bind_paged_step_inputs(
-	                step_request,
-                embeds,
-                seq_len,
-                hidden_size,
-                position_start,
-                past_len,
-                runner->paged_kv_block_size,
-                tts_pad_embed,
-                allow_eos_values,
-                position_ids,
-                block_indices,
-                allow_eos_buffer,
-                beam_idx_buffer);
-            if (remote_input && static_cast<bool>(*remote_input)) {
-                step_request.set_tensor("inputs_embeds", *remote_input);
+        const std::vector<float>& allow_eos_values,
+        const ov::Tensor* remote_input,
+        ov::Tensor* remote_output) {
+        double bind_ms = 0.0;
+        measure_ms(bind_ms, [&]() {
+            const bool has_remote_input = remote_input && static_cast<bool>(*remote_input);
+            bool used_prebind = false;
+            auto bind_host_inputs = [&]() {
+                bind_paged_step_inputs(
+                    step_request,
+                    embeds,
+                    seq_len,
+                    hidden_size,
+                    position_start,
+                    past_len,
+                    runner->paged_kv_block_size,
+                    tts_pad_embed,
+                    allow_eos_values,
+                    position_ids,
+                    block_indices,
+                    allow_eos_buffer,
+                    beam_idx_buffer,
+                    true);
+            };
+            auto mark_split_remote_decode_input_ok = [&]() {
+                if (split_remote_next_embed.enabled && has_remote_input) {
+                    split_remote_next_embed.verified_decode_input = true;
+                }
+            };
+            if (
+                decode_prebind.enabled &&
+                use_static_decode &&
+                &step_request == decode_request &&
+                seq_len == 1) {
+                try {
+                    double prebind_update_ms = 0.0;
+                    measure_ms(prebind_update_ms, [&]() {
+                        update_prebound_decode_step_inputs(
+                            decode_prebind,
+                            step_request,
+                            embeds,
+                            position_start,
+                            past_len,
+                            allow_eos_values,
+                            remote_input);
+                    });
+                    runner->last_timing.decode_step_prebind_update_ms += prebind_update_ms;
+                    runner->last_timing.decode_step_prebind_update_step_ms.push_back(prebind_update_ms);
+                    used_prebind = true;
+                    mark_split_remote_decode_input_ok();
+                } catch (const std::exception& exc) {
+                    decode_prebind.enabled = false;
+                    runner->last_timing.decode_step_prebind_fallback_count += 1;
+                    if (env_enabled("QWEN3_TTS_OV_NATIVE_REQUIRE_DECODE_STEP_PREBIND", false)) {
+                        throw std::runtime_error(std::string("required decode step prebind update failed: ") + exc.what());
+                    }
+                }
             }
-	            if (remote_output && static_cast<bool>(*remote_output)) {
-	                step_request.set_output_tensor(2, *remote_output);
-	            }
-	        });
-	        runner->last_timing.tensor_bind_ms += bind_ms;
-	        runner->last_timing.codegen_bind_step_ms.push_back(bind_ms);
-	        double step_infer_ms = 0.0;
-	        measure_ms(step_infer_ms, [&]() {
-	            step_request.infer();
+            if (!used_prebind) {
+                bind_paged_step_inputs(
+                    step_request,
+                    embeds,
+                    seq_len,
+                    hidden_size,
+                    position_start,
+                    past_len,
+                    runner->paged_kv_block_size,
+                    tts_pad_embed,
+                    allow_eos_values,
+                    position_ids,
+                    block_indices,
+                    allow_eos_buffer,
+                    beam_idx_buffer,
+                    !has_remote_input);
+                if (has_remote_input) {
+                    try {
+                        step_request.set_tensor("inputs_embeds", *remote_input);
+                        mark_split_remote_decode_input_ok();
+                    } catch (const std::exception& exc) {
+                        runner->last_timing.split_subcode_remote_next_embed_fallback_count += 1;
+                        if (split_remote_next_embed.required || !split_remote_host_backup_valid) {
+                            throw std::runtime_error(
+                                std::string("split-subcode remote next_embed input bind failed: ") + exc.what());
+                        }
+                        split_remote_next_embed.enabled = false;
+                        next_remote_input = nullptr;
+                        bind_host_inputs();
+                    } catch (...) {
+                        runner->last_timing.split_subcode_remote_next_embed_fallback_count += 1;
+                        if (split_remote_next_embed.required || !split_remote_host_backup_valid) {
+                            throw std::runtime_error("split-subcode remote next_embed input bind failed");
+                        }
+                        split_remote_next_embed.enabled = false;
+                        next_remote_input = nullptr;
+                        bind_host_inputs();
+                    }
+                }
+            }
+            if (remote_output && static_cast<bool>(*remote_output)) {
+                step_request.set_output_tensor(2, *remote_output);
+            }
+        });
+        runner->last_timing.tensor_bind_ms += bind_ms;
+        runner->last_timing.codegen_bind_step_ms.push_back(bind_ms);
+        double step_infer_ms = 0.0;
+        measure_ms(step_infer_ms, [&]() {
+            step_request.infer();
         });
         runner->last_timing.codegen_infer_ms += step_infer_ms;
-	        if (step_request_label.find("prefill") != std::string::npos) {
-	            runner->last_timing.codegen_prefill_infer_ms += step_infer_ms;
-	            runner->last_timing.codegen_prefill_count += 1;
-	            runner->last_timing.codegen_prefill_step_ms.push_back(step_infer_ms);
-	        } else {
-	            runner->last_timing.codegen_decode_infer_ms += step_infer_ms;
-	            runner->last_timing.codegen_decode_count += 1;
-	            runner->last_timing.codegen_decode_step_ms.push_back(step_infer_ms);
-	        }
+        if (step_request_label.find("prefill") != std::string::npos) {
+            runner->last_timing.codegen_prefill_infer_ms += step_infer_ms;
+            runner->last_timing.codegen_prefill_count += 1;
+            runner->last_timing.codegen_prefill_step_ms.push_back(step_infer_ms);
+        } else {
+            runner->last_timing.codegen_decode_infer_ms += step_infer_ms;
+            runner->last_timing.codegen_decode_count += 1;
+            runner->last_timing.codegen_decode_step_ms.push_back(step_infer_ms);
+        }
         record_request_profile(runner, step_request_label, step_request);
         if (runner->paged_split_subcode) {
             auto first_output_tensor = step_request.get_output_tensor(0);
@@ -2591,6 +4051,14 @@ void run_paged_kv_impl(
                 stop = true;
                 return;
             }
+            ov::Tensor* split_remote_output = nullptr;
+            if (split_remote_next_embed.enabled) {
+                split_remote_output = &split_remote_next_embed.outputs[split_remote_next_embed.next_output];
+            }
+            bool split_remote_written = false;
+            const bool need_host_next_embed =
+                trace_frame_limit > 0 ||
+                (split_remote_next_embed.enabled && !split_remote_next_embed.verified_decode_input);
             run_paged_split_subcode_step(
                 runner,
                 last_hidden_tensor,
@@ -2600,14 +4068,29 @@ void run_paged_kv_impl(
                 hidden_size,
                 num_code_groups,
                 split_frame_codes,
-                next_embed);
+                next_embed,
+                split_remote_output,
+                need_host_next_embed,
+                &split_remote_written,
+                &sampling,
+                &rng);
+            split_remote_host_backup_valid = need_host_next_embed || !split_remote_written;
             append_trace(
                 "split_subcode",
                 generated,
                 first_code,
                 split_frame_codes.data(),
                 &last_hidden_tensor,
-                next_embed.data());
+                need_host_next_embed && !next_embed.empty() ? next_embed.data() : nullptr);
+            if (split_remote_written && split_remote_output) {
+                next_remote_input = split_remote_output;
+                split_remote_next_embed.next_output = 1 - split_remote_next_embed.next_output;
+            } else {
+                if (split_remote_output) {
+                    split_remote_next_embed.enabled = false;
+                }
+                next_remote_input = nullptr;
+            }
             emit_many(&first_code, split_frame_codes.data(), 1);
             if (
                 use_repetition_penalty &&
@@ -2640,7 +4123,6 @@ void run_paged_kv_impl(
     };
 
     ov::Tensor* current_remote_output = remote_embed.enabled ? &remote_embed.decode_outputs[0] : nullptr;
-    const ov::Tensor* next_remote_input = nullptr;
     run_step(
         prefill_request,
         "codegen_paged_kv_prefill",
@@ -2682,6 +4164,1647 @@ void run_paged_kv_impl(
     if (elapsed_ms) {
         *elapsed_ms = runner->last_timing.total_ms;
     }
+}
+
+void run_paged_kv_sequence_batch_impl(
+    NativeCodegen* runner,
+    const float* sequence,
+    int64_t total_prompt_tokens,
+    const int64_t* prompt_lens,
+    int64_t hidden_size,
+    const float* tts_pad_embed,
+    int64_t batch_size,
+    int64_t max_new_tokens,
+    int64_t min_new_tokens,
+    float repetition_penalty,
+    int64_t vocab_size,
+    int64_t num_code_groups,
+    int64_t eos_token_id,
+    const NativeSamplingConfig& sampling,
+    int64_t* out_counts,
+    double* out_ttft_ms,
+    double* out_last_token_ms,
+    double* elapsed_ms,
+    int64_t* out_codes = nullptr) {
+    if (!runner || !sequence || !prompt_lens || !tts_pad_embed || !out_counts || !out_ttft_ms || !out_last_token_ms) {
+        throw std::runtime_error("invalid null pointer passed to native continuous batch codegen");
+    }
+    if (!runner->paged_kv_enabled || !runner->paged_split_subcode) {
+        throw std::runtime_error("native continuous batch requires paged-KV split-subcode runner");
+    }
+    if (sampling.do_sample) {
+        throw std::runtime_error("native continuous batch currently supports greedy do_sample=false only");
+    }
+    if (std::abs(repetition_penalty - 1.0f) > 1e-6f) {
+        throw std::runtime_error("native continuous batch currently requires repetition_penalty=1.0");
+    }
+    if (total_prompt_tokens <= 0 || hidden_size <= 0 || batch_size <= 0 || max_new_tokens <= 0 || num_code_groups <= 0) {
+        throw std::runtime_error("invalid native continuous batch shape argument");
+    }
+    const auto started = std::chrono::steady_clock::now();
+    runner->last_timing = NativeCodegen::RunTiming{};
+    runner->last_timing.no_repeat_fast_path = true;
+    runner->codegen_trace.clear();
+    std::fill(out_counts, out_counts + batch_size, 0);
+    std::fill(out_ttft_ms, out_ttft_ms + batch_size, -1.0);
+    std::fill(out_last_token_ms, out_last_token_ms + batch_size, 0.0);
+    if (out_codes) {
+        std::fill(
+            out_codes,
+            out_codes + static_cast<size_t>(batch_size * max_new_tokens * num_code_groups),
+            -1);
+    }
+    const char* policy_env = std::getenv("QWEN3_TTS_OV_NATIVE_CONTINUOUS_BATCH_POLICY");
+    std::string batch_policy = normalize_continuous_batch_policy(
+        policy_env && std::strlen(policy_env) > 0 ? policy_env : "raw_fused");
+    if (!valid_continuous_batch_policy(batch_policy)) {
+        throw std::runtime_error(continuous_batch_policy_error());
+    }
+    runner->continuous_batch_policy = batch_policy;
+    runner->batch_decode_unroll = 1;
+    runner->last_timing.batch_decode_unroll_requested = runner->batch_decode_unroll_requested;
+    runner->last_timing.batch_decode_unroll = runner->batch_decode_unroll;
+    if (runner->batch_decode_unroll_requested > 1) {
+        runner->last_timing.batch_decode_unroll_fallback_count += 1;
+    }
+
+    std::vector<int64_t> prompt_lengths(static_cast<size_t>(batch_size), 0);
+    std::vector<int64_t> blocks_per_sequence(static_cast<size_t>(batch_size), 0);
+    int64_t checked_total_prompt_tokens = 0;
+    int64_t total_cache_blocks = 0;
+    for (int64_t seq = 0; seq < batch_size; ++seq) {
+        const int64_t prompt_len = prompt_lens[seq];
+        if (prompt_len <= 0) {
+            throw std::runtime_error("native continuous batch prompt_lens must be positive");
+        }
+        prompt_lengths[static_cast<size_t>(seq)] = prompt_len;
+        checked_total_prompt_tokens += prompt_len;
+        const int64_t capacity_tokens = prompt_len + max_new_tokens + 1;
+        const int64_t blocks = std::max<int64_t>(
+            1,
+            (capacity_tokens + runner->paged_kv_block_size - 1) / runner->paged_kv_block_size);
+        blocks_per_sequence[static_cast<size_t>(seq)] = blocks;
+        total_cache_blocks += blocks;
+    }
+    if (checked_total_prompt_tokens != total_prompt_tokens) {
+        throw std::runtime_error("native continuous batch total_prompt_tokens does not match prompt_lens sum");
+    }
+    auto& request = runner->prefill_request;
+    const auto& cache_tensors = get_paged_kv_cache_tensors(runner, runner->prefill_model, total_cache_blocks);
+    bind_named_tensors(request, cache_tensors);
+    if (runner->paged_fused_batch_decode_enabled) {
+        bind_named_tensors(runner->decode_request, cache_tensors);
+    }
+
+    std::vector<PagedBatchSequenceState> states(static_cast<size_t>(batch_size));
+    int64_t next_block_offset = 0;
+    for (int64_t seq = 0; seq < batch_size; ++seq) {
+        auto& state = states[static_cast<size_t>(seq)];
+        state.prompt_len = prompt_lengths[static_cast<size_t>(seq)];
+        state.block_offset = next_block_offset;
+        state.block_capacity = blocks_per_sequence[static_cast<size_t>(seq)];
+        next_block_offset += state.block_capacity;
+        state.next_embed.assign(static_cast<size_t>(hidden_size), 0.0f);
+    }
+
+    std::vector<int64_t> position_ids;
+    std::vector<int32_t> past_lens_buffer;
+    std::vector<int32_t> subsequence_begins;
+    std::vector<int32_t> block_indices;
+    std::vector<int32_t> block_indices_begins;
+    std::vector<float> allow_eos_buffer;
+    std::vector<int64_t> beam_idx_buffer;
+    std::vector<int32_t> score_aggregation_window_buffer;
+    std::vector<int64_t> frame_codes;
+    std::vector<float> next_embeds;
+    std::vector<int64_t> first_codes;
+
+    auto active_count = [&]() {
+        int64_t count = 0;
+        for (const auto& state : states) {
+            if (!state.stop && state.generated < max_new_tokens) {
+                ++count;
+            }
+        }
+        return count;
+    };
+    auto mark_sequence_frame = [&](int64_t seq_index) {
+        auto& state = states[static_cast<size_t>(seq_index)];
+        const double token_ms = elapsed_ms_since(started);
+        if (state.generated == 0) {
+            state.ttft_ms = token_ms;
+            out_ttft_ms[seq_index] = token_ms;
+        }
+        state.last_token_ms = token_ms;
+        out_last_token_ms[seq_index] = token_ms;
+        state.generated += 1;
+        out_counts[seq_index] = state.generated;
+        runner->last_timing.generated_frames += 1;
+        runner->last_timing.last_token_ms = token_ms;
+        if (runner->last_timing.ttft_ms <= 0.0) {
+            runner->last_timing.ttft_ms = token_ms;
+        }
+    };
+    auto record_frame_codes = [&](int64_t seq_index, size_t row) {
+        if (!out_codes) {
+            return;
+        }
+        auto& state = states[static_cast<size_t>(seq_index)];
+        if (state.generated < 0 || state.generated >= max_new_tokens) {
+            return;
+        }
+        const size_t src_offset = row * static_cast<size_t>(num_code_groups);
+        if (frame_codes.size() < src_offset + static_cast<size_t>(num_code_groups)) {
+            throw std::runtime_error("native continuous batch frame_codes output is too small");
+        }
+        const size_t dst_offset =
+            (static_cast<size_t>(seq_index) * static_cast<size_t>(max_new_tokens) +
+             static_cast<size_t>(state.generated)) *
+            static_cast<size_t>(num_code_groups);
+        std::memcpy(
+            out_codes + dst_offset,
+            frame_codes.data() + src_offset,
+            static_cast<size_t>(num_code_groups) * sizeof(int64_t));
+    };
+    auto select_first_codes = [&](
+        const ov::Tensor& first_output_tensor,
+        const std::vector<int64_t>& seq_indices,
+        std::vector<int64_t>& selected,
+        const std::vector<int64_t>& row_offsets = {}) {
+        selected.assign(seq_indices.size(), eos_token_id);
+        int64_t max_row = static_cast<int64_t>(seq_indices.size()) - 1;
+        if (!row_offsets.empty()) {
+            if (row_offsets.size() != seq_indices.size()) {
+                throw std::runtime_error("native continuous batch row_offsets size mismatch");
+            }
+            for (const int64_t row : row_offsets) {
+                max_row = std::max<int64_t>(max_row, row);
+            }
+        }
+        if (runner->paged_seed_outputs_first_code) {
+            const auto first_code_view = tensor_to_host_view<int64_t>(runner, first_output_tensor, "batch first_code");
+            if (!first_code_view.data || first_code_view.size <= static_cast<size_t>(max_row)) {
+                throw std::runtime_error("native continuous batch first_code output is too small");
+            }
+            for (size_t i = 0; i < seq_indices.size(); ++i) {
+                const int64_t row = row_offsets.empty() ? static_cast<int64_t>(i) : row_offsets[i];
+                selected[i] = first_code_view.data[static_cast<size_t>(row)];
+            }
+            return;
+        }
+        const auto logits = tensor_to_host_f32_view(runner, first_output_tensor, "batch logits");
+        int64_t effective_vocab_size = vocab_size;
+        const auto shape = first_output_tensor.get_shape();
+        if (!shape.empty() && shape.back() > 0) {
+            effective_vocab_size = static_cast<int64_t>(shape.back());
+        }
+        if (
+            !logits.data ||
+            effective_vocab_size <= 0 ||
+            logits.size < static_cast<size_t>(max_row + 1) * static_cast<size_t>(effective_vocab_size)) {
+            std::ostringstream msg;
+            msg << "native continuous batch logits output is invalid: "
+                << tensor_debug_string(first_output_tensor)
+                << ", logits_size=" << logits.size
+                << ", selected_rows=" << seq_indices.size()
+                << ", effective_vocab_size=" << effective_vocab_size;
+            throw std::runtime_error(msg.str());
+        }
+        for (size_t i = 0; i < seq_indices.size(); ++i) {
+            const int64_t seq_index = seq_indices[i];
+            const int64_t row = row_offsets.empty() ? static_cast<int64_t>(i) : row_offsets[i];
+            selected[i] = select_first_code_greedy_from_logits_row(
+                logits.data + static_cast<size_t>(row) * static_cast<size_t>(effective_vocab_size),
+                effective_vocab_size,
+                states[static_cast<size_t>(seq_index)].generated,
+                min_new_tokens,
+                eos_token_id);
+        }
+    };
+
+    std::vector<int64_t> seq_indices;
+    std::vector<int64_t> seq_lens;
+    std::vector<int64_t> position_starts;
+    std::vector<int64_t> past_lens;
+    std::vector<int64_t> block_offsets;
+    std::vector<int64_t> block_counts;
+    std::vector<float> allow_eos;
+    std::vector<float> decode_embeds;
+
+    const bool use_batched_prefill =
+        continuous_policy_uses_batched_prefill(batch_policy) &&
+        batch_size > 1 &&
+        env_enabled("QWEN3_TTS_OV_NATIVE_BATCH_PREFILL", false);
+    if (use_batched_prefill) {
+        runner->last_timing.batch_prefill_enabled = true;
+        seq_indices.resize(static_cast<size_t>(batch_size));
+        seq_lens.resize(static_cast<size_t>(batch_size));
+        position_starts.assign(static_cast<size_t>(batch_size), 0);
+        past_lens.assign(static_cast<size_t>(batch_size), 0);
+        block_offsets.resize(static_cast<size_t>(batch_size));
+        block_counts.resize(static_cast<size_t>(batch_size));
+        allow_eos.assign(static_cast<size_t>(batch_size), min_new_tokens <= 0 ? 1.0f : 0.0f);
+        std::vector<int64_t> prefill_row_offsets(static_cast<size_t>(batch_size), 0);
+        int64_t token_offset = 0;
+        for (int64_t seq = 0; seq < batch_size; ++seq) {
+            auto& state = states[static_cast<size_t>(seq)];
+            seq_indices[static_cast<size_t>(seq)] = seq;
+            seq_lens[static_cast<size_t>(seq)] = state.prompt_len;
+            block_offsets[static_cast<size_t>(seq)] = state.block_offset;
+            block_counts[static_cast<size_t>(seq)] = std::max<int64_t>(
+                1,
+                (state.prompt_len + runner->paged_kv_block_size - 1) / runner->paged_kv_block_size);
+            prefill_row_offsets[static_cast<size_t>(seq)] = token_offset + state.prompt_len - 1;
+            token_offset += state.prompt_len;
+        }
+        double bind_ms = 0.0;
+        measure_ms(bind_ms, [&]() {
+            bind_paged_batch_step_inputs(
+                request,
+                sequence,
+                seq_lens,
+                hidden_size,
+                position_starts,
+                past_lens,
+                runner->paged_kv_block_size,
+                tts_pad_embed,
+                allow_eos,
+                block_offsets,
+                block_counts,
+                position_ids,
+                past_lens_buffer,
+                subsequence_begins,
+                block_indices,
+                block_indices_begins,
+                allow_eos_buffer,
+                beam_idx_buffer,
+                score_aggregation_window_buffer);
+        });
+        runner->last_timing.tensor_bind_ms += bind_ms;
+        runner->last_timing.codegen_bind_step_ms.push_back(bind_ms);
+        double prefill_ms = 0.0;
+        measure_ms(prefill_ms, [&]() {
+            request.infer();
+        });
+        runner->last_timing.codegen_infer_ms += prefill_ms;
+        runner->last_timing.codegen_prefill_infer_ms += prefill_ms;
+        runner->last_timing.codegen_prefill_count += 1;
+        runner->last_timing.codegen_prefill_step_ms.push_back(prefill_ms);
+        record_request_profile(runner, "codegen_paged_kv_prefill_batch", request);
+
+        auto first_output_tensor = request.get_output_tensor(0);
+        auto last_hidden_tensor = request.get_output_tensor(1);
+        select_first_codes(first_output_tensor, seq_indices, first_codes, prefill_row_offsets);
+        std::vector<float> prefill_last_hidden(static_cast<size_t>(batch_size * hidden_size), 0.0f);
+        const auto hidden_view = tensor_to_host_f32_view(runner, last_hidden_tensor, "continuous batch prefill last_hidden");
+        if (!hidden_view.data || hidden_view.size < static_cast<size_t>(total_prompt_tokens * hidden_size)) {
+            throw std::runtime_error("native continuous batch prefill hidden output is invalid");
+        }
+        for (int64_t seq = 0; seq < batch_size; ++seq) {
+            const int64_t row = prefill_row_offsets[static_cast<size_t>(seq)];
+            std::memcpy(
+                prefill_last_hidden.data() + static_cast<size_t>(seq * hidden_size),
+                hidden_view.data + static_cast<size_t>(row * hidden_size),
+                static_cast<size_t>(hidden_size) * sizeof(float));
+        }
+        const bool use_batched_prefill_subcode =
+            runner->batch_subcode_enabled &&
+            env_enabled("QWEN3_TTS_OV_NATIVE_BATCH_PREFILL_SUBCODE", false);
+        if (use_batched_prefill_subcode) {
+            ov::Tensor subcode_hidden_tensor(
+                ov::element::f32,
+                ov::Shape{static_cast<size_t>(batch_size), 1, static_cast<size_t>(hidden_size)},
+                prefill_last_hidden.data());
+            run_paged_split_subcode_batch(
+                runner,
+                subcode_hidden_tensor,
+                first_codes,
+                tts_pad_embed,
+                hidden_size,
+                num_code_groups,
+                frame_codes,
+                next_embeds);
+        } else {
+            frame_codes.assign(static_cast<size_t>(batch_size * num_code_groups), 0);
+            next_embeds.assign(static_cast<size_t>(batch_size * hidden_size), 0.0f);
+            for (int64_t seq = 0; seq < batch_size; ++seq) {
+                ov::Tensor row_hidden_tensor(
+                    ov::element::f32,
+                    ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
+                    prefill_last_hidden.data() + static_cast<size_t>(seq * hidden_size));
+                std::vector<int64_t> row_first_code{first_codes[static_cast<size_t>(seq)]};
+                std::vector<int64_t> row_codes;
+                std::vector<float> row_next_embed;
+                run_paged_split_subcode_batch(
+                    runner,
+                    row_hidden_tensor,
+                    row_first_code,
+                    tts_pad_embed,
+                    hidden_size,
+                    num_code_groups,
+                    row_codes,
+                    row_next_embed);
+                if (row_codes.size() < static_cast<size_t>(num_code_groups)) {
+                    throw std::runtime_error("native continuous batched prefill subcode returned too few codec groups");
+                }
+                if (row_next_embed.size() < static_cast<size_t>(hidden_size)) {
+                    throw std::runtime_error("native continuous batched prefill subcode returned too small next_embed");
+                }
+                std::memcpy(
+                    frame_codes.data() + static_cast<size_t>(seq * num_code_groups),
+                    row_codes.data(),
+                    static_cast<size_t>(num_code_groups) * sizeof(int64_t));
+                std::memcpy(
+                    next_embeds.data() + static_cast<size_t>(seq * hidden_size),
+                    row_next_embed.data(),
+                    static_cast<size_t>(hidden_size) * sizeof(float));
+            }
+        }
+        for (int64_t seq = 0; seq < batch_size; ++seq) {
+            auto& state = states[static_cast<size_t>(seq)];
+            const int64_t first_code = first_codes[static_cast<size_t>(seq)];
+            if (first_code == eos_token_id && state.generated >= min_new_tokens) {
+                state.stop = true;
+                continue;
+            }
+            record_frame_codes(seq, static_cast<size_t>(seq));
+            std::memcpy(
+                state.next_embed.data(),
+                next_embeds.data() + static_cast<size_t>(seq * hidden_size),
+                static_cast<size_t>(hidden_size) * sizeof(float));
+            mark_sequence_frame(seq);
+        }
+    } else {
+        int64_t prompt_token_offset = 0;
+        for (int64_t seq = 0; seq < batch_size; ++seq) {
+            auto& state = states[static_cast<size_t>(seq)];
+            seq_indices.assign(1, seq);
+            seq_lens.assign(1, state.prompt_len);
+            position_starts.assign(1, 0);
+            past_lens.assign(1, 0);
+            block_offsets.assign(1, state.block_offset);
+            block_counts.assign(
+                1,
+                std::max<int64_t>(
+                    1,
+                    (state.prompt_len + runner->paged_kv_block_size - 1) / runner->paged_kv_block_size));
+            allow_eos.assign(1, min_new_tokens <= 0 ? 1.0f : 0.0f);
+            const float* sequence_ptr = sequence + static_cast<size_t>(prompt_token_offset * hidden_size);
+            prompt_token_offset += state.prompt_len;
+
+            double bind_ms = 0.0;
+            measure_ms(bind_ms, [&]() {
+                bind_paged_batch_step_inputs(
+                    request,
+                    sequence_ptr,
+                    seq_lens,
+                    hidden_size,
+                    position_starts,
+                    past_lens,
+                    runner->paged_kv_block_size,
+                    tts_pad_embed,
+                    allow_eos,
+                    block_offsets,
+                    block_counts,
+                    position_ids,
+                    past_lens_buffer,
+                    subsequence_begins,
+                    block_indices,
+                    block_indices_begins,
+                    allow_eos_buffer,
+                    beam_idx_buffer,
+                    score_aggregation_window_buffer);
+            });
+            runner->last_timing.tensor_bind_ms += bind_ms;
+            runner->last_timing.codegen_bind_step_ms.push_back(bind_ms);
+            double prefill_ms = 0.0;
+            measure_ms(prefill_ms, [&]() {
+                request.infer();
+            });
+            runner->last_timing.codegen_infer_ms += prefill_ms;
+            runner->last_timing.codegen_prefill_infer_ms += prefill_ms;
+            runner->last_timing.codegen_prefill_count += 1;
+            runner->last_timing.codegen_prefill_step_ms.push_back(prefill_ms);
+            record_request_profile(runner, "codegen_paged_kv_prefill_sequence", request);
+
+            auto first_output_tensor = request.get_output_tensor(0);
+            auto last_hidden_tensor = request.get_output_tensor(1);
+            std::vector<int64_t> prefill_row_offsets{state.prompt_len - 1};
+            select_first_codes(first_output_tensor, seq_indices, first_codes, prefill_row_offsets);
+            ov::Tensor subcode_hidden_tensor = last_hidden_tensor;
+            std::vector<float> prefill_last_hidden;
+            if (last_hidden_tensor.get_size() > static_cast<size_t>(hidden_size)) {
+                const auto hidden_view = tensor_to_host_f32_view(runner, last_hidden_tensor, "continuous prefill last_hidden");
+                if (!hidden_view.data || hidden_view.size < static_cast<size_t>(state.prompt_len * hidden_size)) {
+                    throw std::runtime_error("native continuous batch prefill hidden output is invalid");
+                }
+                prefill_last_hidden.assign(
+                    hidden_view.data + static_cast<size_t>((state.prompt_len - 1) * hidden_size),
+                    hidden_view.data + static_cast<size_t>(state.prompt_len * hidden_size));
+                subcode_hidden_tensor = ov::Tensor(
+                    ov::element::f32,
+                    ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
+                    prefill_last_hidden.data());
+            }
+            run_paged_split_subcode_batch(
+                runner,
+                subcode_hidden_tensor,
+                first_codes,
+                tts_pad_embed,
+                hidden_size,
+                num_code_groups,
+                frame_codes,
+                next_embeds);
+            const int64_t first_code = first_codes[0];
+            if (first_code == eos_token_id && state.generated >= min_new_tokens) {
+                state.stop = true;
+                continue;
+            }
+            record_frame_codes(seq, 0);
+            std::memcpy(
+                state.next_embed.data(),
+                next_embeds.data(),
+                static_cast<size_t>(hidden_size) * sizeof(float));
+            mark_sequence_frame(seq);
+        }
+    }
+
+    while (active_count() > 0) {
+        seq_indices.clear();
+        for (int64_t seq = 0; seq < batch_size; ++seq) {
+            const auto& state = states[static_cast<size_t>(seq)];
+            if (!state.stop && state.generated < max_new_tokens) {
+                seq_indices.push_back(seq);
+            }
+        }
+        if (batch_policy == "context_bucketed" && seq_indices.size() > 1) {
+            int64_t selected_block_count = std::numeric_limits<int64_t>::max();
+            for (const int64_t seq_index : seq_indices) {
+                const auto& state = states[static_cast<size_t>(seq_index)];
+                const int64_t position = state.prompt_len + state.generated - 1;
+                const int64_t count = std::max<int64_t>(
+                    1,
+                    (position + 1 + runner->paged_kv_block_size - 1) / runner->paged_kv_block_size);
+                selected_block_count = std::min<int64_t>(selected_block_count, count);
+            }
+            std::vector<int64_t> bucketed;
+            bucketed.reserve(seq_indices.size());
+            for (const int64_t seq_index : seq_indices) {
+                const auto& state = states[static_cast<size_t>(seq_index)];
+                const int64_t position = state.prompt_len + state.generated - 1;
+                const int64_t count = std::max<int64_t>(
+                    1,
+                    (position + 1 + runner->paged_kv_block_size - 1) / runner->paged_kv_block_size);
+                if (count == selected_block_count) {
+                    bucketed.push_back(seq_index);
+                }
+            }
+            if (!bucketed.empty()) {
+                seq_indices.swap(bucketed);
+            }
+        }
+        const size_t active = seq_indices.size();
+        if (runner->last_timing.active_batch_histogram.size() <= active) {
+            runner->last_timing.active_batch_histogram.resize(active + 1, 0);
+        }
+        runner->last_timing.active_batch_histogram[active] += 1;
+        runner->last_timing.batch_buffer_reuse = true;
+        decode_embeds.resize(active * static_cast<size_t>(hidden_size));
+        seq_lens.assign(active, 1);
+        position_starts.assign(active, 0);
+        past_lens.assign(active, 0);
+        block_offsets.assign(active, 0);
+        block_counts.assign(active, 1);
+        allow_eos.assign(active, 0.0f);
+        for (size_t row = 0; row < active; ++row) {
+            const int64_t seq_index = seq_indices[row];
+            const auto& state = states[static_cast<size_t>(seq_index)];
+            std::memcpy(
+                decode_embeds.data() + row * static_cast<size_t>(hidden_size),
+                state.next_embed.data(),
+                static_cast<size_t>(hidden_size) * sizeof(float));
+            const int64_t position = state.prompt_len + state.generated - 1;
+            position_starts[row] = position;
+            past_lens[row] = position;
+            block_offsets[row] = state.block_offset;
+            block_counts[row] = std::max<int64_t>(
+                1,
+                (position + 1 + runner->paged_kv_block_size - 1) / runner->paged_kv_block_size);
+            allow_eos[row] = state.generated >= min_new_tokens ? 1.0f : 0.0f;
+        }
+        const bool use_fused_batch_decode =
+            runner->paged_fused_batch_decode_enabled &&
+            !(continuous_policy_uses_single_row_fast_path(batch_policy) && active == 1);
+        ov::InferRequest& decode_request = use_fused_batch_decode
+            ? runner->decode_request
+            : request;
+        if (use_fused_batch_decode) {
+            runner->last_timing.batch_fused_decode_step_count += 1;
+            runner->last_timing.batch_fused_decode_token_count += static_cast<int64_t>(active);
+        } else {
+            runner->last_timing.batch_single_decode_step_count += 1;
+            runner->last_timing.batch_single_decode_token_count += static_cast<int64_t>(active);
+            if (runner->paged_fused_batch_decode_enabled &&
+                continuous_policy_uses_single_row_fast_path(batch_policy) &&
+                active == 1) {
+                runner->last_timing.batch_fused_decode_active1_bypass_count += 1;
+            }
+        }
+        double decode_bind_ms = 0.0;
+        measure_ms(decode_bind_ms, [&]() {
+            bind_paged_batch_step_inputs(
+                decode_request,
+                decode_embeds.data(),
+                seq_lens,
+                hidden_size,
+                position_starts,
+                past_lens,
+                runner->paged_kv_block_size,
+                tts_pad_embed,
+                allow_eos,
+                block_offsets,
+                block_counts,
+                position_ids,
+                past_lens_buffer,
+                subsequence_begins,
+                block_indices,
+                block_indices_begins,
+                allow_eos_buffer,
+                beam_idx_buffer,
+                score_aggregation_window_buffer);
+        });
+        runner->last_timing.tensor_bind_ms += decode_bind_ms;
+        runner->last_timing.codegen_bind_step_ms.push_back(decode_bind_ms);
+        double decode_ms = 0.0;
+        measure_ms(decode_ms, [&]() {
+            decode_request.infer();
+        });
+        runner->last_timing.codegen_infer_ms += decode_ms;
+        runner->last_timing.codegen_decode_infer_ms += decode_ms;
+        runner->last_timing.codegen_decode_count += 1;
+        runner->last_timing.codegen_decode_step_ms.push_back(decode_ms);
+        record_request_profile(
+            runner,
+            use_fused_batch_decode
+                ? "codegen_paged_kv_decode_batch_fused"
+                : "codegen_paged_kv_decode_batch",
+            decode_request);
+        auto first_output_tensor = decode_request.get_output_tensor(0);
+        if (use_fused_batch_decode) {
+            auto codes_tensor = decode_request.get_output_tensor(1);
+            auto embed_tensor = decode_request.get_output_tensor(2);
+            double output_read_ms = 0.0;
+            HostTensorView<int64_t> first_code_view;
+            HostTensorView<int64_t> codes_view;
+            FloatTensorView embed_view;
+            measure_ms(output_read_ms, [&]() {
+                first_code_view = tensor_to_host_view<int64_t>(
+                    runner,
+                    first_output_tensor,
+                    "continuous fused batch first_code");
+                codes_view = tensor_to_host_view<int64_t>(
+                    runner,
+                    codes_tensor,
+                    "continuous fused batch codes");
+                embed_view = tensor_to_host_f32_view(
+                    runner,
+                    embed_tensor,
+                    "continuous fused batch frame_embed");
+            });
+            runner->last_timing.subcode_output_read_ms += output_read_ms;
+            runner->last_timing.subcode_output_read_step_ms.push_back(output_read_ms);
+            if (!first_code_view.data || first_code_view.size < active) {
+                throw std::runtime_error("native continuous fused batch first_code output is too small");
+            }
+            if (!codes_view.data || codes_view.size < active * static_cast<size_t>(num_code_groups)) {
+                throw std::runtime_error("native continuous fused batch codes output is too small");
+            }
+            if (!embed_view.data || embed_view.size < active * static_cast<size_t>(hidden_size)) {
+                throw std::runtime_error("native continuous fused batch frame_embed output is too small");
+            }
+            first_codes.assign(first_code_view.data, first_code_view.data + active);
+            frame_codes.assign(codes_view.data, codes_view.data + active * static_cast<size_t>(num_code_groups));
+            next_embeds.assign(embed_view.data, embed_view.data + active * static_cast<size_t>(hidden_size));
+        } else {
+            auto last_hidden_tensor = decode_request.get_output_tensor(1);
+            select_first_codes(first_output_tensor, seq_indices, first_codes);
+            const bool batch_subcode = env_enabled("QWEN3_TTS_OV_NATIVE_CONTINUOUS_BATCH_SUBCODE", false);
+            if (batch_subcode || active == 1) {
+                run_paged_split_subcode_batch(
+                    runner,
+                    last_hidden_tensor,
+                    first_codes,
+                    tts_pad_embed,
+                    hidden_size,
+                    num_code_groups,
+                    frame_codes,
+                    next_embeds);
+            } else {
+                const auto hidden_view = tensor_to_host_f32_view(runner, last_hidden_tensor, "continuous decode last_hidden");
+                if (!hidden_view.data || hidden_view.size < active * static_cast<size_t>(hidden_size)) {
+                    throw std::runtime_error("native continuous batch decode hidden output is invalid");
+                }
+                frame_codes.assign(active * static_cast<size_t>(num_code_groups), 0);
+                next_embeds.assign(active * static_cast<size_t>(hidden_size), 0.0f);
+                for (size_t row = 0; row < active; ++row) {
+                    std::vector<float> row_hidden(
+                        hidden_view.data + row * static_cast<size_t>(hidden_size),
+                        hidden_view.data + (row + 1) * static_cast<size_t>(hidden_size));
+                    ov::Tensor row_hidden_tensor(
+                        ov::element::f32,
+                        ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
+                        row_hidden.data());
+                    std::vector<int64_t> row_first_code{first_codes[row]};
+                    std::vector<int64_t> row_codes;
+                    std::vector<float> row_next_embed;
+                    run_paged_split_subcode_batch(
+                        runner,
+                        row_hidden_tensor,
+                        row_first_code,
+                        tts_pad_embed,
+                        hidden_size,
+                        num_code_groups,
+                        row_codes,
+                        row_next_embed);
+                    if (row_codes.size() >= static_cast<size_t>(num_code_groups)) {
+                        std::memcpy(
+                            frame_codes.data() + row * static_cast<size_t>(num_code_groups),
+                            row_codes.data(),
+                            static_cast<size_t>(num_code_groups) * sizeof(int64_t));
+                    }
+                    if (row_next_embed.size() >= static_cast<size_t>(hidden_size)) {
+                        std::memcpy(
+                            next_embeds.data() + row * static_cast<size_t>(hidden_size),
+                            row_next_embed.data(),
+                            static_cast<size_t>(hidden_size) * sizeof(float));
+                    }
+                }
+            }
+        }
+        for (size_t row = 0; row < active; ++row) {
+            const int64_t seq_index = seq_indices[row];
+            auto& state = states[static_cast<size_t>(seq_index)];
+            const int64_t first_code = first_codes[row];
+            if (first_code == eos_token_id && state.generated >= min_new_tokens) {
+                state.stop = true;
+                continue;
+            }
+            record_frame_codes(seq_index, row);
+            std::memcpy(
+                state.next_embed.data(),
+                next_embeds.data() + row * static_cast<size_t>(hidden_size),
+                static_cast<size_t>(hidden_size) * sizeof(float));
+            mark_sequence_frame(seq_index);
+        }
+    }
+
+    runner->last_timing.total_ms = elapsed_ms_since(started);
+    if (elapsed_ms) {
+        *elapsed_ms = runner->last_timing.total_ms;
+    }
+}
+
+void online_batch_reset_impl(NativeCodegen* runner, int64_t max_cache_blocks) {
+    if (!runner || !runner->paged_kv_enabled || !runner->paged_split_subcode) {
+        throw std::runtime_error("online continuous batching requires paged-KV split-subcode runner");
+    }
+    if (max_cache_blocks <= 0) {
+        throw std::runtime_error("online continuous batching max_cache_blocks must be positive");
+    }
+    runner->online_batch_ready = true;
+    runner->online_batch_next_id = 1;
+    runner->online_batch_hidden_size = 0;
+    runner->online_batch_vocab_size = 0;
+    runner->online_batch_num_code_groups = 0;
+    runner->online_batch_eos_token_id = 0;
+    runner->online_batch_cache_block_capacity = max_cache_blocks;
+    runner->online_batch_next_block_offset = 0;
+    runner->online_batch_total_requests = 0;
+    runner->online_batch_finished_requests = 0;
+    runner->online_batch_tts_pad_embed.clear();
+    runner->online_batch_sequences.clear();
+    runner->online_batch_pending_ids.clear();
+    runner->online_batch_free_blocks.clear();
+    runner->last_timing = NativeCodegen::RunTiming{};
+    runner->codegen_trace.clear();
+    runner->online_scheduler = env_string("QWEN3_TTS_OV_NATIVE_SCHEDULER", runner->online_scheduler);
+    if (runner->online_scheduler != "legacy" && runner->online_scheduler != "layered") {
+        throw std::runtime_error("QWEN3_TTS_OV_NATIVE_SCHEDULER must be legacy or layered");
+    }
+    runner->prefill_mode = env_string(
+        "QWEN3_TTS_OV_NATIVE_PREFILL_MODE",
+        env_enabled("QWEN3_TTS_OV_NATIVE_BATCH_PREFILL", false) ? "dynamic_ragged" : runner->prefill_mode);
+    if (runner->prefill_mode == "dynamic") {
+        runner->prefill_mode = "dynamic_ragged";
+    }
+    if (
+        runner->prefill_mode != "serial" &&
+        runner->prefill_mode != "dynamic_ragged" &&
+        runner->prefill_mode != "bucketed_padded") {
+        throw std::runtime_error("QWEN3_TTS_OV_NATIVE_PREFILL_MODE must be serial, dynamic_ragged, or bucketed_padded");
+    }
+    runner->prefill_seq_buckets = env_int64_list(
+        "QWEN3_TTS_OV_NATIVE_PREFILL_SEQ_BUCKETS",
+        std::vector<int64_t>{128, 256, 512, 1024});
+    runner->prefill_batch_buckets = env_int64_list(
+        "QWEN3_TTS_OV_NATIVE_PREFILL_BATCH_BUCKETS",
+        std::vector<int64_t>{1, 2, 4, 8});
+    runner->decode_batch_buckets = env_int64_list(
+        "QWEN3_TTS_OV_NATIVE_DECODE_BATCH_BUCKETS",
+        std::vector<int64_t>{1, 2, 4, 8, 16});
+    runner->max_num_batched_tokens = std::max<int64_t>(
+        1,
+        env_int64("QWEN3_TTS_OV_NATIVE_MAX_NUM_BATCHED_TOKENS", 16));
+    runner->paged_kv_cache_tensors = make_paged_kv_cache_tensors(runner->prefill_model, max_cache_blocks);
+    runner->paged_kv_cache_tensor_blocks = max_cache_blocks;
+    bind_named_tensors(runner->prefill_request, runner->paged_kv_cache_tensors);
+    bind_named_tensors(runner->online_logits_decode_request, runner->paged_kv_cache_tensors);
+    if (runner->paged_fused_batch_decode_enabled) {
+        bind_named_tensors(runner->decode_request, runner->paged_kv_cache_tensors);
+    }
+}
+
+std::pair<int64_t, int64_t> online_allocate_blocks(NativeCodegen* runner, int64_t blocks) {
+    if (!runner || blocks <= 0) {
+        throw std::runtime_error("invalid online continuous batch block allocation");
+    }
+    for (auto it = runner->online_batch_free_blocks.begin(); it != runner->online_batch_free_blocks.end(); ++it) {
+        if (it->second < blocks) {
+            continue;
+        }
+        const int64_t offset = it->first;
+        if (it->second == blocks) {
+            runner->online_batch_free_blocks.erase(it);
+        } else {
+            it->first += blocks;
+            it->second -= blocks;
+        }
+        return {offset, blocks};
+    }
+    if (runner->online_batch_next_block_offset + blocks > runner->online_batch_cache_block_capacity) {
+        throw std::runtime_error("online continuous batch KV cache capacity exceeded; increase max_cache_blocks");
+    }
+    const int64_t offset = runner->online_batch_next_block_offset;
+    runner->online_batch_next_block_offset += blocks;
+    return {offset, blocks};
+}
+
+void online_release_blocks(NativeCodegen* runner, int64_t offset, int64_t blocks) {
+    if (!runner || blocks <= 0 || offset < 0) {
+        return;
+    }
+    runner->online_batch_free_blocks.push_back({offset, blocks});
+    std::sort(
+        runner->online_batch_free_blocks.begin(),
+        runner->online_batch_free_blocks.end(),
+        [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::vector<std::pair<int64_t, int64_t>> merged;
+    for (const auto& item : runner->online_batch_free_blocks) {
+        if (merged.empty() || merged.back().first + merged.back().second < item.first) {
+            merged.push_back(item);
+        } else {
+            const int64_t end = std::max(merged.back().first + merged.back().second, item.first + item.second);
+            merged.back().second = end - merged.back().first;
+        }
+    }
+    runner->online_batch_free_blocks.swap(merged);
+    while (!runner->online_batch_free_blocks.empty()) {
+        auto& last = runner->online_batch_free_blocks.back();
+        if (last.first + last.second != runner->online_batch_next_block_offset) {
+            break;
+        }
+        runner->online_batch_next_block_offset = last.first;
+        runner->online_batch_free_blocks.pop_back();
+    }
+}
+
+int64_t online_batch_add_sequence_impl(
+    NativeCodegen* runner,
+    const float* sequence,
+    int64_t prompt_len,
+    int64_t hidden_size,
+    const float* tts_pad_embed,
+    int64_t max_new_tokens,
+    int64_t min_new_tokens,
+    float repetition_penalty,
+    int64_t vocab_size,
+    int64_t num_code_groups,
+    int64_t eos_token_id,
+    const NativeSamplingConfig& sampling) {
+    if (!runner || !runner->online_batch_ready) {
+        throw std::runtime_error("online continuous batch session is not initialized");
+    }
+    if (!sequence || !tts_pad_embed || prompt_len <= 0 || hidden_size <= 0 || max_new_tokens <= 0 || num_code_groups <= 0) {
+        throw std::runtime_error("invalid online continuous batch sequence arguments");
+    }
+    if (runner->online_batch_hidden_size == 0) {
+        runner->online_batch_hidden_size = hidden_size;
+        runner->online_batch_vocab_size = vocab_size;
+        runner->online_batch_num_code_groups = num_code_groups;
+        runner->online_batch_eos_token_id = eos_token_id;
+        runner->online_batch_tts_pad_embed.assign(
+            tts_pad_embed,
+            tts_pad_embed + static_cast<size_t>(hidden_size));
+    } else if (
+        runner->online_batch_hidden_size != hidden_size ||
+        runner->online_batch_vocab_size != vocab_size ||
+        runner->online_batch_num_code_groups != num_code_groups ||
+        runner->online_batch_eos_token_id != eos_token_id) {
+        throw std::runtime_error("online continuous batch requests must share hidden/vocab/codegroup/eos shape");
+    }
+    const int64_t capacity_tokens = prompt_len + max_new_tokens + 1;
+    const int64_t blocks = std::max<int64_t>(
+        1,
+        (capacity_tokens + runner->paged_kv_block_size - 1) / runner->paged_kv_block_size);
+    const auto allocated_blocks = online_allocate_blocks(runner, blocks);
+    OnlineBatchSequence item;
+    item.id = runner->online_batch_next_id++;
+    item.prompt_len = prompt_len;
+    item.hidden_size = hidden_size;
+    item.max_new_tokens = max_new_tokens;
+    item.min_new_tokens = min_new_tokens;
+    item.vocab_size = vocab_size;
+    item.num_code_groups = num_code_groups;
+    item.eos_token_id = eos_token_id;
+    item.repetition_penalty = repetition_penalty;
+    item.do_sample = sampling.do_sample;
+    item.top_k = sampling.top_k;
+    item.top_p = sampling.top_p;
+    item.temperature = sampling.temperature;
+    item.seed = sampling.seed;
+    item.rng.seed(sampling.seed == 0 ? static_cast<uint64_t>(item.id) : sampling.seed);
+    if (std::abs(repetition_penalty - 1.0f) > 1e-6f) {
+        item.repeated_first_codes.assign(static_cast<size_t>(std::max<int64_t>(1, vocab_size)), 0);
+    }
+    item.block_offset = allocated_blocks.first;
+    item.block_capacity = allocated_blocks.second;
+    item.next_embed.assign(static_cast<size_t>(hidden_size), 0.0f);
+    item.prompt.assign(sequence, sequence + static_cast<size_t>(prompt_len * hidden_size));
+    item.queued_at_ms = 0.0;
+    const int64_t id = item.id;
+    runner->online_batch_sequences.emplace(id, std::move(item));
+    runner->online_batch_pending_ids.push_back(id);
+    runner->online_batch_total_requests += 1;
+    return id;
+}
+
+struct OnlineBatchEvent {
+    int64_t id = 0;
+    int64_t kind = 0;  // 1=code, 2=final, 3=code+final
+    std::vector<int64_t> codes;
+};
+
+std::vector<int64_t> online_select_first_codes(
+    NativeCodegen* runner,
+    const ov::Tensor& first_output_tensor,
+    const std::vector<int64_t>& ids,
+    const std::vector<int64_t>& row_offsets) {
+    std::vector<int64_t> selected(ids.size(), runner->online_batch_eos_token_id);
+    int64_t max_row = static_cast<int64_t>(ids.size()) - 1;
+    if (!row_offsets.empty()) {
+        if (row_offsets.size() != ids.size()) {
+            throw std::runtime_error("online continuous batch row_offsets size mismatch");
+        }
+        for (const int64_t row : row_offsets) {
+            max_row = std::max<int64_t>(max_row, row);
+        }
+    }
+    if (runner->paged_seed_outputs_first_code) {
+        for (const int64_t id : ids) {
+            const auto it = runner->online_batch_sequences.find(id);
+            if (it == runner->online_batch_sequences.end()) {
+                continue;
+            }
+            if (it->second.do_sample || std::abs(it->second.repetition_penalty - 1.0f) > 1e-6f) {
+                throw std::runtime_error(
+                    "online continuous batching sampled/repetition mode requires logits seed graph; "
+                    "disable top1 seed or use greedy repetition_penalty=1.0");
+            }
+        }
+        const auto first_code_view = tensor_to_host_view<int64_t>(runner, first_output_tensor, "online first_code");
+        if (!first_code_view.data || first_code_view.size <= static_cast<size_t>(max_row)) {
+            throw std::runtime_error("online continuous batch first_code output is too small");
+        }
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const int64_t row = row_offsets.empty() ? static_cast<int64_t>(i) : row_offsets[i];
+            selected[i] = first_code_view.data[static_cast<size_t>(row)];
+        }
+        return selected;
+    }
+    const auto logits = tensor_to_host_f32_view(runner, first_output_tensor, "online logits");
+    int64_t effective_vocab_size = runner->online_batch_vocab_size;
+    const auto shape = first_output_tensor.get_shape();
+    if (!shape.empty() && shape.back() > 0) {
+        effective_vocab_size = static_cast<int64_t>(shape.back());
+    }
+    if (
+        !logits.data ||
+        effective_vocab_size <= 0 ||
+        logits.size < static_cast<size_t>(max_row + 1) * static_cast<size_t>(effective_vocab_size)) {
+        throw std::runtime_error("online continuous batch logits output is invalid");
+    }
+    for (size_t i = 0; i < ids.size(); ++i) {
+        const auto it = runner->online_batch_sequences.find(ids[i]);
+        if (it == runner->online_batch_sequences.end()) {
+            throw std::runtime_error("online continuous batch sequence disappeared during selection");
+        }
+        const int64_t row = row_offsets.empty() ? static_cast<int64_t>(i) : row_offsets[i];
+        NativeSamplingConfig sampling;
+        sampling.do_sample = it->second.do_sample;
+        sampling.top_k = it->second.top_k;
+        sampling.top_p = it->second.top_p;
+        sampling.temperature = it->second.temperature;
+        sampling.seed = it->second.seed;
+        selected[i] = select_first_code_from_logits_row(
+            logits.data + static_cast<size_t>(row) * static_cast<size_t>(effective_vocab_size),
+            effective_vocab_size,
+            it->second.generated,
+            it->second.min_new_tokens,
+            it->second.eos_token_id,
+            it->second.repeated_first_codes.empty() ? nullptr : &it->second.repeated_first_codes,
+            it->second.repetition_penalty,
+            &sampling,
+            &it->second.rng);
+    }
+    return selected;
+}
+
+void online_record_event(
+    NativeCodegen* runner,
+    OnlineBatchSequence& state,
+    int64_t first_code,
+    const int64_t* frame_codes,
+    std::vector<OnlineBatchEvent>& events) {
+    OnlineBatchEvent event;
+    event.id = state.id;
+    event.kind = 1;
+    event.codes.assign(frame_codes, frame_codes + static_cast<size_t>(state.num_code_groups));
+    state.generated += 1;
+    if (
+        first_code >= 0 &&
+        first_code != state.eos_token_id &&
+        !state.repeated_first_codes.empty() &&
+        static_cast<size_t>(first_code) < state.repeated_first_codes.size()) {
+        state.repeated_first_codes[static_cast<size_t>(first_code)] = 1;
+    }
+    state.last_token_ms = 0.0;
+    runner->last_timing.generated_frames += 1;
+    if (state.generated >= state.max_new_tokens) {
+        state.stop = true;
+        event.kind = 3;
+        runner->online_batch_finished_requests += 1;
+    }
+    events.push_back(std::move(event));
+}
+
+void online_record_final(NativeCodegen* runner, OnlineBatchSequence& state, std::vector<OnlineBatchEvent>& events) {
+    if (!state.stop) {
+        state.stop = true;
+        runner->online_batch_finished_requests += 1;
+    }
+    OnlineBatchEvent event;
+    event.id = state.id;
+    event.kind = 2;
+    events.push_back(std::move(event));
+}
+
+void online_batch_step_impl(
+    NativeCodegen* runner,
+    int64_t max_decode_batch,
+    int64_t max_events,
+    int64_t* out_ids,
+    int64_t* out_kinds,
+    int64_t* out_codes,
+    int64_t* out_event_count,
+    double* elapsed_ms) {
+    if (!runner || !runner->online_batch_ready) {
+        throw std::runtime_error("online continuous batch session is not initialized");
+    }
+    if (!out_ids || !out_kinds || !out_codes || !out_event_count || max_events <= 0) {
+        throw std::runtime_error("invalid online continuous batch output buffers");
+    }
+    if (max_decode_batch <= 0) {
+        max_decode_batch = 1;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    const std::string configured_policy = runner->continuous_batch_policy;
+    runner->last_timing = NativeCodegen::RunTiming{};
+    runner->last_timing.no_repeat_fast_path = true;
+    runner->continuous_batch_policy =
+        configured_policy.rfind("online_", 0) == 0 ? configured_policy : "online_" + configured_policy;
+    const bool layered_scheduler =
+        runner->online_scheduler == "layered" ||
+        configured_policy == "layered_vllm" ||
+        configured_policy == "online_layered_vllm";
+    if (layered_scheduler) {
+        runner->online_scheduler = "layered";
+    }
+    runner->last_timing.online_scheduler = runner->online_scheduler;
+    runner->last_timing.prefill_mode = runner->prefill_mode;
+    runner->last_timing.max_num_batched_tokens = runner->max_num_batched_tokens;
+    std::vector<OnlineBatchEvent> events;
+    events.reserve(static_cast<size_t>(max_events));
+    std::vector<int64_t> ids;
+    std::vector<int64_t> seq_lens;
+    std::vector<int64_t> position_starts;
+    std::vector<int64_t> past_lens;
+    std::vector<int64_t> block_offsets;
+    std::vector<int64_t> block_counts;
+    std::vector<float> allow_eos;
+    std::vector<int64_t> position_ids;
+    std::vector<int32_t> past_lens_buffer;
+    std::vector<int32_t> subsequence_begins;
+    std::vector<int32_t> block_indices;
+    std::vector<int32_t> block_indices_begins;
+    std::vector<float> allow_eos_buffer;
+    std::vector<int64_t> beam_idx_buffer;
+    std::vector<int32_t> score_aggregation_window_buffer;
+    std::vector<int64_t> frame_codes;
+    std::vector<float> next_embeds;
+
+    const int64_t hidden_size = runner->online_batch_hidden_size;
+    const int64_t num_code_groups = runner->online_batch_num_code_groups;
+    const float* tts_pad_embed = runner->online_batch_tts_pad_embed.data();
+    auto sequence_requires_logits_sampling = [](const OnlineBatchSequence& state) {
+        return state.do_sample || std::abs(state.repetition_penalty - 1.0f) > 1e-6f;
+    };
+    std::string prefill_mode = runner->prefill_mode;
+    if (prefill_mode.empty()) {
+        prefill_mode = env_enabled("QWEN3_TTS_OV_NATIVE_BATCH_PREFILL", false) ? "dynamic_ragged" : "serial";
+    }
+    if (prefill_mode == "dynamic") {
+        prefill_mode = "dynamic_ragged";
+    }
+    if (prefill_mode == "bucketed_padded") {
+        throw std::runtime_error(
+            "online continuous batching prefill_mode=bucketed_padded requires exported fixed BxS prefill graphs; "
+            "the current native online runner only supports serial and dynamic_ragged prefill");
+    }
+    const bool online_batch_prefill_enabled = prefill_mode == "dynamic_ragged";
+    runner->last_timing.prefill_mode = prefill_mode;
+    auto ready_decode_count = [&]() {
+        int64_t count = 0;
+        for (const auto& item : runner->online_batch_sequences) {
+            const auto& state = item.second;
+            if (!state.stop && !state.pending_prefill && state.generated > 0 && state.generated < state.max_new_tokens) {
+                ++count;
+            }
+        }
+        return count;
+    };
+    for (const auto& item : runner->online_batch_sequences) {
+        if (sequence_requires_logits_sampling(item.second)) {
+            runner->last_timing.no_repeat_fast_path = false;
+            break;
+        }
+    }
+    auto erase_finished = [&]() {
+        std::vector<int64_t> erase_ids;
+        for (const auto& item : runner->online_batch_sequences) {
+            if (item.second.stop) {
+                erase_ids.push_back(item.first);
+            }
+        }
+        for (const int64_t id : erase_ids) {
+            auto it = runner->online_batch_sequences.find(id);
+            if (it != runner->online_batch_sequences.end()) {
+                online_release_blocks(runner, it->second.block_offset, it->second.block_capacity);
+                runner->online_batch_sequences.erase(it);
+            }
+        }
+    };
+
+    if (hidden_size > 0 && !runner->online_batch_pending_ids.empty() && events.size() < static_cast<size_t>(max_events)) {
+        const int64_t decode_ready = ready_decode_count();
+        const int64_t decode_token_budget =
+            layered_scheduler ? std::min<int64_t>(max_decode_batch, runner->max_num_batched_tokens) : max_decode_batch;
+        int64_t requested_prefill_limit = online_batch_prefill_enabled ? max_decode_batch : 1;
+        if (layered_scheduler) {
+            const int64_t remaining_token_budget =
+                std::max<int64_t>(0, runner->max_num_batched_tokens - std::min<int64_t>(decode_ready, decode_token_budget));
+            requested_prefill_limit = std::min<int64_t>(
+                requested_prefill_limit,
+                bucket_limit_le(runner->prefill_batch_buckets, remaining_token_budget));
+            runner->last_timing.prefill_token_budget = remaining_token_budget;
+            runner->last_timing.decode_token_budget = decode_token_budget;
+        }
+        const int64_t limit = std::min<int64_t>(
+            requested_prefill_limit,
+            std::min<int64_t>(runner->online_batch_pending_ids.size(), max_events - static_cast<int64_t>(events.size())));
+        ids.clear();
+        ids.reserve(static_cast<size_t>(limit));
+        if (layered_scheduler && limit > 0) {
+            int64_t anchor_bucket = 0;
+            std::deque<int64_t> kept;
+            while (!runner->online_batch_pending_ids.empty()) {
+                const int64_t id = runner->online_batch_pending_ids.front();
+                runner->online_batch_pending_ids.pop_front();
+                auto it = runner->online_batch_sequences.find(id);
+                if (it == runner->online_batch_sequences.end()) {
+                    continue;
+                }
+                const int64_t seq_bucket = bucket_ge(runner->prefill_seq_buckets, it->second.prompt_len);
+                if (anchor_bucket == 0) {
+                    anchor_bucket = seq_bucket;
+                }
+                if (seq_bucket == anchor_bucket && static_cast<int64_t>(ids.size()) < limit) {
+                    ids.push_back(id);
+                } else {
+                    kept.push_back(id);
+                }
+            }
+            runner->online_batch_pending_ids.swap(kept);
+            runner->last_timing.prefill_seq_bucket = anchor_bucket;
+            runner->last_timing.prefill_batch_bucket = bucket_ge(
+                runner->prefill_batch_buckets,
+                static_cast<int64_t>(ids.size()));
+            runner->last_timing.prefill_seq_bucket_histogram.push_back(anchor_bucket);
+            runner->last_timing.prefill_batch_bucket_histogram.push_back(runner->last_timing.prefill_batch_bucket);
+        } else {
+            for (int64_t i = 0; i < limit; ++i) {
+                const int64_t id = runner->online_batch_pending_ids.front();
+                runner->online_batch_pending_ids.pop_front();
+                if (runner->online_batch_sequences.count(id)) {
+                    ids.push_back(id);
+                }
+            }
+            runner->last_timing.prefill_batch_bucket = static_cast<int64_t>(ids.size());
+        }
+        if (!ids.empty()) {
+            runner->last_timing.batch_prefill_enabled = ids.size() > 1;
+            std::vector<float> flat_prompt;
+            std::vector<int64_t> row_offsets(ids.size(), 0);
+            int64_t token_offset = 0;
+            seq_lens.resize(ids.size());
+            position_starts.assign(ids.size(), 0);
+            past_lens.assign(ids.size(), 0);
+            block_offsets.resize(ids.size());
+            block_counts.resize(ids.size());
+            allow_eos.resize(ids.size());
+            for (size_t row = 0; row < ids.size(); ++row) {
+                auto& state = runner->online_batch_sequences.at(ids[row]);
+                seq_lens[row] = state.prompt_len;
+                block_offsets[row] = state.block_offset;
+                block_counts[row] = std::max<int64_t>(
+                    1,
+                    (state.prompt_len + runner->paged_kv_block_size - 1) / runner->paged_kv_block_size);
+                allow_eos[row] = state.min_new_tokens <= 0 ? 1.0f : 0.0f;
+                row_offsets[row] = token_offset + state.prompt_len - 1;
+                token_offset += state.prompt_len;
+                flat_prompt.insert(flat_prompt.end(), state.prompt.begin(), state.prompt.end());
+            }
+            double bind_ms = 0.0;
+            measure_ms(bind_ms, [&]() {
+                bind_paged_batch_step_inputs(
+                    runner->prefill_request,
+                    flat_prompt.data(),
+                    seq_lens,
+                    hidden_size,
+                    position_starts,
+                    past_lens,
+                    runner->paged_kv_block_size,
+                    tts_pad_embed,
+                    allow_eos,
+                    block_offsets,
+                    block_counts,
+                    position_ids,
+                    past_lens_buffer,
+                    subsequence_begins,
+                    block_indices,
+                    block_indices_begins,
+                    allow_eos_buffer,
+                    beam_idx_buffer,
+                    score_aggregation_window_buffer);
+            });
+            runner->last_timing.tensor_bind_ms += bind_ms;
+            runner->last_timing.codegen_bind_step_ms.push_back(bind_ms);
+            double prefill_ms = 0.0;
+            measure_ms(prefill_ms, [&]() {
+                runner->prefill_request.infer();
+            });
+            runner->last_timing.codegen_infer_ms += prefill_ms;
+            runner->last_timing.codegen_prefill_infer_ms += prefill_ms;
+            runner->last_timing.codegen_prefill_count += 1;
+            runner->last_timing.codegen_prefill_step_ms.push_back(prefill_ms);
+            record_request_profile(runner, "online_paged_kv_prefill_batch", runner->prefill_request);
+            auto first_output_tensor = runner->prefill_request.get_output_tensor(0);
+            auto last_hidden_tensor = runner->prefill_request.get_output_tensor(1);
+            double select_ms = 0.0;
+            std::vector<int64_t> first_codes;
+            measure_ms(select_ms, [&]() {
+                first_codes = online_select_first_codes(runner, first_output_tensor, ids, row_offsets);
+            });
+            runner->last_timing.sampling_ms += select_ms;
+            runner->last_timing.codegen_sampling_step_ms.push_back(select_ms);
+            const auto hidden_view = tensor_to_host_f32_view(runner, last_hidden_tensor, "online prefill last_hidden");
+            if (!hidden_view.data || hidden_view.size < static_cast<size_t>(token_offset * hidden_size)) {
+                throw std::runtime_error("online continuous batch prefill hidden output is invalid");
+            }
+            for (size_t row = 0; row < ids.size(); ++row) {
+                auto& state = runner->online_batch_sequences.at(ids[row]);
+                const int64_t first_code = first_codes[row];
+                if (first_code == state.eos_token_id && state.generated >= state.min_new_tokens) {
+                    online_record_final(runner, state, events);
+                    continue;
+                }
+                const int64_t hidden_row = row_offsets[row];
+                ov::Tensor row_hidden_tensor(
+                    ov::element::f32,
+                    ov::Shape{1, 1, static_cast<size_t>(hidden_size)},
+                    const_cast<float*>(hidden_view.data + static_cast<size_t>(hidden_row * hidden_size)));
+                std::vector<int64_t> row_first_code{first_code};
+                std::vector<int64_t> row_codes;
+                std::vector<float> row_next_embed;
+                run_paged_split_subcode_batch(
+                    runner,
+                    row_hidden_tensor,
+                    row_first_code,
+                    tts_pad_embed,
+                    hidden_size,
+                    num_code_groups,
+                    row_codes,
+                    row_next_embed);
+                if (row_codes.size() < static_cast<size_t>(num_code_groups) ||
+                    row_next_embed.size() < static_cast<size_t>(hidden_size)) {
+                    throw std::runtime_error("online continuous batch prefill subcode output is too small");
+                }
+                std::memcpy(state.next_embed.data(), row_next_embed.data(), static_cast<size_t>(hidden_size) * sizeof(float));
+                state.pending_prefill = false;
+                online_record_event(runner, state, first_code, row_codes.data(), events);
+            }
+        }
+    }
+
+    if (hidden_size > 0 && events.size() < static_cast<size_t>(max_events)) {
+        ids.clear();
+        const int64_t raw_decode_limit = std::min<int64_t>(
+            max_decode_batch,
+            max_events - static_cast<int64_t>(events.size()));
+        const int64_t decode_limit = layered_scheduler
+            ? std::min<int64_t>(raw_decode_limit, bucket_limit_le(runner->decode_batch_buckets, runner->max_num_batched_tokens))
+            : raw_decode_limit;
+        for (const auto& item : runner->online_batch_sequences) {
+            const auto& state = item.second;
+            if (!state.stop && !state.pending_prefill && state.generated > 0 && state.generated < state.max_new_tokens) {
+                ids.push_back(item.first);
+                if (static_cast<int64_t>(ids.size()) >= decode_limit) {
+                    break;
+                }
+            }
+        }
+        const size_t active = ids.size();
+        if (active > 0) {
+            if (runner->last_timing.active_batch_histogram.size() <= active) {
+                runner->last_timing.active_batch_histogram.resize(active + 1, 0);
+            }
+            runner->last_timing.active_batch_histogram[active] += 1;
+            runner->last_timing.decode_token_budget = decode_limit;
+            runner->last_timing.decode_batch_bucket = layered_scheduler
+                ? bucket_ge(runner->decode_batch_buckets, static_cast<int64_t>(active))
+                : static_cast<int64_t>(active);
+            runner->last_timing.decode_batch_bucket_histogram.push_back(runner->last_timing.decode_batch_bucket);
+            runner->last_timing.batch_buffer_reuse = true;
+            std::vector<float> decode_embeds(active * static_cast<size_t>(hidden_size));
+            seq_lens.assign(active, 1);
+            position_starts.assign(active, 0);
+            past_lens.assign(active, 0);
+            block_offsets.assign(active, 0);
+            block_counts.assign(active, 1);
+            allow_eos.assign(active, 0.0f);
+            for (size_t row = 0; row < active; ++row) {
+                const auto& state = runner->online_batch_sequences.at(ids[row]);
+                std::memcpy(
+                    decode_embeds.data() + row * static_cast<size_t>(hidden_size),
+                    state.next_embed.data(),
+                    static_cast<size_t>(hidden_size) * sizeof(float));
+                const int64_t position = state.prompt_len + state.generated - 1;
+                position_starts[row] = position;
+                past_lens[row] = position;
+                block_offsets[row] = state.block_offset;
+                block_counts[row] = std::max<int64_t>(
+                    1,
+                    (position + 1 + runner->paged_kv_block_size - 1) / runner->paged_kv_block_size);
+                allow_eos[row] = state.generated >= state.min_new_tokens ? 1.0f : 0.0f;
+            }
+            bool active_batch_requires_logits = false;
+            for (const int64_t id : ids) {
+                const auto& state = runner->online_batch_sequences.at(id);
+                if (sequence_requires_logits_sampling(state)) {
+                    active_batch_requires_logits = true;
+                    break;
+                }
+            }
+            const bool use_fused_batch_decode =
+                runner->paged_fused_batch_decode_enabled && active > 1 && !active_batch_requires_logits;
+            if (use_fused_batch_decode) {
+                runner->last_timing.batch_fused_decode_step_count += 1;
+                runner->last_timing.batch_fused_decode_token_count += static_cast<int64_t>(active);
+            } else {
+                runner->last_timing.batch_single_decode_step_count += 1;
+                runner->last_timing.batch_single_decode_token_count += static_cast<int64_t>(active);
+                if (runner->paged_fused_batch_decode_enabled && active == 1) {
+                    runner->last_timing.batch_fused_decode_active1_bypass_count += 1;
+                }
+                if (runner->paged_fused_batch_decode_enabled && active > 1 && active_batch_requires_logits) {
+                    runner->last_timing.batch_fused_decode_logits_bypass_count += 1;
+                }
+            }
+            ov::InferRequest& decode_request =
+                use_fused_batch_decode ? runner->decode_request : runner->online_logits_decode_request;
+            double bind_ms = 0.0;
+            measure_ms(bind_ms, [&]() {
+                bind_paged_batch_step_inputs(
+                    decode_request,
+                    decode_embeds.data(),
+                    seq_lens,
+                    hidden_size,
+                    position_starts,
+                    past_lens,
+                    runner->paged_kv_block_size,
+                    tts_pad_embed,
+                    allow_eos,
+                    block_offsets,
+                    block_counts,
+                    position_ids,
+                    past_lens_buffer,
+                    subsequence_begins,
+                    block_indices,
+                    block_indices_begins,
+                    allow_eos_buffer,
+                    beam_idx_buffer,
+                    score_aggregation_window_buffer);
+            });
+            runner->last_timing.tensor_bind_ms += bind_ms;
+            runner->last_timing.codegen_bind_step_ms.push_back(bind_ms);
+            double decode_ms = 0.0;
+            measure_ms(decode_ms, [&]() {
+                decode_request.infer();
+            });
+            runner->last_timing.codegen_infer_ms += decode_ms;
+            runner->last_timing.codegen_decode_infer_ms += decode_ms;
+            runner->last_timing.codegen_decode_count += 1;
+            runner->last_timing.codegen_decode_step_ms.push_back(decode_ms);
+            record_request_profile(
+                runner,
+                use_fused_batch_decode ? "online_paged_kv_decode_batch_fused" : "online_paged_kv_decode_single",
+                decode_request);
+            if (use_fused_batch_decode) {
+                auto first_tensor = decode_request.get_output_tensor(0);
+                auto codes_tensor = decode_request.get_output_tensor(1);
+                auto embed_tensor = decode_request.get_output_tensor(2);
+                const auto first_view = tensor_to_host_view<int64_t>(runner, first_tensor, "online fused first_code");
+                const auto codes_view = tensor_to_host_view<int64_t>(runner, codes_tensor, "online fused codes");
+                const auto embed_view = tensor_to_host_f32_view(runner, embed_tensor, "online fused next_embed");
+                if (!first_view.data || first_view.size < active ||
+                    !codes_view.data || codes_view.size < active * static_cast<size_t>(num_code_groups) ||
+                    !embed_view.data || embed_view.size < active * static_cast<size_t>(hidden_size)) {
+                    throw std::runtime_error("online fused batch output is too small");
+                }
+                for (size_t row = 0; row < active; ++row) {
+                    auto& state = runner->online_batch_sequences.at(ids[row]);
+                    if (first_view.data[row] == state.eos_token_id && state.generated >= state.min_new_tokens) {
+                        online_record_final(runner, state, events);
+                        continue;
+                    }
+                    std::memcpy(
+                        state.next_embed.data(),
+                        embed_view.data + row * static_cast<size_t>(hidden_size),
+                        static_cast<size_t>(hidden_size) * sizeof(float));
+                    online_record_event(
+                        runner,
+                        state,
+                        first_view.data[row],
+                        codes_view.data + row * static_cast<size_t>(num_code_groups),
+                        events);
+                }
+            } else {
+                auto first_tensor = decode_request.get_output_tensor(0);
+                auto hidden_tensor = decode_request.get_output_tensor(1);
+                double select_ms = 0.0;
+                std::vector<int64_t> first_codes;
+                measure_ms(select_ms, [&]() {
+                    first_codes = online_select_first_codes(runner, first_tensor, ids, {});
+                });
+                runner->last_timing.sampling_ms += select_ms;
+                runner->last_timing.codegen_sampling_step_ms.push_back(select_ms);
+                if (active_batch_requires_logits && active > 1) {
+                    run_online_sampled_subcode(
+                        runner,
+                        hidden_tensor,
+                        first_codes,
+                        tts_pad_embed,
+                        hidden_size,
+                        num_code_groups,
+                        frame_codes,
+                        next_embeds);
+                } else {
+                    run_paged_split_subcode_batch(
+                        runner,
+                        hidden_tensor,
+                        first_codes,
+                        tts_pad_embed,
+                        hidden_size,
+                        num_code_groups,
+                        frame_codes,
+                        next_embeds);
+                }
+                for (size_t row = 0; row < active; ++row) {
+                    auto& state = runner->online_batch_sequences.at(ids[row]);
+                    if (first_codes[row] == state.eos_token_id && state.generated >= state.min_new_tokens) {
+                        online_record_final(runner, state, events);
+                        continue;
+                    }
+                    std::memcpy(
+                        state.next_embed.data(),
+                        next_embeds.data() + row * static_cast<size_t>(hidden_size),
+                        static_cast<size_t>(hidden_size) * sizeof(float));
+                    online_record_event(
+                        runner,
+                        state,
+                        first_codes[row],
+                        frame_codes.data() + row * static_cast<size_t>(num_code_groups),
+                        events);
+                }
+            }
+        }
+    }
+
+    erase_finished();
+    const int64_t emit_count = std::min<int64_t>(events.size(), max_events);
+    for (int64_t i = 0; i < emit_count; ++i) {
+        out_ids[i] = events[static_cast<size_t>(i)].id;
+        out_kinds[i] = events[static_cast<size_t>(i)].kind;
+        int64_t* dst = out_codes + static_cast<size_t>(i * num_code_groups);
+        std::fill(dst, dst + num_code_groups, -1);
+        if (!events[static_cast<size_t>(i)].codes.empty()) {
+            std::memcpy(dst, events[static_cast<size_t>(i)].codes.data(), static_cast<size_t>(num_code_groups) * sizeof(int64_t));
+        }
+    }
+    *out_event_count = emit_count;
+    runner->last_timing.total_ms = elapsed_ms_since(started);
+    if (elapsed_ms) {
+        *elapsed_ms = runner->last_timing.total_ms;
+    }
+}
+
+void online_batch_cancel_impl(NativeCodegen* runner, int64_t request_id) {
+    if (!runner || !runner->online_batch_ready) {
+        return;
+    }
+    auto it = runner->online_batch_sequences.find(request_id);
+    if (it != runner->online_batch_sequences.end()) {
+        online_release_blocks(runner, it->second.block_offset, it->second.block_capacity);
+        runner->online_batch_sequences.erase(it);
+    }
+    std::deque<int64_t> kept;
+    while (!runner->online_batch_pending_ids.empty()) {
+        const int64_t id = runner->online_batch_pending_ids.front();
+        runner->online_batch_pending_ids.pop_front();
+        if (id != request_id) {
+            kept.push_back(id);
+        }
+    }
+    runner->online_batch_pending_ids.swap(kept);
+}
+
+std::string online_batch_stats_json(const NativeCodegen& runner) {
+    int64_t active = 0;
+    int64_t pending = 0;
+    int64_t active_blocks = 0;
+    int64_t free_blocks = 0;
+    for (const auto& item : runner.online_batch_sequences) {
+        if (item.second.pending_prefill) {
+            ++pending;
+        } else if (!item.second.stop) {
+            ++active;
+        }
+        if (!item.second.stop) {
+            active_blocks += item.second.block_capacity;
+        }
+    }
+    for (const auto& item : runner.online_batch_free_blocks) {
+        free_blocks += item.second;
+    }
+    std::string json = "{";
+    json += "\"ready\": ";
+    json += runner.online_batch_ready ? "true" : "false";
+    json += ", \"active\": " + std::to_string(active);
+    json += ", \"pending\": " + std::to_string(pending);
+    json += ", \"total_requests\": " + std::to_string(runner.online_batch_total_requests);
+    json += ", \"finished_requests\": " + std::to_string(runner.online_batch_finished_requests);
+    json += ", \"cache_block_capacity\": " + std::to_string(runner.online_batch_cache_block_capacity);
+    json += ", \"cache_blocks_used\": " + std::to_string(runner.online_batch_next_block_offset);
+    json += ", \"cache_blocks_active\": " + std::to_string(active_blocks);
+    json += ", \"cache_blocks_free\": " + std::to_string(free_blocks);
+    json += ", \"batch_subcode_compiled\": ";
+    json += runner.batch_subcode_enabled ? "true" : "false";
+    json += ", \"paged_fused_batch_decode_enabled\": ";
+    json += runner.paged_fused_batch_decode_enabled ? "true" : "false";
+    json += ", \"continuous_batch_policy\": \"" + json_escape_native(runner.continuous_batch_policy) + "\"";
+    json += ", \"online_scheduler\": \"" + json_escape_native(runner.online_scheduler) + "\"";
+    json += ", \"prefill_mode\": \"" + json_escape_native(runner.prefill_mode) + "\"";
+    json += ", \"max_num_batched_tokens\": " + std::to_string(runner.max_num_batched_tokens);
+    json += ", \"last_prefill_seq_bucket\": " + std::to_string(runner.last_timing.prefill_seq_bucket);
+    json += ", \"last_prefill_batch_bucket\": " + std::to_string(runner.last_timing.prefill_batch_bucket);
+    json += ", \"last_decode_batch_bucket\": " + std::to_string(runner.last_timing.decode_batch_bucket);
+    json += ", \"last_prefill_token_budget\": " + std::to_string(runner.last_timing.prefill_token_budget);
+    json += ", \"last_decode_token_budget\": " + std::to_string(runner.last_timing.decode_token_budget);
+    json += ", \"last_batch_fused_decode_step_count\": " +
+            std::to_string(runner.last_timing.batch_fused_decode_step_count);
+    json += ", \"last_batch_fused_decode_token_count\": " +
+            std::to_string(runner.last_timing.batch_fused_decode_token_count);
+    json += ", \"last_batch_single_decode_step_count\": " +
+            std::to_string(runner.last_timing.batch_single_decode_step_count);
+    json += ", \"last_batch_single_decode_token_count\": " +
+            std::to_string(runner.last_timing.batch_single_decode_token_count);
+    json += ", \"last_batch_fused_decode_active1_bypass_count\": " +
+            std::to_string(runner.last_timing.batch_fused_decode_active1_bypass_count);
+    json += ", \"last_batch_fused_decode_logits_bypass_count\": " +
+            std::to_string(runner.last_timing.batch_fused_decode_logits_bypass_count);
+    json += ", \"last_batch_subcode_used\": ";
+    json += runner.last_timing.batch_subcode_enabled ? "true" : "false";
+    json += ", \"sampled_batch_subcode_policy\": \"" +
+            json_escape_native(runner.last_timing.sampled_batch_subcode_policy) + "\"";
+    json += ", \"sampled_batch_subcode_used\": ";
+    json += runner.last_timing.sampled_batch_subcode_used ? "true" : "false";
+    json += ", \"sampled_batch_subcode_verified\": ";
+    json += runner.last_timing.sampled_batch_subcode_verified ? "true" : "false";
+    json += ", \"sampled_batch_subcode_fallback_count\": " +
+            std::to_string(runner.last_timing.sampled_batch_subcode_fallback_count);
+    json += ", \"sampled_batch_subcode_mismatch_count\": " +
+            std::to_string(runner.last_timing.sampled_batch_subcode_mismatch_count);
+    json += ", \"sampled_batch_subcode_code_mismatch_count\": " +
+            std::to_string(runner.last_timing.sampled_batch_subcode_code_mismatch_count);
+    json += ", \"sampled_batch_subcode_embed_mismatch_count\": " +
+            std::to_string(runner.last_timing.sampled_batch_subcode_embed_mismatch_count);
+    json += ", \"sampled_batch_subcode_max_abs_diff\": " +
+            std::to_string(runner.last_timing.sampled_batch_subcode_max_abs_diff);
+    json += ", \"sampled_batch_subcode_fallback_reason\": \"" +
+            json_escape_native(runner.last_timing.sampled_batch_subcode_fallback_reason) + "\"";
+    json += ", \"sampled_subcode_parallel_rows\": ";
+    json += runner.last_timing.sampled_subcode_parallel_rows ? "true" : "false";
+    json += ", \"sampled_subcode_parallel_row_count\": " +
+            std::to_string(runner.last_timing.sampled_subcode_parallel_row_count);
+    json += ", \"last_no_repeat_fast_path\": ";
+    json += runner.last_timing.no_repeat_fast_path ? "true" : "false";
+    json += ", \"last_codegen_decode_count\": " + std::to_string(runner.last_timing.codegen_decode_count);
+    json += ", \"last_codegen_subcode_count\": " + std::to_string(runner.last_timing.codegen_subcode_count);
+    append_int_vector_json(json, "last_active_batch_histogram", runner.last_timing.active_batch_histogram);
+    append_int_vector_json(json, "last_prefill_seq_bucket_histogram", runner.last_timing.prefill_seq_bucket_histogram);
+    append_int_vector_json(json, "last_prefill_batch_bucket_histogram", runner.last_timing.prefill_batch_bucket_histogram);
+    append_int_vector_json(json, "last_decode_batch_bucket_histogram", runner.last_timing.decode_batch_bucket_histogram);
+    json += "}";
+    return json;
+}
+
+void run_paged_kv_repeat_batch_impl(
+    NativeCodegen* runner,
+    const float* sequence,
+    int64_t prompt_len,
+    int64_t hidden_size,
+    const float* tts_pad_embed,
+    int64_t batch_size,
+    int64_t max_new_tokens,
+    int64_t min_new_tokens,
+    float repetition_penalty,
+    int64_t vocab_size,
+    int64_t num_code_groups,
+    int64_t eos_token_id,
+    const NativeSamplingConfig& sampling,
+    int64_t* out_counts,
+    double* out_ttft_ms,
+    double* out_last_token_ms,
+    double* elapsed_ms) {
+    if (!sequence || prompt_len <= 0 || hidden_size <= 0 || batch_size <= 0) {
+        throw std::runtime_error("invalid native continuous repeat-batch shape argument");
+    }
+    std::vector<int64_t> prompt_lens(static_cast<size_t>(batch_size), prompt_len);
+    std::vector<float> repeated(static_cast<size_t>(batch_size * prompt_len * hidden_size));
+    for (int64_t seq = 0; seq < batch_size; ++seq) {
+        std::memcpy(
+            repeated.data() + static_cast<size_t>(seq * prompt_len * hidden_size),
+            sequence,
+            static_cast<size_t>(prompt_len * hidden_size) * sizeof(float));
+    }
+    run_paged_kv_sequence_batch_impl(
+        runner,
+        repeated.data(),
+        batch_size * prompt_len,
+        prompt_lens.data(),
+        hidden_size,
+        tts_pad_embed,
+        batch_size,
+        max_new_tokens,
+        min_new_tokens,
+        repetition_penalty,
+        vocab_size,
+        num_code_groups,
+        eos_token_id,
+        sampling,
+        out_counts,
+        out_ttft_ms,
+        out_last_token_ms,
+        elapsed_ms);
 }
 
 void run_unroll4_statefulmask_impl(
@@ -3020,6 +6143,20 @@ public:
         m_runner.paged_split_subcode = split_subcode;
         m_runner.subcode_outputs_next_embed =
             split_subcode && lower_text(std::filesystem::path(subcode_xml).filename().string()).find("next_embed") != std::string::npos;
+        const char* continuous_policy_env = std::getenv("QWEN3_TTS_OV_NATIVE_CONTINUOUS_BATCH_POLICY");
+        std::string compile_continuous_policy = normalize_continuous_batch_policy(
+            continuous_policy_env && std::strlen(continuous_policy_env) > 0 ? continuous_policy_env : "raw_fused");
+        if (!valid_continuous_batch_policy(compile_continuous_policy)) {
+            throw std::runtime_error(continuous_batch_policy_error());
+        }
+        m_runner.continuous_batch_policy = compile_continuous_policy;
+        const char* batch_unroll_env = std::getenv("QWEN3_TTS_OV_NATIVE_BATCH_DECODE_UNROLL");
+        if (batch_unroll_env && std::strlen(batch_unroll_env) > 0) {
+            std::string batch_unroll_text = lower_text(batch_unroll_env);
+            if (batch_unroll_text != "auto") {
+                m_runner.batch_decode_unroll_requested = std::max<int64_t>(1, std::stoll(batch_unroll_text));
+            }
+        }
         m_runner.bucket = 0;
         m_runner.unroll = parse_unroll_steps(paged_seed_xml);
         auto model = convert_paged_kv_seed_model(
@@ -3030,7 +6167,21 @@ public:
             kv_head_dim,
             parse_element_type(cache_input_precision));
         auto decode_model = model->clone();
-        const bool want_static_decode = env_enabled("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE", false);
+        const char* fused_batch_decode_env = std::getenv("QWEN3_TTS_OV_NATIVE_PAGED_KV_FUSED_BATCH_DECODE_XML");
+        if (fused_batch_decode_env && std::strlen(fused_batch_decode_env) > 0) {
+            decode_model = convert_paged_kv_seed_model(
+                m_runner.core,
+                fused_batch_decode_env,
+                kv_heads,
+                kv_block_size,
+                kv_head_dim,
+                parse_element_type(cache_input_precision));
+            m_runner.paged_fused_batch_decode_enabled = true;
+            m_runner.paged_fused_batch_decode_graph = fused_batch_decode_env;
+        }
+        const bool want_static_decode =
+            !m_runner.paged_fused_batch_decode_enabled &&
+            env_enabled("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_DECODE", false);
         const char* static_blocks_env = std::getenv("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_BLOCKS");
         int64_t static_blocks = 128;
         if (static_blocks_env && std::strlen(static_blocks_env) > 0) {
@@ -3070,13 +6221,15 @@ public:
         m_runner.paged_seed_outputs_first_code =
             split_subcode && compiled_model_first_output_is_first_code(m_runner.prefill_model);
         m_runner.prefill_request = m_runner.prefill_model.create_infer_request();
-        if (static_decode_ready) {
+        m_runner.online_logits_decode_request = m_runner.prefill_model.create_infer_request();
+        if (m_runner.paged_fused_batch_decode_enabled || static_decode_ready) {
             try {
                 m_runner.decode_model = m_runner.core.compile_model(decode_model, device, config);
                 m_runner.decode_request = m_runner.decode_model.create_infer_request();
-                m_runner.paged_static_decode_enabled = true;
+                m_runner.paged_static_decode_enabled = static_decode_ready;
                 m_runner.paged_static_decode_failure.clear();
             } catch (const std::exception& exc) {
+                m_runner.paged_fused_batch_decode_enabled = false;
                 m_runner.paged_static_decode_enabled = false;
                 m_runner.paged_static_decode_mode = "dynamic";
                 m_runner.paged_static_decode_failure = std::string("compile_failed: ") + exc.what();
@@ -3095,8 +6248,79 @@ public:
             const std::string subcode_device =
                 subcode_device_env && std::strlen(subcode_device_env) > 0 ? subcode_device_env : device;
             auto subcode_config = compile_config_for_device(cache_dir, cache_mode, subcode_device.c_str());
-            m_runner.subcode_model = m_runner.core.compile_model(subcode_xml, subcode_device, subcode_config);
+            auto single_subcode_model = m_runner.core.read_model(subcode_xml);
+            m_runner.subcode_model = m_runner.core.compile_model(single_subcode_model, subcode_device, subcode_config);
             m_runner.subcode_request = m_runner.subcode_model.create_infer_request();
+
+            const bool want_batch_subcode =
+                env_enabled("QWEN3_TTS_OV_NATIVE_CONTINUOUS_BATCH", false) &&
+                (
+                    env_enabled("QWEN3_TTS_OV_NATIVE_BATCH_PREFILL_SUBCODE", false) ||
+                    env_enabled("QWEN3_TTS_OV_NATIVE_CONTINUOUS_BATCH_SUBCODE", false) ||
+                    sampled_batch_subcode_policy_from_env() != "off");
+            if (want_batch_subcode) {
+                const char* batch_subcode_xml_env = std::getenv("QWEN3_TTS_OV_NATIVE_BATCH_SUBCODE_XML");
+                const bool has_batch_subcode_xml =
+                    batch_subcode_xml_env && std::strlen(batch_subcode_xml_env) > 0;
+                if (has_batch_subcode_xml) {
+                    try {
+                        auto batch_subcode_model = m_runner.core.read_model(batch_subcode_xml_env);
+                        m_runner.batch_subcode_model =
+                            m_runner.core.compile_model(batch_subcode_model, subcode_device, subcode_config);
+                        m_runner.batch_subcode_request = m_runner.batch_subcode_model.create_infer_request();
+                        m_runner.batch_subcode_enabled = true;
+                    } catch (const std::exception& exc) {
+                        m_runner.batch_subcode_enabled = false;
+                        if (enabled_env("QWEN3_TTS_OV_NATIVE_DEBUG_GRAPH", false)) {
+                            std::cerr << "true batch subcode compile failed: " << exc.what() << std::endl;
+                        }
+                    }
+                } else if (env_enabled("QWEN3_TTS_OV_NATIVE_LEGACY_RESHAPE_BATCH_SUBCODE", false)) {
+                    try {
+                        auto subcode_model = m_runner.core.read_model(subcode_xml);
+                        int64_t subcode_hidden = 2048;
+                        for (const auto& input : subcode_model->inputs()) {
+                            std::string name;
+                            try {
+                                name = input.get_any_name();
+                            } catch (...) {
+                                continue;
+                            }
+                            if (name != "past_hidden") {
+                                continue;
+                            }
+                            const auto shape = input.get_partial_shape();
+                            if (!shape.rank().is_dynamic() && shape.rank().get_length() > 0) {
+                                const auto last = shape[shape.rank().get_length() - 1];
+                                if (last.is_static()) {
+                                    subcode_hidden = last.get_length();
+                                }
+                            }
+                        }
+                        std::map<std::string, ov::PartialShape> subcode_shapes;
+                        subcode_shapes["past_hidden"] = ov::PartialShape{ov::Dimension::dynamic(), 1, subcode_hidden};
+                        subcode_shapes["first_code"] = ov::PartialShape{ov::Dimension::dynamic(), 1};
+                        subcode_model->reshape(subcode_shapes);
+                        m_runner.batch_subcode_model =
+                            m_runner.core.compile_model(subcode_model, subcode_device, subcode_config);
+                        m_runner.batch_subcode_request = m_runner.batch_subcode_model.create_infer_request();
+                        m_runner.batch_subcode_enabled = true;
+                    } catch (const std::exception& exc) {
+                        m_runner.batch_subcode_enabled = false;
+                        if (enabled_env("QWEN3_TTS_OV_NATIVE_DEBUG_GRAPH", false)) {
+                            std::cerr << "legacy reshaped subcode dynamic batch compile failed: " << exc.what()
+                                      << std::endl;
+                        }
+                    }
+                } else {
+                    m_runner.batch_subcode_enabled = false;
+                    if (enabled_env("QWEN3_TTS_OV_NATIVE_DEBUG_GRAPH", false)) {
+                        std::cerr
+                            << "batch subcode disabled: QWEN3_TTS_OV_NATIVE_BATCH_SUBCODE_XML is not set"
+                            << std::endl;
+                    }
+                }
+            }
         }
     }
 
@@ -3228,7 +6452,6 @@ public:
             const float* codec_side = codec_embed.data() + static_cast<size_t>(i * hidden_size);
             append_sum_token(output, text_side, codec_side, hidden_size);
         }
-        output.resize(output.size() - static_cast<size_t>(hidden_size));
 
         const int64_t input_len = static_cast<int64_t>(input_ids.size());
         const int64_t text_body_start = 3;
@@ -3320,6 +6543,106 @@ public:
             elapsed_ms,
             callback,
             user_data);
+    }
+
+    void generate_repeat_batch(
+        const float* sequence,
+        int64_t prompt_len,
+        int64_t hidden_size,
+        const float* tts_pad_embed,
+        int64_t batch_size,
+        int64_t max_new_tokens,
+        int64_t min_new_tokens,
+        float repetition_penalty,
+        int64_t vocab_size,
+        int64_t num_code_groups,
+        int64_t eos_token_id,
+        int64_t do_sample,
+        int64_t top_k,
+        float top_p,
+        float temperature,
+        uint64_t seed,
+        int64_t* out_counts,
+        double* out_ttft_ms,
+        double* out_last_token_ms,
+        double* elapsed_ms) {
+        const auto config = make_generation_config(max_new_tokens, min_new_tokens, repetition_penalty, eos_token_id);
+        NativeSamplingConfig sampling;
+        sampling.do_sample = do_sample != 0;
+        sampling.top_k = top_k;
+        sampling.top_p = top_p;
+        sampling.temperature = temperature;
+        sampling.seed = seed;
+        run_paged_kv_repeat_batch_impl(
+            &m_runner,
+            sequence,
+            prompt_len,
+            hidden_size,
+            tts_pad_embed,
+            batch_size,
+            static_cast<int64_t>(config.max_new_tokens),
+            static_cast<int64_t>(config.min_new_tokens),
+            config.repetition_penalty,
+            vocab_size,
+            num_code_groups,
+            config.eos_token_id,
+            sampling,
+            out_counts,
+            out_ttft_ms,
+            out_last_token_ms,
+            elapsed_ms);
+    }
+
+    void generate_sequence_batch(
+        const float* sequences,
+        int64_t total_prompt_tokens,
+        const int64_t* prompt_lens,
+        int64_t hidden_size,
+        const float* tts_pad_embed,
+        int64_t batch_size,
+        int64_t max_new_tokens,
+        int64_t min_new_tokens,
+        float repetition_penalty,
+        int64_t vocab_size,
+        int64_t num_code_groups,
+        int64_t eos_token_id,
+        int64_t do_sample,
+        int64_t top_k,
+        float top_p,
+        float temperature,
+        uint64_t seed,
+        int64_t* out_counts,
+        double* out_ttft_ms,
+        double* out_last_token_ms,
+        double* elapsed_ms,
+        int64_t* out_codes = nullptr) {
+        const auto config = make_generation_config(max_new_tokens, min_new_tokens, repetition_penalty, eos_token_id);
+        NativeSamplingConfig sampling;
+        sampling.do_sample = do_sample != 0;
+        sampling.top_k = top_k;
+        sampling.top_p = top_p;
+        sampling.temperature = temperature;
+        sampling.seed = seed;
+        run_paged_kv_sequence_batch_impl(
+            &m_runner,
+            sequences,
+            total_prompt_tokens,
+            prompt_lens,
+            hidden_size,
+            tts_pad_embed,
+            batch_size,
+            static_cast<int64_t>(config.max_new_tokens),
+            static_cast<int64_t>(config.min_new_tokens),
+            config.repetition_penalty,
+            vocab_size,
+            num_code_groups,
+            config.eos_token_id,
+            sampling,
+            out_counts,
+            out_ttft_ms,
+            out_last_token_ms,
+            elapsed_ms,
+            out_codes);
     }
 
     void set_stream_decoders(
@@ -3536,6 +6859,7 @@ public:
         m_runner.scratch.next_embed.clear();
         if (static_cast<bool>(m_runner.prefill_model)) {
             m_runner.prefill_request = m_runner.prefill_model.create_infer_request();
+            m_runner.online_logits_decode_request = m_runner.prefill_model.create_infer_request();
         }
         if (static_cast<bool>(m_runner.decode_model)) {
             m_runner.decode_request = m_runner.decode_model.create_infer_request();
@@ -3693,6 +7017,281 @@ int qwen3_tts_codegen_run_unroll4_statefulmask(
             elapsed_ms,
             nullptr,
             nullptr);
+    });
+}
+
+int qwen3_tts_codegen_run_paged_kv_repeat_batch(
+    void* handle,
+    const float* sequence,
+    int64_t prompt_len,
+    int64_t hidden_size,
+    const float* tts_pad_embed,
+    int64_t batch_size,
+    int64_t max_new_tokens,
+    int64_t min_new_tokens,
+    float repetition_penalty,
+    int64_t vocab_size,
+    int64_t num_code_groups,
+    int64_t eos_token_id,
+    int64_t do_sample,
+    int64_t top_k,
+    float top_p,
+    float temperature,
+    uint64_t seed,
+    int64_t* out_counts,
+    double* out_ttft_ms,
+    double* out_last_token_ms,
+    double* elapsed_ms,
+    char** error) {
+    return guarded(error, [&]() {
+        if (!handle) {
+            throw std::runtime_error("native pipeline handle is required");
+        }
+        static_cast<Qwen3TTSGenAIPipeline*>(handle)->generate_repeat_batch(
+            sequence,
+            prompt_len,
+            hidden_size,
+            tts_pad_embed,
+            batch_size,
+            max_new_tokens,
+            min_new_tokens,
+            repetition_penalty,
+            vocab_size,
+            num_code_groups,
+            eos_token_id,
+            do_sample,
+            top_k,
+            top_p,
+            temperature,
+            seed,
+            out_counts,
+            out_ttft_ms,
+            out_last_token_ms,
+            elapsed_ms);
+    });
+}
+
+int qwen3_tts_codegen_run_paged_kv_sequence_batch(
+    void* handle,
+    const float* sequences,
+    int64_t total_prompt_tokens,
+    const int64_t* prompt_lens,
+    int64_t hidden_size,
+    const float* tts_pad_embed,
+    int64_t batch_size,
+    int64_t max_new_tokens,
+    int64_t min_new_tokens,
+    float repetition_penalty,
+    int64_t vocab_size,
+    int64_t num_code_groups,
+    int64_t eos_token_id,
+    int64_t do_sample,
+    int64_t top_k,
+    float top_p,
+    float temperature,
+    uint64_t seed,
+    int64_t* out_counts,
+    double* out_ttft_ms,
+    double* out_last_token_ms,
+    double* elapsed_ms,
+    char** error) {
+    return guarded(error, [&]() {
+        if (!handle) {
+            throw std::runtime_error("native pipeline handle is required");
+        }
+        static_cast<Qwen3TTSGenAIPipeline*>(handle)->generate_sequence_batch(
+            sequences,
+            total_prompt_tokens,
+            prompt_lens,
+            hidden_size,
+            tts_pad_embed,
+            batch_size,
+            max_new_tokens,
+            min_new_tokens,
+            repetition_penalty,
+            vocab_size,
+            num_code_groups,
+            eos_token_id,
+            do_sample,
+            top_k,
+            top_p,
+            temperature,
+            seed,
+            out_counts,
+            out_ttft_ms,
+            out_last_token_ms,
+            elapsed_ms);
+    });
+}
+
+int qwen3_tts_codegen_run_paged_kv_sequence_batch_codes(
+    void* handle,
+    const float* sequences,
+    int64_t total_prompt_tokens,
+    const int64_t* prompt_lens,
+    int64_t hidden_size,
+    const float* tts_pad_embed,
+    int64_t batch_size,
+    int64_t max_new_tokens,
+    int64_t min_new_tokens,
+    float repetition_penalty,
+    int64_t vocab_size,
+    int64_t num_code_groups,
+    int64_t eos_token_id,
+    int64_t do_sample,
+    int64_t top_k,
+    float top_p,
+    float temperature,
+    uint64_t seed,
+    int64_t* out_counts,
+    int64_t* out_codes,
+    double* out_ttft_ms,
+    double* out_last_token_ms,
+    double* elapsed_ms,
+    char** error) {
+    return guarded(error, [&]() {
+        if (!handle) {
+            throw std::runtime_error("native pipeline handle is required");
+        }
+        if (!out_codes) {
+            throw std::runtime_error("out_codes is required");
+        }
+        static_cast<Qwen3TTSGenAIPipeline*>(handle)->generate_sequence_batch(
+            sequences,
+            total_prompt_tokens,
+            prompt_lens,
+            hidden_size,
+            tts_pad_embed,
+            batch_size,
+            max_new_tokens,
+            min_new_tokens,
+            repetition_penalty,
+            vocab_size,
+            num_code_groups,
+            eos_token_id,
+            do_sample,
+            top_k,
+            top_p,
+            temperature,
+            seed,
+            out_counts,
+            out_ttft_ms,
+            out_last_token_ms,
+            elapsed_ms,
+            out_codes);
+    });
+}
+
+int qwen3_tts_codegen_online_batch_reset(
+    void* handle,
+    int64_t max_cache_blocks,
+    char** error) {
+    return guarded(error, [&]() {
+        if (!handle) {
+            throw std::runtime_error("native pipeline handle is required");
+        }
+        online_batch_reset_impl(&static_cast<Qwen3TTSGenAIPipeline*>(handle)->runner(), max_cache_blocks);
+    });
+}
+
+int qwen3_tts_codegen_online_batch_add_sequence(
+    void* handle,
+    const float* sequence,
+    int64_t prompt_len,
+    int64_t hidden_size,
+    const float* tts_pad_embed,
+    int64_t max_new_tokens,
+    int64_t min_new_tokens,
+    float repetition_penalty,
+    int64_t vocab_size,
+    int64_t num_code_groups,
+    int64_t eos_token_id,
+    int64_t do_sample,
+    int64_t top_k,
+    float top_p,
+    float temperature,
+    uint64_t seed,
+    int64_t* out_request_id,
+    char** error) {
+    return guarded(error, [&]() {
+        if (!handle || !out_request_id) {
+            throw std::runtime_error("native pipeline handle and out_request_id are required");
+        }
+        NativeSamplingConfig sampling;
+        sampling.do_sample = do_sample != 0;
+        sampling.top_k = top_k;
+        sampling.top_p = top_p;
+        sampling.temperature = temperature;
+        sampling.seed = seed;
+        *out_request_id = online_batch_add_sequence_impl(
+            &static_cast<Qwen3TTSGenAIPipeline*>(handle)->runner(),
+            sequence,
+            prompt_len,
+            hidden_size,
+            tts_pad_embed,
+            max_new_tokens,
+            min_new_tokens,
+            repetition_penalty,
+            vocab_size,
+            num_code_groups,
+            eos_token_id,
+            sampling);
+    });
+}
+
+int qwen3_tts_codegen_online_batch_step(
+    void* handle,
+    int64_t max_decode_batch,
+    int64_t max_events,
+    int64_t* out_request_ids,
+    int64_t* out_event_kinds,
+    int64_t* out_codes,
+    int64_t* out_event_count,
+    double* elapsed_ms,
+    char** error) {
+    return guarded(error, [&]() {
+        if (!handle) {
+            throw std::runtime_error("native pipeline handle is required");
+        }
+        online_batch_step_impl(
+            &static_cast<Qwen3TTSGenAIPipeline*>(handle)->runner(),
+            max_decode_batch,
+            max_events,
+            out_request_ids,
+            out_event_kinds,
+            out_codes,
+            out_event_count,
+            elapsed_ms);
+    });
+}
+
+int qwen3_tts_codegen_online_batch_cancel(
+    void* handle,
+    int64_t request_id,
+    char** error) {
+    return guarded(error, [&]() {
+        if (!handle) {
+            throw std::runtime_error("native pipeline handle is required");
+        }
+        online_batch_cancel_impl(&static_cast<Qwen3TTSGenAIPipeline*>(handle)->runner(), request_id);
+    });
+}
+
+int qwen3_tts_codegen_online_batch_get_stats_json(
+    void* handle,
+    char** out_json,
+    char** error) {
+    return guarded(error, [&]() {
+        if (!handle || !out_json) {
+            throw std::runtime_error("native pipeline handle and out_json are required");
+        }
+        auto json = online_batch_stats_json(static_cast<Qwen3TTSGenAIPipeline*>(handle)->runner());
+        char* buffer = static_cast<char*>(std::malloc(json.size() + 1));
+        if (!buffer) {
+            throw std::runtime_error("failed to allocate stats json buffer");
+        }
+        std::memcpy(buffer, json.c_str(), json.size() + 1);
+        *out_json = buffer;
     });
 }
 

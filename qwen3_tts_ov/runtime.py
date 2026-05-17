@@ -1,6 +1,7 @@
 import argparse
 from contextlib import contextmanager
 import gc
+import hashlib
 import json
 import os
 import queue
@@ -8,11 +9,12 @@ import shutil
 import sys
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 # os.environ.setdefault("OV_TELEMETRY_DISABLE", "1")
 # if "ZE_ENABLE_ALT_DRIVERS" not in os.environ:
@@ -27,6 +29,7 @@ import soundfile as sf
 
 from .audio import load_audio, speaker_mel_spectrogram
 from .cache import build_ov_cache_config, merge_compile_config_with_cache_mode, normalize_ov_cache_mode, resolve_ov_cache_dir
+from .default_policy import resolve_generation_defaults
 from .manifest import load_manifest, resolve_ir_dir
 from .profiles import (
     CODEGEN_SCHEDULE_CHOICES,
@@ -43,9 +46,20 @@ from .profiles import (
 
 
 PRETOKENIZE_REGEX = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
+SPEECH_TEXT_TOKEN_RE = re.compile(r"[A-Za-z0-9]+|[\u3400-\u9fff]|[^\s]")
 NEG_INF = -3.4028234663852886e38
 _CACHE_SPACE_WARNED: set[str] = set()
 DEFAULT_STREAM_CHUNK_STRATEGIES = {
+    "auto": {
+        "initial_chunk_frames": 8,
+        "chunk_frames": 24,
+        "left_context_frames": 25,
+    },
+    "short_compute": {
+        "initial_chunk_frames": 12,
+        "chunk_frames": 24,
+        "left_context_frames": 25,
+    },
     "realtime": {
         "initial_chunk_frames": 8,
         "chunk_frames": 12,
@@ -72,6 +86,60 @@ DEFAULT_STREAM_CHUNK_STRATEGIES = {
         "left_context_frames": 25,
     },
 }
+
+
+def speech_text_unit_count_for_defaults(text: str) -> int:
+    units = 0
+    for token in SPEECH_TEXT_TOKEN_RE.findall(str(text or "")):
+        if not token or token.isspace():
+            continue
+        if re.fullmatch(r"[A-Za-z0-9]+", token):
+            units += 2
+        elif re.fullmatch(r"[\u3400-\u9fff]", token):
+            units += 1
+        elif token in {",", ".", ":", ";", "，", "。", "：", "；", "、", "！", "？", "!", "?"}:
+            continue
+        else:
+            units += 1
+    return units
+
+
+def custom_voice_default_repetition_penalty(
+    text: str,
+    *,
+    do_sample: bool,
+    repetition_penalty: float,
+    explicit_repetition_penalty: bool,
+) -> float:
+    if explicit_repetition_penalty or not do_sample:
+        return float(repetition_penalty)
+    if speech_text_unit_count_for_defaults(text) > 24:
+        return max(float(repetition_penalty), 1.2)
+    return float(repetition_penalty)
+
+
+CUSTOM_VOICE_PRONUNCIATION_OVERRIDES = {
+    ("ono_anna", "japanese"): (
+        ("小野杏奈", "オノアンナ"),
+        ("小野 杏奈", "オノアンナ"),
+        ("おのあんな", "オノアンナ"),
+        ("おの あんな", "オノアンナ"),
+        ("オノ アンナ", "オノアンナ"),
+        ("オノ・アンナ", "オノアンナ"),
+    ),
+}
+
+
+def normalize_custom_voice_text(text: str, speaker: str | None, language: str | None) -> str:
+    speaker_key = str(speaker or "").strip().lower()
+    language_key = str(language or "").strip().lower()
+    if not speaker_key or language_key not in {"auto", "japanese", "ja", "jp"}:
+        return str(text)
+    normalized = str(text)
+    replacements = CUSTOM_VOICE_PRONUNCIATION_OVERRIDES.get((speaker_key, "japanese"), ())
+    for source, target in replacements:
+        normalized = normalized.replace(source, target)
+    return normalized
 
 
 def normalize_preferred_cache_bucket(value) -> int | None:
@@ -636,6 +704,7 @@ class OpenVINOQwen3TTS:
         self.model_dir = str(model_dir)
         self.ids = self.manifest["ids"]
         self.num_code_groups = int(self.manifest["num_code_groups"])
+        self.subcode_vocab_size = int(self.manifest.get("subcode_vocab_size") or 2048)
         self.sample_rate = int(self.manifest["sample_rate"])
         self.decode_upsample_rate = int(self.manifest["decode_upsample_rate"])
         self.input_sample_rate = int(self.manifest.get("input_sample_rate", self.sample_rate))
@@ -652,10 +721,40 @@ class OpenVINOQwen3TTS:
         self.streaming_decoder_graphs_by_context = self._load_streaming_decoder_graphs(stream_config, graphs)
         self.streaming_decoder_graphs = self.streaming_decoder_graphs_by_context.get(self.streaming_decoder_left_context, {})
         self.streaming_decoders = {}
-        self.streaming_decoder_requests = {}
+        self.streaming_decoder_request_pools = {}
+        self.streaming_decoder_request_pool_size = max(
+            1,
+            int(os.environ.get("QWEN3_TTS_OV_STREAM_DECODER_REQUEST_POOL_SIZE") or 1),
+        )
+        self.streaming_decoder_locks = {}
+        self.streaming_decoder_compile_lock = threading.Lock()
+        self._thread_local = threading.local()
         self.decoder_requests = {}
         self.last_stream_decode_info = {}
+        self.last_generation_default_metadata = {}
         self.stream_pipeline_decode = True
+        self.prompt_component_cache_enabled = os.environ.get("QWEN3_TTS_OV_PROMPT_COMPONENT_CACHE", "1").lower() not in {
+            "0",
+            "false",
+            "off",
+            "no",
+        }
+        self.prompt_component_cache_max_items = max(
+            0,
+            int(os.environ.get("QWEN3_TTS_OV_PROMPT_COMPONENT_CACHE_MAX_ITEMS") or 128),
+        )
+        self.prompt_component_cache: OrderedDict[tuple, np.ndarray] = OrderedDict()
+        self.prompt_component_cache_hits = 0
+        self.prompt_component_cache_misses = 0
+        self.prompt_component_cache_lock = threading.Lock()
+        self.voice_clone_prompt_cache_max_items = max(
+            0,
+            int(os.environ.get("QWEN3_TTS_OV_VOICE_CLONE_PROMPT_CACHE_MAX_ITEMS") or 16),
+        )
+        self.voice_clone_prompt_cache: OrderedDict[tuple, VoiceClonePromptItem] = OrderedDict()
+        self.voice_clone_prompt_cache_hits = 0
+        self.voice_clone_prompt_cache_misses = 0
+        self.voice_clone_prompt_cache_lock = threading.Lock()
         self.native_codegen_override = None if native_codegen is None else str(native_codegen).strip().lower()
         self.native_pipeline_override = None if native_pipeline is None else str(native_pipeline).strip().lower()
         self.native_paged_kv_override = None if native_paged_kv is None else str(native_paged_kv).strip().lower()
@@ -869,6 +968,14 @@ class OpenVINOQwen3TTS:
             self.talker_request = self.talker.create_infer_request()
         self.subcode_greedy = None
         self.subcode_request = None
+        self.subcode_sampled = None
+        self.subcode_sampled_request = None
+        self.subcode_sampled_graph_name = None
+        self.subtalker_sample_policy = os.environ.get("QWEN3_TTS_OV_SUBTALKER_SAMPLE", "auto").strip().lower()
+        if self.subtalker_sample_policy not in {"auto", "on", "off", "require"}:
+            raise ValueError("QWEN3_TTS_OV_SUBTALKER_SAMPLE must be one of auto, on, off, require")
+        self.subtalker_temperature = float(os.environ.get("QWEN3_TTS_OV_SUBTALKER_TEMPERATURE") or 0.9)
+        self.subtalker_sample_steps = max(0, int(os.environ.get("QWEN3_TTS_OV_SUBTALKER_SAMPLE_STEPS") or 0))
         if (
             compile_python_codegen_core
             and self.mode != "fused-no-cache"
@@ -979,10 +1086,10 @@ class OpenVINOQwen3TTS:
     def _load_cache_bucket_graphs(self, graphs, kernel: str, variant_graphs=None):
         bucket_graphs = self._load_bucket_graphs(graphs.get("talker_stateful_buckets", {}), kernel)
         bucket_graphs.update(self._load_bucket_graphs((variant_graphs or {}).get("talker_stateful_buckets", {}), kernel))
-        legacy_graph = graphs.get("talker_stateful")
-        legacy_len = int(self.manifest.get("max_cache_len", 0) or 0)
-        if legacy_graph and legacy_len:
-            bucket_graphs.setdefault(legacy_len, legacy_graph)
+        stateful_graph = graphs.get("talker_stateful")
+        stateful_len = int(self.manifest.get("max_cache_len", 0) or 0)
+        if stateful_graph and stateful_len:
+            bucket_graphs.setdefault(stateful_len, stateful_graph)
         return dict(sorted(bucket_graphs.items()))
 
     def _load_fused_cache_bucket_graphs(self, graphs, kernel: str, variant_graphs=None):
@@ -1032,27 +1139,38 @@ class OpenVINOQwen3TTS:
         return result
 
     def _load_streaming_decoder_graphs(self, stream_config: dict, graphs: dict) -> dict[int, dict[int, str]]:
+        result: dict[int, dict[int, str]] = {}
+
+        def add_graph(context: int, chunk: int, graph: str) -> None:
+            if graph:
+                result.setdefault(int(context), {}).setdefault(int(chunk), graph)
+
         contexts = stream_config.get("contexts")
         if contexts:
-            return {
-                int(context): {int(chunk): graph for chunk, graph in chunk_graphs.items() if graph}
-                for context, chunk_graphs in contexts.items()
-                if chunk_graphs
-            }
+            for context, chunk_graphs in contexts.items():
+                for chunk, graph in (chunk_graphs or {}).items():
+                    add_graph(int(context), int(chunk), graph)
+        else:
+            stream_graphs = stream_config.get("graphs") or graphs.get("streaming_decoder", {})
+            if stream_graphs:
+                if all(str(key).isdigit() and isinstance(value, dict) for key, value in stream_graphs.items()):
+                    for context, chunk_graphs in stream_graphs.items():
+                        for chunk, graph in (chunk_graphs or {}).items():
+                            add_graph(int(context), int(chunk), graph)
+                else:
+                    left_context = int(stream_config.get("left_context_frames", 25))
+                    for chunk, graph in stream_graphs.items():
+                        add_graph(left_context, int(chunk), graph)
 
-        stream_graphs = stream_config.get("graphs") or graphs.get("streaming_decoder", {})
-        if not stream_graphs:
-            return {}
-
-        if all(str(key).isdigit() and isinstance(value, dict) for key, value in stream_graphs.items()):
-            return {
-                int(context): {int(chunk): graph for chunk, graph in chunk_graphs.items() if graph}
-                for context, chunk_graphs in stream_graphs.items()
-                if chunk_graphs
-            }
-
-        left_context = int(stream_config.get("left_context_frames", 25))
-        return {left_context: {int(chunk): graph for chunk, graph in stream_graphs.items() if graph}}
+        # Some locally exported/repackaged IRs still carry an older manifest
+        # layout while the directory already contains context-specific stream
+        # decoder graphs. Discover them so fastest sidecar paths do not fail
+        # just because manifest metadata is stale.
+        for path in sorted(self.ir_dir.glob("speech_decoder_stream_c*_t*.xml")):
+            match = re.fullmatch(r"speech_decoder_stream_c(\d+)_t(\d+)\.xml", path.name)
+            if match:
+                add_graph(int(match.group(1)), int(match.group(2)), path.name)
+        return {context: dict(sorted(chunks.items())) for context, chunks in sorted(result.items()) if chunks}
 
     @staticmethod
     def _normalize_chunk_strategy_name(strategy: str | None) -> str:
@@ -1311,12 +1429,7 @@ class OpenVINOQwen3TTS:
         return bool(self.fused_cache_unroll_bucket_graphs_by_step.get(int(unroll_steps), {}))
 
     def select_codegen_unroll_for_step(self, generated_count: int) -> int:
-        if self.codegen_schedule == "ll-v2":
-            preferred = [4, 8, 6, 12] if generated_count < 8 else [12, 8, 6, 4]
-        elif self.codegen_schedule == "balanced-v2":
-            preferred = [8, 4, 6, 12] if generated_count < 8 else [12, 8, 6, 4]
-        else:
-            preferred = [self.codegen_unroll]
+        preferred = [self.codegen_unroll]
         for unroll_steps in preferred:
             if unroll_steps > 1 and self.codegen_unroll_available(unroll_steps):
                 return int(unroll_steps)
@@ -1559,6 +1672,7 @@ class OpenVINOQwen3TTS:
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        seed: int = 0,
     ):
         native_mode = self._native_pipeline_mode()
         if native_mode not in {"1", "true", "on", "require"}:
@@ -1635,7 +1749,7 @@ class OpenVINOQwen3TTS:
                 if len(instruct_ids) > max_prompt_tokens:
                     raise ValueError(f"instruct prompt has {len(instruct_ids)} tokens, max_prompt_tokens={max_prompt_tokens}")
                 codec_prefill = self.language_codec_prefill(language, speaker=None)
-                prompt_len = int(len(instruct_ids) + len(input_ids) + len(codec_prefill) - 3)
+                prompt_len = int(len(instruct_ids) + len(input_ids) + len(codec_prefill) - 2)
             else:
                 sequence, tts_pad_embed = self.build_prompt(
                     text,
@@ -1810,7 +1924,20 @@ class OpenVINOQwen3TTS:
                             .lower()
                             not in {"0", "false", "off", "no"}
                         )
-                        subcode_graph_name = (
+                        sampled_graph_name = None
+                        if do_sample and self.subtalker_sample_policy in {"on", "require"}:
+                            sampled_graph_name = (
+                                (
+                                    (self.variant_graphs or {}).get("subcode_sampled_cached_next_embed")
+                                    or graphs_root.get("subcode_sampled_cached_next_embed")
+                                )
+                                if use_next_embed_graph
+                                else None
+                            ) or (
+                                (self.variant_graphs or {}).get("subcode_sampled_cached")
+                                or graphs_root.get("subcode_sampled_cached")
+                            )
+                        subcode_graph_name = sampled_graph_name or (
                             (
                                 (self.variant_graphs or {}).get("subcode_greedy_cached_next_embed")
                                 or graphs_root.get("subcode_greedy_cached_next_embed")
@@ -2102,6 +2229,7 @@ class OpenVINOQwen3TTS:
                         top_k=top_k,
                         top_p=top_p,
                         temperature=temperature,
+                        seed=seed,
                     )
                 else:
                     source_iter = runner.iter_audio_chunks(
@@ -2118,6 +2246,7 @@ class OpenVINOQwen3TTS:
                         top_k=top_k,
                         top_p=top_p,
                         temperature=temperature,
+                        seed=seed,
                     )
                 for item in source_iter:
                     audio = np.asarray(item["audio"], dtype=np.float32)
@@ -2278,6 +2407,7 @@ class OpenVINOQwen3TTS:
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        seed: int = 0,
     ):
         if not env_flag_enabled(os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID")):
             return None
@@ -2315,6 +2445,7 @@ class OpenVINOQwen3TTS:
                 top_k=top_k,
                 top_p=top_p,
                 temperature=temperature,
+                seed=seed,
             )
         if prefix_iter is None:
             return None
@@ -2470,6 +2601,113 @@ class OpenVINOQwen3TTS:
             self.assert_gpu_execution([self.subcode_greedy])
         print(f"compiled subcode greedy on {self.device} in {time.time() - started:.1f}s", flush=True)
 
+    def ensure_subcode_sampled(self) -> bool:
+        if self.subcode_sampled is not None:
+            return True
+        graphs = self.manifest["graphs"]
+        subcode_graph = self.variant_graphs.get("subcode_sampled_cached_next_embed") or graphs.get(
+            "subcode_sampled_cached_next_embed"
+        )
+        if not subcode_graph:
+            subcode_graph = self.variant_graphs.get("subcode_sampled_cached") or graphs.get("subcode_sampled_cached")
+        if not subcode_graph:
+            return False
+        started = time.time()
+        self.subcode_sampled_graph_name = subcode_graph
+        self.subcode_sampled = compile_model(
+            self.core,
+            self.ir_dir / subcode_graph,
+            self.device,
+            self.cache_dir,
+            self.allow_cpu_fallback,
+            self.ov_profiler.enabled,
+            self.precision_hint,
+            self.compile_config,
+        )
+        self.subcode_sampled_request = self.subcode_sampled.create_infer_request()
+        if not self.allow_cpu_fallback and self.device == "GPU":
+            self.assert_gpu_execution([self.subcode_sampled])
+        print(f"compiled subcode sampled on {self.device} in {time.time() - started:.1f}s", flush=True)
+        return True
+
+    def should_sample_subcode(self, *, do_sample: bool) -> bool:
+        if self.subtalker_sample_policy == "off":
+            return False
+        graphs = self.manifest["graphs"]
+        has_sampled_graph = bool(
+            self.variant_graphs.get("subcode_sampled_cached_next_embed")
+            or graphs.get("subcode_sampled_cached_next_embed")
+            or self.variant_graphs.get("subcode_sampled_cached")
+            or graphs.get("subcode_sampled_cached")
+        )
+        if self.subtalker_sample_policy == "require" and not has_sampled_graph:
+            raise RuntimeError(
+                "subtalker sampling was required but the manifest has no "
+                "graphs.subcode_sampled_cached_next_embed or graphs.subcode_sampled_cached; re-export subcode graphs"
+            )
+        if self.subtalker_sample_policy in {"on", "require"}:
+            return has_sampled_graph
+        # Keep auto conservative. The sampled subcode graph is useful for
+        # controlled parity experiments, but it is not quality-gated as the
+        # production default yet.
+        return False
+
+    def should_sample_subcode_step(self, *, enabled: bool, step: int) -> bool:
+        if not enabled:
+            return False
+        if self.subtalker_sample_steps <= 0:
+            return True
+        return int(step) < self.subtalker_sample_steps
+
+    def run_subcode_predictor(
+        self,
+        past_hidden: np.ndarray,
+        first_code: int,
+        tts_pad_embed: np.ndarray | None = None,
+        *,
+        sample_subcode: bool = False,
+        temperature: float = 0.9,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        code_input = np.asarray([[first_code]], dtype=np.int64)
+        if sample_subcode and self.ensure_subcode_sampled():
+            noise = np.random.random(
+                (1, max(1, self.num_code_groups - 1), self.subcode_vocab_size)
+            ).astype(np.float32)
+            inputs: list[np.ndarray] = [
+                past_hidden.astype(np.float32, copy=False),
+                code_input,
+                noise,
+                np.asarray([temperature], dtype=np.float32),
+            ]
+            label = "subcode_sampled"
+            if self.subcode_sampled_graph_name and "next_embed" in self.subcode_sampled_graph_name:
+                if tts_pad_embed is None:
+                    raise RuntimeError("sampled next-embed subcode graph requires tts_pad_embed")
+                inputs.append(tts_pad_embed.astype(np.float32, copy=False))
+                label = "subcode_sampled_next_embed"
+            started = time.time()
+            codes, embed = run_request(
+                self.subcode_sampled_request,
+                self.subcode_sampled,
+                inputs,
+                self.ov_profiler,
+                label,
+            )
+            self.timings.add("subcode_sampled", time.time() - started)
+            return codes.astype(np.int64, copy=False), embed.astype(np.float32, copy=False)
+
+        self.ensure_subcode_greedy()
+        started = time.time()
+        codes, embed = run_request(
+            self.subcode_request,
+            self.subcode_greedy,
+            [past_hidden.astype(np.float32, copy=False), code_input],
+            self.ov_profiler,
+            "subcode_greedy",
+        )
+        self.timings.add("subcode", time.time() - started)
+        return codes.astype(np.int64, copy=False), embed.astype(np.float32, copy=False)
+
     def embed_text(self, token_ids):
         ids = np.asarray([token_ids], dtype=np.int64)
         started = time.time()
@@ -2495,6 +2733,44 @@ class OpenVINOQwen3TTS:
         )[0].astype(np.float32, copy=False)
         self.timings.add("embedding", time.time() - started)
         return result
+
+    def _cached_component(self, key: tuple, factory):
+        if not self.prompt_component_cache_enabled or self.prompt_component_cache_max_items <= 0:
+            return factory()
+        with self.prompt_component_cache_lock:
+            cached = self.prompt_component_cache.get(key)
+            if cached is not None:
+                self.prompt_component_cache.move_to_end(key)
+                self.prompt_component_cache_hits += 1
+                return cached
+        value = np.asarray(factory(), dtype=np.float32)
+        with self.prompt_component_cache_lock:
+            self.prompt_component_cache_misses += 1
+            self.prompt_component_cache[key] = value
+            self.prompt_component_cache.move_to_end(key)
+            while len(self.prompt_component_cache) > self.prompt_component_cache_max_items:
+                self.prompt_component_cache.popitem(last=False)
+        return value
+
+    def embed_text_cached(self, cache_label: str, token_ids):
+        ids = tuple(int(item) for item in token_ids)
+        return self._cached_component(("text", cache_label, ids), lambda: self.embed_text(list(ids)))
+
+    def embed_codec_cached(self, cache_label: str, token_ids):
+        ids = tuple(int(item) for item in token_ids)
+        return self._cached_component(("codec", cache_label, ids), lambda: self.embed_codec(list(ids)))
+
+    def prompt_cache_stats(self) -> dict:
+        return {
+            "prompt_component_cache_enabled": bool(self.prompt_component_cache_enabled),
+            "prompt_component_cache_size": len(self.prompt_component_cache),
+            "prompt_component_cache_hits": int(self.prompt_component_cache_hits),
+            "prompt_component_cache_misses": int(self.prompt_component_cache_misses),
+            "voice_clone_prompt_cache_enabled": self.voice_clone_prompt_cache_max_items > 0,
+            "voice_clone_prompt_cache_size": len(self.voice_clone_prompt_cache),
+            "voice_clone_prompt_cache_hits": int(self.voice_clone_prompt_cache_hits),
+            "voice_clone_prompt_cache_misses": int(self.voice_clone_prompt_cache_misses),
+        }
 
     def embed_code_frames(self, codes: np.ndarray) -> np.ndarray:
         if self.code_frame_embedding_request is None:
@@ -2522,7 +2798,7 @@ class OpenVINOQwen3TTS:
         if spk_id is None:
             supported = sorted(self.ids.get("spk_id", {}))
             raise ValueError(f"unsupported speaker {speaker!r}; supported: {supported}")
-        return self.embed_codec([int(spk_id)])
+        return self.embed_codec_cached(f"speaker:{speaker.lower()}", [int(spk_id)])
 
     def voice_clone_speaker_embed(self, prompt_item: VoiceClonePromptItem | None):
         if prompt_item is None:
@@ -2582,22 +2858,19 @@ class OpenVINOQwen3TTS:
 
         prompt_parts = []
         if instruct_ids is not None:
-            prompt_parts.append(self.embed_text(instruct_ids))
+            prompt_parts.append(self.embed_text_cached("instruct", instruct_ids))
 
-        tts_special = self.embed_text(
-            [
-                self.ids["tts_bos_token_id"],
-                self.ids["tts_eos_token_id"],
-                self.ids["tts_pad_token_id"],
-            ]
+        tts_special = self.embed_text_cached(
+            "tts_special",
+            [self.ids["tts_bos_token_id"], self.ids["tts_eos_token_id"], self.ids["tts_pad_token_id"]],
         )
         tts_bos_embed = tts_special[:, 0:1, :]
         tts_eos_embed = tts_special[:, 1:2, :]
         tts_pad_embed = tts_special[:, 2:3, :]
 
         codec_prefill = self.language_codec_prefill(language, speaker=speaker)
-        codec_prefix = self.embed_codec(codec_prefill)
-        codec_tail = self.embed_codec([self.ids["codec_pad_id"], self.ids["codec_bos_id"]])
+        codec_prefix = self.embed_codec_cached(f"codec_prefix:{str(language).lower()}:{str(speaker).lower()}", codec_prefill)
+        codec_tail = self.embed_codec_cached("codec_tail", [self.ids["codec_pad_id"], self.ids["codec_bos_id"]])
         speaker_embed = self.voice_clone_speaker_embed(voice_clone_prompt)
         if speaker_embed is None:
             speaker_embed = self.speaker_token_embed(speaker)
@@ -2612,6 +2885,8 @@ class OpenVINOQwen3TTS:
         pad_prefix = np.repeat(tts_pad_embed, codec_input_embedding.shape[1] - 2, axis=1)
         prefill_embed = np.concatenate([pad_prefix, tts_bos_embed], axis=1) + codec_input_embedding[:, :-1, :]
         talker_input_embed = np.concatenate([role_embed, prefill_embed], axis=1)
+        codec_pad_embed = self.embed_codec_cached("codec_pad", [self.ids["codec_pad_id"]])
+        codec_bos_embed_cached = self.embed_codec_cached("codec_bos", [self.ids["codec_bos_id"]])
 
         if voice_clone_prompt is not None and voice_clone_prompt.ref_code is not None and voice_clone_prompt.icl_mode:
             if not ref_text:
@@ -2621,11 +2896,11 @@ class OpenVINOQwen3TTS:
             text_body_ids = input_ids[3:-5]
             text_embed = self.embed_text(ref_body_ids + text_body_ids)
             text_embed = np.concatenate([text_embed, tts_eos_embed], axis=1)
-            text_codec_pad = self.embed_codec([self.ids["codec_pad_id"]] * text_embed.shape[1])
+            text_codec_pad = np.repeat(codec_pad_embed, text_embed.shape[1], axis=1)
 
             ref_code = np.asarray(voice_clone_prompt.ref_code, dtype=np.int64)
             codec_embed = self.embed_code_frames(ref_code)
-            codec_bos_embed = self.embed_codec([self.ids["codec_bos_id"]])
+            codec_bos_embed = codec_bos_embed_cached
             codec_embed = np.concatenate([codec_bos_embed, codec_embed], axis=1)
 
             talker_input_embed = np.concatenate(
@@ -2639,11 +2914,11 @@ class OpenVINOQwen3TTS:
         else:
             text_body = input_embed[:, 3:-5, :]
             text_body_with_eos = np.concatenate([text_body, tts_eos_embed], axis=1)
-            text_codec_pad = self.embed_codec([self.ids["codec_pad_id"]] * text_body_with_eos.shape[1])
-            final_bos = tts_pad_embed + self.embed_codec([self.ids["codec_bos_id"]])
+            text_codec_pad = np.repeat(codec_pad_embed, text_body_with_eos.shape[1], axis=1)
+            final_bos = tts_pad_embed + codec_bos_embed_cached
             talker_input_embed = np.concatenate(
                 [
-                    talker_input_embed[:, :-1, :],
+                    talker_input_embed,
                     text_body_with_eos + text_codec_pad,
                     final_bos,
                 ],
@@ -2695,6 +2970,7 @@ class OpenVINOQwen3TTS:
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        seed: int = 0,
     ):
         logits = self.normalize_logits(logits)
         scores = logits[0].astype(np.float32, copy=True)
@@ -2911,6 +3187,7 @@ class OpenVINOQwen3TTS:
             sequence = self.append_prefix_code_frames_to_prompt(sequence, tts_pad_embed, prefix_codes)
         generated_count = 0
         generated_first_codes = []
+        sample_subcode = self.should_sample_subcode(do_sample=do_sample)
         started = time.time()
         for step in range(max_new_tokens):
             talker_started = time.time()
@@ -2938,23 +3215,23 @@ class OpenVINOQwen3TTS:
             if first_code == int(self.ids["codec_eos_token_id"]):
                 break
 
-            code_input = np.asarray([[first_code]], dtype=np.int64)
-            subcode_started = time.time()
-            subcode_inputs = [past_hidden.astype(np.float32), code_input]
+            sample_subcode_step = self.should_sample_subcode_step(enabled=sample_subcode, step=step)
+            subcode_inputs = [past_hidden.astype(np.float32), np.asarray([[first_code]], dtype=np.int64)]
             self.dump_calibration("subcode_greedy", subcode_inputs)
-            codes, sum_embed = run_request(
-                self.subcode_request,
-                self.subcode_greedy,
-                subcode_inputs,
-                self.ov_profiler,
-                "subcode_greedy",
+            codes, sum_embed = self.run_subcode_predictor(
+                past_hidden,
+                first_code,
+                tts_pad_embed,
+                sample_subcode=sample_subcode_step,
+                temperature=self.subtalker_temperature,
             )
-            self.timings.add("subcode", time.time() - subcode_started)
-            codes = codes.astype(np.int64, copy=False)
             generated_count += 1
             generated_first_codes.append(first_code)
 
-            frame_embed = sum_embed.astype(np.float32, copy=False) + tts_pad_embed
+            if self.subcode_sampled_graph_name and "next_embed" in self.subcode_sampled_graph_name and sample_subcode_step:
+                frame_embed = sum_embed.astype(np.float32, copy=False)
+            else:
+                frame_embed = sum_embed.astype(np.float32, copy=False) + tts_pad_embed
             sequence = np.concatenate([sequence, frame_embed], axis=1)
             if progress_interval and generated_count % progress_interval == 0:
                 elapsed = time.time() - started
@@ -3069,7 +3346,6 @@ class OpenVINOQwen3TTS:
         )
         if append_prefix_codes_to_prompt:
             sequence = self.append_prefix_code_frames_to_prompt(sequence, tts_pad_embed, prefix_codes)
-        self.ensure_subcode_greedy()
         prompt_len = int(sequence.shape[1])
         required_len = prompt_len + max_new_tokens
         cache_len, talker_stateful, talker_request = self.get_talker_stateful(required_len)
@@ -3095,6 +3371,7 @@ class OpenVINOQwen3TTS:
 
         generated_count = 0
         generated_first_codes = []
+        sample_subcode = self.should_sample_subcode(do_sample=do_sample)
         for step in range(max_new_tokens):
             first_code = self.select_first_code(
                 logits,
@@ -3110,17 +3387,14 @@ class OpenVINOQwen3TTS:
             if first_code == int(self.ids["codec_eos_token_id"]):
                 break
 
-            code_input = np.asarray([[first_code]], dtype=np.int64)
-            subcode_started = time.time()
-            codes, sum_embed = run_request(
-                self.subcode_request,
-                self.subcode_greedy,
-                [past_hidden.astype(np.float32, copy=False), code_input],
-                self.ov_profiler,
-                "subcode_greedy",
+            sample_subcode_step = self.should_sample_subcode_step(enabled=sample_subcode, step=step)
+            codes, sum_embed = self.run_subcode_predictor(
+                past_hidden,
+                first_code,
+                tts_pad_embed,
+                sample_subcode=sample_subcode_step,
+                temperature=self.subtalker_temperature,
             )
-            self.timings.add("subcode", time.time() - subcode_started)
-            codes = codes.astype(np.int64, copy=False)
             generated_count += 1
             generated_first_codes.append(first_code)
 
@@ -3132,7 +3406,10 @@ class OpenVINOQwen3TTS:
             if step + 1 >= max_new_tokens:
                 break
 
-            frame_embed = sum_embed.astype(np.float32, copy=False) + tts_pad_embed
+            if self.subcode_sampled_graph_name and "next_embed" in self.subcode_sampled_graph_name and sample_subcode_step:
+                frame_embed = sum_embed.astype(np.float32, copy=False)
+            else:
+                frame_embed = sum_embed.astype(np.float32, copy=False) + tts_pad_embed
             cache_position = np.asarray([prompt_len + step], dtype=np.int64)
             attention_mask = self.make_attention_mask(cache_position, 1, prompt_len + step + 1)
             talker_started = time.time()
@@ -3462,6 +3739,7 @@ class OpenVINOQwen3TTS:
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        seed: int = 0,
     ):
         sequence, tts_pad_embed = self.build_prompt(
             text,
@@ -3474,6 +3752,7 @@ class OpenVINOQwen3TTS:
         )
         generated = []
         generated_first_codes = []
+        sample_subcode = self.should_sample_subcode(do_sample=do_sample)
         started = time.time()
         for step in range(max_new_tokens):
             talker_started = time.time()
@@ -3501,23 +3780,23 @@ class OpenVINOQwen3TTS:
             if first_code == int(self.ids["codec_eos_token_id"]):
                 break
 
-            code_input = np.asarray([[first_code]], dtype=np.int64)
-            subcode_started = time.time()
-            subcode_inputs = [past_hidden.astype(np.float32), code_input]
+            sample_subcode_step = self.should_sample_subcode_step(enabled=sample_subcode, step=step)
+            subcode_inputs = [past_hidden.astype(np.float32), np.asarray([[first_code]], dtype=np.int64)]
             self.dump_calibration("subcode_greedy", subcode_inputs)
-            codes, sum_embed = run_request(
-                self.subcode_request,
-                self.subcode_greedy,
-                subcode_inputs,
-                self.ov_profiler,
-                "subcode_greedy",
+            codes, sum_embed = self.run_subcode_predictor(
+                past_hidden,
+                first_code,
+                tts_pad_embed,
+                sample_subcode=sample_subcode_step,
+                temperature=self.subtalker_temperature,
             )
-            self.timings.add("subcode", time.time() - subcode_started)
-            codes = codes.astype(np.int64, copy=False)
             generated.append(codes[0])
             generated_first_codes.append(first_code)
 
-            frame_embed = sum_embed.astype(np.float32, copy=False) + tts_pad_embed
+            if self.subcode_sampled_graph_name and "next_embed" in self.subcode_sampled_graph_name and sample_subcode_step:
+                frame_embed = sum_embed.astype(np.float32, copy=False)
+            else:
+                frame_embed = sum_embed.astype(np.float32, copy=False) + tts_pad_embed
             sequence = np.concatenate([sequence, frame_embed], axis=1)
             if progress_interval and (step + 1) % progress_interval == 0:
                 elapsed = time.time() - started
@@ -3544,6 +3823,7 @@ class OpenVINOQwen3TTS:
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        seed: int = 0,
     ):
         if do_sample:
             raise ValueError("do_sample=True is not supported by fused-no-cache OpenVINO graphs; use --mode no-cache")
@@ -3614,6 +3894,7 @@ class OpenVINOQwen3TTS:
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        seed: int = 0,
     ):
         sequence, tts_pad_embed = self.build_prompt(
             text,
@@ -3649,6 +3930,7 @@ class OpenVINOQwen3TTS:
 
         generated = []
         generated_first_codes = []
+        sample_subcode = self.should_sample_subcode(do_sample=do_sample)
         for step in range(max_new_tokens):
             first_code = self.select_first_code(
                 logits,
@@ -3664,17 +3946,14 @@ class OpenVINOQwen3TTS:
             if first_code == int(self.ids["codec_eos_token_id"]):
                 break
 
-            code_input = np.asarray([[first_code]], dtype=np.int64)
-            subcode_started = time.time()
-            codes, sum_embed = run_request(
-                self.subcode_request,
-                self.subcode_greedy,
-                [past_hidden.astype(np.float32, copy=False), code_input],
-                self.ov_profiler,
-                "subcode_greedy",
+            sample_subcode_step = self.should_sample_subcode_step(enabled=sample_subcode, step=step)
+            codes, sum_embed = self.run_subcode_predictor(
+                past_hidden,
+                first_code,
+                tts_pad_embed,
+                sample_subcode=sample_subcode_step,
+                temperature=self.subtalker_temperature,
             )
-            self.timings.add("subcode", time.time() - subcode_started)
-            codes = codes.astype(np.int64, copy=False)
             generated.append(codes[0])
             generated_first_codes.append(first_code)
 
@@ -3685,7 +3964,10 @@ class OpenVINOQwen3TTS:
             if step + 1 >= max_new_tokens:
                 break
 
-            frame_embed = sum_embed.astype(np.float32, copy=False) + tts_pad_embed
+            if self.subcode_sampled_graph_name and "next_embed" in self.subcode_sampled_graph_name and sample_subcode_step:
+                frame_embed = sum_embed.astype(np.float32, copy=False)
+            else:
+                frame_embed = sum_embed.astype(np.float32, copy=False) + tts_pad_embed
             cache_position = np.asarray([prompt_len + step], dtype=np.int64)
             attention_mask = self.make_attention_mask(cache_position, 1, prompt_len + step + 1)
             talker_started = time.time()
@@ -3832,20 +4114,73 @@ class OpenVINOQwen3TTS:
         embed = outputs[0].astype(np.float32, copy=False)
         return embed.reshape(-1)
 
+    def _voice_clone_audio_cache_key(self, ref_audio):
+        if isinstance(ref_audio, (str, os.PathLike)):
+            text = str(ref_audio)
+            if text.startswith(("http://", "https://")):
+                return ("url", text)
+            path = Path(text).expanduser()
+            if path.exists() and path.is_file():
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                return ("file_sha256", digest.hexdigest(), int(path.stat().st_size))
+            return ("path", text)
+        if isinstance(ref_audio, (bytes, bytearray, memoryview)):
+            return ("bytes_sha256", hashlib.sha256(bytes(ref_audio)).hexdigest(), len(ref_audio))
+        return None
+
+    def _voice_clone_prompt_cache_get(self, key: tuple):
+        if self.voice_clone_prompt_cache_max_items <= 0:
+            return None
+        with self.voice_clone_prompt_cache_lock:
+            item = self.voice_clone_prompt_cache.get(key)
+            if item is not None:
+                self.voice_clone_prompt_cache.move_to_end(key)
+                self.voice_clone_prompt_cache_hits += 1
+                return item
+        return None
+
+    def _voice_clone_prompt_cache_put(self, key: tuple, item: VoiceClonePromptItem) -> None:
+        if self.voice_clone_prompt_cache_max_items <= 0:
+            return
+        with self.voice_clone_prompt_cache_lock:
+            self.voice_clone_prompt_cache_misses += 1
+            self.voice_clone_prompt_cache[key] = item
+            self.voice_clone_prompt_cache.move_to_end(key)
+            while len(self.voice_clone_prompt_cache) > self.voice_clone_prompt_cache_max_items:
+                self.voice_clone_prompt_cache.popitem(last=False)
+
     def create_voice_clone_prompt(self, ref_audio, ref_text=None, x_vector_only_mode: bool = False):
         if not x_vector_only_mode and (ref_text is None or ref_text == ""):
             raise ValueError("ref_text is required when x_vector_only_mode=False")
+        audio_key = self._voice_clone_audio_cache_key(ref_audio)
+        cache_key = None
+        if audio_key is not None:
+            cache_key = (
+                "voice_clone_prompt",
+                audio_key,
+                str(ref_text or ""),
+                bool(x_vector_only_mode),
+                int(self.input_sample_rate),
+                int(self.speaker_encoder_sample_rate),
+            )
+            cached = self._voice_clone_prompt_cache_get(cache_key)
+            if cached is not None:
+                return [cached]
         ref_code = None if x_vector_only_mode else self.encode_audio_codes(ref_audio)
         spk_embed = self.extract_speaker_embedding(ref_audio)
-        return [
-            VoiceClonePromptItem(
-                ref_code=ref_code,
-                ref_spk_embedding=spk_embed,
-                x_vector_only_mode=bool(x_vector_only_mode),
-                icl_mode=not bool(x_vector_only_mode),
-                ref_text=ref_text,
-            )
-        ]
+        item = VoiceClonePromptItem(
+            ref_code=ref_code,
+            ref_spk_embedding=spk_embed,
+            x_vector_only_mode=bool(x_vector_only_mode),
+            icl_mode=not bool(x_vector_only_mode),
+            ref_text=ref_text,
+        )
+        if cache_key is not None:
+            self._voice_clone_prompt_cache_put(cache_key, item)
+        return [item]
 
     @classmethod
     def from_ir(cls, ir_dir: str | Path, **kwargs):
@@ -3860,6 +4195,24 @@ class OpenVINOQwen3TTS:
     def _ensure_list(value):
         return value if isinstance(value, list) else [value]
 
+    def _resolve_public_generation_defaults(
+        self,
+        do_sample: bool | None,
+        repetition_penalty: float | None,
+        *,
+        fallback_do_sample: bool = False,
+    ) -> tuple[bool, float]:
+        fallback_penalty = 1.0 if is_fastest_or_norepeat_mode(self.requested_mode) else 1.05
+        resolved_do_sample, resolved_penalty, metadata = resolve_generation_defaults(
+            explicit_do_sample=do_sample,
+            explicit_repetition_penalty=repetition_penalty,
+            fallback_do_sample=fallback_do_sample,
+            fallback_repetition_penalty=fallback_penalty,
+            sampled_repetition_penalty=1.05,
+        )
+        self.last_generation_default_metadata = metadata
+        return resolved_do_sample, resolved_penalty
+
     def generate_voice_design(
         self,
         text,
@@ -3867,14 +4220,16 @@ class OpenVINOQwen3TTS:
         language=None,
         max_new_tokens: int = 512,
         min_new_tokens: int = 2,
-        repetition_penalty: float = 1.05,
+        repetition_penalty: float | None = None,
         max_prompt_tokens: int = 512,
         progress_interval: int = 8,
-        do_sample: bool = False,
+        do_sample: bool | None = None,
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        seed: int = 0,
     ):
+        do_sample, repetition_penalty = self._resolve_public_generation_defaults(do_sample, repetition_penalty)
         texts = self._ensure_list(text)
         instructs = self._ensure_list(instruct)
         languages = self._ensure_list(language if language is not None else "Auto")
@@ -3886,6 +4241,29 @@ class OpenVINOQwen3TTS:
             raise ValueError("text, instruct, and language batch sizes must match")
         wavs = []
         for item_text, item_instruct, item_language in zip(texts, instructs, languages):
+            if self._native_pipeline_mode() in {"1", "true", "on", "require"} and self.talker_request is None:
+                chunks = list(
+                    self.stream_voice_design(
+                        text=item_text,
+                        instruct=item_instruct or "",
+                        language=item_language,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=min_new_tokens,
+                        repetition_penalty=repetition_penalty,
+                        max_prompt_tokens=max_prompt_tokens,
+                        progress_interval=progress_interval,
+                        do_sample=do_sample,
+                        top_k=top_k,
+                        top_p=top_p,
+                        temperature=temperature,
+                        seed=seed,
+                    )
+                )
+                audio_parts = [np.asarray(chunk.audio, dtype=np.float32) for chunk in chunks if chunk.audio.size]
+                if not audio_parts:
+                    raise RuntimeError("voice design generation stopped before producing any audio chunk")
+                wavs.append(np.concatenate(audio_parts, axis=0))
+                continue
             codes = self.generate_codes(
                 text=item_text,
                 instruct=item_instruct or "",
@@ -3911,14 +4289,17 @@ class OpenVINOQwen3TTS:
         instruct=None,
         max_new_tokens: int = 512,
         min_new_tokens: int = 2,
-        repetition_penalty: float = 1.05,
+        repetition_penalty: float | None = None,
         max_prompt_tokens: int = 512,
         progress_interval: int = 8,
-        do_sample: bool = False,
+        do_sample: bool | None = None,
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        seed: int = 0,
     ):
+        explicit_repetition_penalty = repetition_penalty is not None
+        do_sample, repetition_penalty = self._resolve_public_generation_defaults(do_sample, repetition_penalty)
         texts = self._ensure_list(text)
         speakers = self._ensure_list(speaker)
         languages = self._ensure_list(language if language is not None else "Auto")
@@ -3931,8 +4312,43 @@ class OpenVINOQwen3TTS:
             instructs *= len(texts)
         if not (len(texts) == len(speakers) == len(languages) == len(instructs)):
             raise ValueError("text, speaker, language, and instruct batch sizes must match")
+        if do_sample and not explicit_repetition_penalty:
+            repetition_penalty = max(
+                custom_voice_default_repetition_penalty(
+                    normalize_custom_voice_text(item_text, item_speaker, item_language),
+                    do_sample=do_sample,
+                    repetition_penalty=repetition_penalty,
+                    explicit_repetition_penalty=False,
+                )
+                for item_text, item_speaker, item_language in zip(texts, speakers, languages)
+            )
         wavs = []
         for item_text, item_speaker, item_language, item_instruct in zip(texts, speakers, languages, instructs):
+            item_text = normalize_custom_voice_text(item_text, item_speaker, item_language)
+            if self._native_pipeline_mode() in {"1", "true", "on", "require"} and self.talker_request is None:
+                chunks = list(
+                    self.stream_custom_voice(
+                        text=item_text,
+                        speaker=item_speaker,
+                        instruct=item_instruct or "",
+                        language=item_language,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=min_new_tokens,
+                        repetition_penalty=repetition_penalty,
+                        max_prompt_tokens=max_prompt_tokens,
+                        progress_interval=progress_interval,
+                        do_sample=do_sample,
+                        top_k=top_k,
+                        top_p=top_p,
+                        temperature=temperature,
+                        seed=seed,
+                    )
+                )
+                audio_parts = [np.asarray(chunk.audio, dtype=np.float32) for chunk in chunks if chunk.audio.size]
+                if not audio_parts:
+                    raise RuntimeError("custom voice generation stopped before producing any audio chunk")
+                wavs.append(np.concatenate(audio_parts, axis=0))
+                continue
             codes = self.generate_codes(
                 text=item_text,
                 instruct=item_instruct or "",
@@ -3954,14 +4370,60 @@ class OpenVINOQwen3TTS:
     def _normalize_voice_clone_prompt(self, prompt, text_count: int):
         if isinstance(prompt, dict):
             items = []
-            for index in range(len(prompt["ref_spk_embedding"])):
+            speaker_embeddings = np.asarray(prompt["ref_spk_embedding"], dtype=np.float32)
+            if speaker_embeddings.ndim <= 1:
+                speaker_items = [speaker_embeddings.reshape(-1)]
+            else:
+                speaker_items = [speaker_embeddings[index] for index in range(speaker_embeddings.shape[0])]
+
+            def item_value(name: str, index: int, item_count: int, default=None):
+                values = prompt.get(name)
+                if values is None:
+                    return default
+                if isinstance(values, (list, tuple)):
+                    if not values:
+                        return default
+                    if len(values) == 1:
+                        return values[0]
+                    if len(values) != item_count:
+                        return values[0] if item_count == 1 else default
+                    return values[index]
+                return values
+
+            def ref_code_value(index: int, item_count: int):
                 ref_codes = prompt.get("ref_code")
+                if ref_codes is None:
+                    return None
+                num_groups = int(getattr(self, "num_code_groups", 16))
+                try:
+                    arr = np.asarray(ref_codes)
+                except ValueError:
+                    arr = None
+                if arr is not None and arr.ndim == 2 and int(arr.shape[-1]) == num_groups:
+                    return arr.astype(np.int64, copy=False)
+                if arr is not None and arr.ndim == 3 and int(arr.shape[0]) == item_count:
+                    return arr[index].astype(np.int64, copy=False)
+                if arr is not None and item_count == 1 and arr.ndim == 3 and int(arr.shape[0]) == 1:
+                    return arr[0].astype(np.int64, copy=False)
+                if isinstance(ref_codes, (list, tuple)):
+                    if len(ref_codes) == 1:
+                        item = ref_codes[0]
+                    elif len(ref_codes) == item_count:
+                        item = ref_codes[index]
+                    else:
+                        item = ref_codes
+                    return None if item is None else np.asarray(item, dtype=np.int64)
+                return np.asarray(ref_codes, dtype=np.int64)
+
+            for index, speaker_embedding in enumerate(speaker_items):
+                item_count = len(speaker_items)
                 items.append(
                     VoiceClonePromptItem(
-                        ref_code=None if ref_codes is None else ref_codes[index],
-                        ref_spk_embedding=prompt["ref_spk_embedding"][index],
-                        x_vector_only_mode=bool(prompt.get("x_vector_only_mode", [False])[index]),
-                        icl_mode=bool(prompt.get("icl_mode", [True])[index]),
+                        ref_code=ref_code_value(index, item_count),
+                        ref_spk_embedding=speaker_embedding,
+                        x_vector_only_mode=bool(item_value("x_vector_only_mode", index, item_count, False)),
+                        icl_mode=bool(item_value("icl_mode", index, item_count, True)),
+                        ref_text=item_value("ref_text", index, item_count),
                     )
                 )
         else:
@@ -3984,13 +4446,14 @@ class OpenVINOQwen3TTS:
         voice_clone_prompt=None,
         max_new_tokens: int = 512,
         min_new_tokens: int = 2,
-        repetition_penalty: float = 1.05,
+        repetition_penalty: float | None = None,
         max_prompt_tokens: int = 512,
         progress_interval: int = 8,
-        do_sample: bool = False,
+        do_sample: bool | None = None,
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        seed: int = 0,
     ):
         texts = self._ensure_list(text)
         languages = self._ensure_list(language if language is not None else "Auto")
@@ -4006,6 +4469,9 @@ class OpenVINOQwen3TTS:
             prompts = self._normalize_voice_clone_prompt(voice_clone_prompt, len(texts))
         if len(prompts) == 1 and len(texts) > 1:
             prompts = prompts * len(texts)
+        if do_sample is None and any(bool(prompt.x_vector_only_mode) for prompt in prompts):
+            do_sample = False
+        do_sample, repetition_penalty = self._resolve_public_generation_defaults(do_sample, repetition_penalty)
         wavs = []
         for item_text, item_language, prompt in zip(texts, languages, prompts):
             item_ref_text = prompt.ref_text if prompt.ref_text is not None else ref_text
@@ -4025,6 +4491,7 @@ class OpenVINOQwen3TTS:
                         top_k=top_k,
                         top_p=top_p,
                         temperature=temperature,
+                        seed=seed,
                     )
                 )
                 audio_parts = [np.asarray(chunk.audio, dtype=np.float32) for chunk in chunks if chunk.audio.size]
@@ -4147,31 +4614,50 @@ class OpenVINOQwen3TTS:
                 candidates.append(largest)
         return candidates
 
+    def _set_last_stream_decode_info(self, info: dict[str, Any]) -> None:
+        self.last_stream_decode_info = info
+        thread_local = getattr(self, "_thread_local", None)
+        if thread_local is not None:
+            thread_local.last_stream_decode_info = info
+
+    def _get_last_stream_decode_info(self) -> dict[str, Any]:
+        thread_local = getattr(self, "_thread_local", None)
+        info = getattr(thread_local, "last_stream_decode_info", None) if thread_local is not None else None
+        if isinstance(info, dict):
+            return info
+        return dict(getattr(self, "last_stream_decode_info", {}) or {})
+
     def _get_stream_decoder(self, context_frames: int, chunk_frames: int):
         key = (int(context_frames), int(chunk_frames))
-        if key not in self.streaming_decoders:
-            started = time.time()
-            graph = self.streaming_decoder_graphs_by_context[int(context_frames)][int(chunk_frames)]
-            compiled = compile_model(
-                self.core,
-                self.ir_dir / graph,
-                self.decoder_device,
-                self.cache_dir,
-                self.allow_cpu_fallback,
-                self.ov_profiler.enabled,
-                self.precision_hint,
-                self.compile_config,
-            )
-            if not self.allow_cpu_fallback and self.decoder_device == "GPU":
-                self.assert_gpu_execution([compiled])
-            self.streaming_decoders[key] = compiled
-            self.streaming_decoder_requests[key] = compiled.create_infer_request()
-            print(
-                f"compiled streaming decoder context {context_frames} chunk {chunk_frames} "
-                f"on {self.decoder_device} in {time.time() - started:.1f}s",
-                flush=True,
-            )
-        return self.streaming_decoders[key], self.streaming_decoder_requests[key]
+        with self.streaming_decoder_compile_lock:
+            if key not in self.streaming_decoders:
+                started = time.time()
+                graph = self.streaming_decoder_graphs_by_context[int(context_frames)][int(chunk_frames)]
+                compiled = compile_model(
+                    self.core,
+                    self.ir_dir / graph,
+                    self.decoder_device,
+                    self.cache_dir,
+                    self.allow_cpu_fallback,
+                    self.ov_profiler.enabled,
+                    self.precision_hint,
+                    self.compile_config,
+                )
+                if not self.allow_cpu_fallback and self.decoder_device == "GPU":
+                    self.assert_gpu_execution([compiled])
+                self.streaming_decoders[key] = compiled
+                pool: queue.LifoQueue = queue.LifoQueue(maxsize=self.streaming_decoder_request_pool_size)
+                for _ in range(self.streaming_decoder_request_pool_size):
+                    pool.put(compiled.create_infer_request())
+                self.streaming_decoder_request_pools[key] = pool
+                self.streaming_decoder_locks[key] = threading.Lock()
+                print(
+                    f"compiled streaming decoder context {context_frames} chunk {chunk_frames} "
+                    f"pool={self.streaming_decoder_request_pool_size} on {self.decoder_device} "
+                    f"in {time.time() - started:.1f}s",
+                    flush=True,
+                )
+        return self.streaming_decoders[key], self.streaming_decoder_request_pools[key]
 
     def _pad_stream_context(self, window_codes: np.ndarray, context_frames: int, target_context_frames: int):
         if target_context_frames <= context_frames:
@@ -4240,17 +4726,21 @@ class OpenVINOQwen3TTS:
                     target_context,
                     target_chunk,
                 )
-                compiled, request = self._get_stream_decoder(target_context, target_chunk)
-                audio = run_request(
-                    request,
-                    compiled,
-                    [np.asarray(padded_window, dtype=np.int64).reshape(1, -1, self.num_code_groups)],
-                    self.ov_profiler,
-                    f"speech_decoder_stream_c{target_context}_t{target_chunk}",
-                )[0][0].astype(np.float32, copy=False)
+                compiled, request_pool = self._get_stream_decoder(target_context, target_chunk)
+                request = request_pool.get()
+                try:
+                    audio = run_request(
+                        request,
+                        compiled,
+                        [np.asarray(padded_window, dtype=np.int64).reshape(1, -1, self.num_code_groups)],
+                        self.ov_profiler,
+                        f"speech_decoder_stream_c{target_context}_t{target_chunk}",
+                    )[0][0].astype(np.float32, copy=False)
+                finally:
+                    request_pool.put(request)
                 elapsed = time.time() - started
                 self.timings.add("decode", elapsed)
-                self.last_stream_decode_info = {
+                self._set_last_stream_decode_info({
                     "decode_path": f"stream:c{target_context}_t{target_chunk}",
                     "decode_context_frames": int(effective_context),
                     "decode_chunk_graph_frames": int(target_chunk),
@@ -4258,13 +4748,16 @@ class OpenVINOQwen3TTS:
                     "decode_padded_frames": int(padded_frames),
                     "decode_ms": elapsed * 1000.0,
                     "fallback": False,
-                }
+                    "stream_decoder_request_pool_size": int(self.streaming_decoder_request_pool_size),
+                })
                 return audio[: new_frames * self.decode_upsample_rate]
             except Exception as exc:
                 last_stream_error = exc
                 failed_key = (int(target_context), int(target_chunk))
-                self.streaming_decoders.pop(failed_key, None)
-                self.streaming_decoder_requests.pop(failed_key, None)
+                with self.streaming_decoder_compile_lock:
+                    self.streaming_decoders.pop(failed_key, None)
+                    self.streaming_decoder_request_pools.pop(failed_key, None)
+                    self.streaming_decoder_locks.pop(failed_key, None)
                 print(
                     f"warning: streaming decoder c{target_context}_t{target_chunk} failed; "
                     f"trying fallback path: {exc}",
@@ -4276,7 +4769,7 @@ class OpenVINOQwen3TTS:
         elapsed = time.time() - started
         start = context_frames * self.decode_upsample_rate
         end = start + new_frames * self.decode_upsample_rate
-        self.last_stream_decode_info = {
+        self._set_last_stream_decode_info({
             "decode_path": "fallback:speech_decoder",
             "decode_context_frames": int(context_frames),
             "decode_chunk_graph_frames": None,
@@ -4285,7 +4778,8 @@ class OpenVINOQwen3TTS:
             "decode_ms": elapsed * 1000.0,
             "fallback": True,
             "stream_decoder_error": str(last_stream_error) if last_stream_error is not None else None,
-        }
+            "stream_decoder_request_pool_size": int(self.streaming_decoder_request_pool_size),
+        })
         return audio[start:end]
 
     def stream_decode_codes(
@@ -4354,7 +4848,7 @@ class OpenVINOQwen3TTS:
                     left_context_frames=left_context_frames,
                 )
                 decode_ms = (time.time() - decode_started) * 1000.0
-                decode_info = dict(getattr(self, "last_stream_decode_info", {}) or {})
+                decode_info = self._get_last_stream_decode_info()
                 decode_ms = float(decode_info.get("decode_ms", decode_ms))
                 codes = np.stack(all_codes[emitted_frames:total_frames], axis=0).astype(np.int64, copy=False)
                 emitted_frames = total_frames
@@ -4514,7 +5008,7 @@ class OpenVINOQwen3TTS:
                             left_context_frames=left_context_frames,
                         )
                         decode_ms = (time.time() - decode_started) * 1000.0
-                        decode_info = dict(getattr(self, "last_stream_decode_info", {}) or {})
+                        decode_info = self._get_last_stream_decode_info()
                         decode_ms = float(decode_info.get("decode_ms", decode_ms))
                     else:
                         audio = np.zeros((0,), dtype=np.float32)
@@ -4588,7 +5082,8 @@ class OpenVINOQwen3TTS:
                         drain_ready(False)
 
                         if pending_frames >= current_target_frames():
-                            future = executor.submit(build_decode_job(False))
+                            decode_job = build_decode_job(False)
+                            future = executor.submit(decode_job)
                             pending.append(future)
                             if chunk_index == 1:
                                 out_queue.put(future.result())
@@ -4596,10 +5091,8 @@ class OpenVINOQwen3TTS:
                             elif len(pending) >= 2:
                                 drain_ready(True)
 
-                    if pending_frames > 0:
-                        pending.append(executor.submit(build_decode_job(True)))
-                    else:
-                        pending.append(executor.submit(build_decode_job(True)))
+                    final_decode_job = build_decode_job(True)
+                    pending.append(executor.submit(final_decode_job))
                     drain_ready(True)
             except Exception as exc:
                 out_queue.put(exc)
@@ -4629,16 +5122,18 @@ class OpenVINOQwen3TTS:
         chunk_strategy: str | None = None,
         max_new_tokens: int = 512,
         min_new_tokens: int = 2,
-        repetition_penalty: float = 1.05,
+        repetition_penalty: float | None = None,
         max_prompt_tokens: int = 512,
         progress_interval: int = 8,
-        do_sample: bool = False,
+        do_sample: bool | None = None,
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        seed: int = 0,
         prefix_codes: np.ndarray | None = None,
         append_prefix_codes_to_prompt: bool = False,
     ):
+        do_sample, repetition_penalty = self._resolve_public_generation_defaults(do_sample, repetition_penalty)
         scalar_text = self._ensure_scalar(text, "text")
         scalar_instruct = self._ensure_scalar(instruct, "instruct") or ""
         scalar_language = self._ensure_scalar(language if language is not None else "Auto", "language")
@@ -4659,6 +5154,7 @@ class OpenVINOQwen3TTS:
                 top_k=top_k,
                 top_p=top_p,
                 temperature=temperature,
+                seed=seed,
             )
             if hybrid_chunks is not None:
                 yield from hybrid_chunks
@@ -4722,18 +5218,32 @@ class OpenVINOQwen3TTS:
         chunk_strategy: str | None = None,
         max_new_tokens: int = 512,
         min_new_tokens: int = 2,
-        repetition_penalty: float = 1.05,
+        repetition_penalty: float | None = None,
         max_prompt_tokens: int = 512,
         progress_interval: int = 8,
-        do_sample: bool = False,
+        do_sample: bool | None = None,
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        seed: int = 0,
     ):
+        explicit_repetition_penalty = repetition_penalty is not None
+        do_sample, repetition_penalty = self._resolve_public_generation_defaults(do_sample, repetition_penalty)
+        scalar_text = self._ensure_scalar(text, "text")
+        scalar_instruct = self._ensure_scalar(instruct if instruct is not None else "", "instruct") or ""
+        scalar_language = self._ensure_scalar(language if language is not None else "Auto", "language")
+        scalar_speaker = self._ensure_scalar(speaker, "speaker")
+        scalar_text = normalize_custom_voice_text(scalar_text, scalar_speaker, scalar_language)
+        repetition_penalty = custom_voice_default_repetition_penalty(
+            scalar_text,
+            do_sample=do_sample,
+            repetition_penalty=repetition_penalty,
+            explicit_repetition_penalty=explicit_repetition_penalty,
+        )
         native_chunks = self._try_stream_native_audio_pipeline(
-            text=self._ensure_scalar(text, "text"),
-            instruct=self._ensure_scalar(instruct if instruct is not None else "", "instruct") or "",
-            language=self._ensure_scalar(language if language is not None else "Auto", "language"),
+            text=scalar_text,
+            instruct=scalar_instruct,
+            language=scalar_language,
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,
             repetition_penalty=repetition_penalty,
@@ -4742,22 +5252,26 @@ class OpenVINOQwen3TTS:
             left_context_frames=left_context_frames,
             initial_chunk_frames=initial_chunk_frames,
             chunk_strategy=chunk_strategy,
-            speaker=self._ensure_scalar(speaker, "speaker"),
+            speaker=scalar_speaker,
             do_sample=do_sample,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+            seed=seed,
         )
         if native_chunks is not None:
             yield from native_chunks
             return
         codes = self.generate_codes_iter(
-            text=self._ensure_scalar(text, "text"),
-            instruct=self._ensure_scalar(instruct if instruct is not None else "", "instruct") or "",
-            language=self._ensure_scalar(language if language is not None else "Auto", "language"),
+            text=scalar_text,
+            instruct=scalar_instruct,
+            language=scalar_language,
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,
             repetition_penalty=repetition_penalty,
             max_prompt_tokens=max_prompt_tokens,
             progress_interval=progress_interval,
-            speaker=self._ensure_scalar(speaker, "speaker"),
+            speaker=scalar_speaker,
             do_sample=do_sample,
             top_k=top_k,
             top_p=top_p,
@@ -4785,13 +5299,14 @@ class OpenVINOQwen3TTS:
         chunk_strategy: str | None = None,
         max_new_tokens: int = 512,
         min_new_tokens: int = 2,
-        repetition_penalty: float = 1.05,
+        repetition_penalty: float | None = None,
         max_prompt_tokens: int = 512,
         progress_interval: int = 8,
-        do_sample: bool = False,
+        do_sample: bool | None = None,
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        seed: int = 0,
     ):
         text = self._ensure_scalar(text, "text")
         language = self._ensure_scalar(language if language is not None else "Auto", "language")
@@ -4801,6 +5316,9 @@ class OpenVINOQwen3TTS:
             prompt = self.create_voice_clone_prompt(ref_audio, ref_text=ref_text, x_vector_only_mode=x_vector_only_mode)[0]
         else:
             prompt = self._normalize_voice_clone_prompt(voice_clone_prompt, 1)[0]
+        if do_sample is None and bool(prompt.x_vector_only_mode):
+            do_sample = False
+        do_sample, repetition_penalty = self._resolve_public_generation_defaults(do_sample, repetition_penalty)
         item_ref_text = prompt.ref_text if prompt.ref_text is not None else ref_text
         prefix = np.asarray(prompt.ref_code, dtype=np.int64) if prompt.ref_code is not None else None
         native_chunks = self._try_stream_native_audio_pipeline(
@@ -4819,6 +5337,10 @@ class OpenVINOQwen3TTS:
             ref_text=item_ref_text,
             prefix_codes=prefix,
             do_sample=do_sample,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+            seed=seed,
         )
         if native_chunks is not None:
             yield from native_chunks
@@ -4876,7 +5398,7 @@ class OpenVINOQwen3TTS:
         left_context_frames = int(stream_config["left_context_frames"])
         max_new_tokens = int(max_new_tokens or (initial_chunk_frames + chunk_frames))
         native_pipeline_active = self._native_pipeline_mode() in {"1", "true", "on", "require"}
-        status = {
+        status: dict[str, Any] = {
             "enabled": True,
             "status": "running",
             "mode": self.mode,
@@ -4900,42 +5422,124 @@ class OpenVINOQwen3TTS:
             "compiled_decode_unroll_buckets": [],
             "bucket_errors": {},
             "compiled_stream_decoders": [],
+            "warmed_stream_decoders": [],
             "stream_decoder_errors": {},
             "streaming_decoder_available": bool(self.streaming_decoder_graphs_by_context),
             "native_pipeline_prewarm": bool(native_pipeline_active),
         }
+        warm_stream_decoder_infer = not env_flag_enabled(os.environ.get("QWEN3_TTS_OV_DISABLE_STREAM_DECODER_INFER_WARMUP"))
+        warm_stream_decoder_runs = max(1, int(os.environ.get("QWEN3_TTS_OV_STREAM_DECODER_INFER_WARMUP_RUNS") or 2))
+        warmed_stream_decoder_keys: set[tuple[int, int]] = set()
 
-        def compile_stream_candidates(label: str, candidates: list[tuple[int, int]]):
+        def warm_stream_decoder_infer_once(context: int, chunk: int, request) -> None:
+            if not warm_stream_decoder_infer:
+                return
+            key = (int(context), int(chunk))
+            if key in warmed_stream_decoder_keys:
+                return
+            frames = max(1, int(context) + int(chunk))
+            dummy_codes = np.zeros((1, frames, self.num_code_groups), dtype=np.int64)
+            started_infer = time.time()
+            for _ in range(warm_stream_decoder_runs):
+                request.infer([dummy_codes])
+            warmed_stream_decoder_keys.add(key)
+            status["warmed_stream_decoders"].append(
+                {
+                    "context_frames": int(context),
+                    "chunk_frames": int(chunk),
+                    "runs": int(warm_stream_decoder_runs),
+                    "elapsed_ms": (time.time() - started_infer) * 1000.0,
+                }
+            )
+
+        def compile_stream_candidates(label: str, candidates: list[tuple[int, int]], *, compile_all: bool = False):
+            compiled_any = False
+            seen: set[tuple[int, int]] = set()
             for context, chunk in candidates:
+                key = (int(context), int(chunk))
+                if key in seen:
+                    continue
+                seen.add(key)
                 try:
-                    self._get_stream_decoder(context, chunk)
+                    _compiled, request_pool = self._get_stream_decoder(context, chunk)
+                    request = request_pool.get()
+                    try:
+                        warm_stream_decoder_infer_once(int(context), int(chunk), request)
+                    finally:
+                        request_pool.put(request)
                     item = {"context_frames": int(context), "chunk_frames": int(chunk), "label": label}
                     if item not in status["compiled_stream_decoders"]:
                         status["compiled_stream_decoders"].append(item)
-                    return True
+                    compiled_any = True
+                    if not compile_all:
+                        return True
                 except Exception as exc:
                     status["stream_decoder_errors"][f"{label}:c{context}_t{chunk}"] = str(exc)
-            return False
+            return compiled_any
 
         if native_pipeline_active:
-            status["skipped_python_graph_prewarm"] = True
-        else:
+            status["compiled_python_stream_decoders_with_native_pipeline"] = True
+        compile_stream_candidates(
+            "initial",
+            self._stream_decoder_key_candidates(
+                context_frames=0,
+                new_frames=initial_chunk_frames,
+                preferred_chunk_frames=initial_chunk_frames,
+                left_context_frames=left_context_frames,
+            ),
+        )
+        compile_stream_candidates(
+            "steady",
+            self._stream_decoder_key_candidates(
+                context_frames=min(initial_chunk_frames, left_context_frames),
+                new_frames=chunk_frames,
+                preferred_chunk_frames=chunk_frames,
+                left_context_frames=left_context_frames,
+            ),
+        )
+        # VoiceClone ICL starts target-audio decoding with reference codec frames
+        # already in the left context. Precompile the context-bearing first-chunk
+        # decoder as well, otherwise the first real clone request may still pay a
+        # c25_t12/c25_t24 compile cost even after sidecar warmup.
+        compile_stream_candidates(
+            "prefix_initial",
+            self._stream_decoder_key_candidates(
+                context_frames=left_context_frames,
+                new_frames=initial_chunk_frames,
+                preferred_chunk_frames=initial_chunk_frames,
+                left_context_frames=left_context_frames,
+            ),
+        )
+        short_config = self.streaming_decoder_strategies.get("short_compute")
+        if short_config:
+            short_initial = int(short_config.get("initial_chunk_frames", 12))
+            short_chunk = int(short_config.get("chunk_frames", 24))
+            short_context = int(short_config.get("left_context_frames", left_context_frames))
             compile_stream_candidates(
-                "initial",
+                "short_initial",
                 self._stream_decoder_key_candidates(
                     context_frames=0,
-                    new_frames=initial_chunk_frames,
-                    preferred_chunk_frames=initial_chunk_frames,
-                    left_context_frames=left_context_frames,
+                    new_frames=short_initial,
+                    preferred_chunk_frames=short_initial,
+                    left_context_frames=short_context,
                 ),
             )
             compile_stream_candidates(
-                "steady",
+                "short_steady",
                 self._stream_decoder_key_candidates(
-                    context_frames=min(initial_chunk_frames, left_context_frames),
-                    new_frames=chunk_frames,
-                    preferred_chunk_frames=chunk_frames,
-                    left_context_frames=left_context_frames,
+                    context_frames=min(short_initial, short_context),
+                    new_frames=short_chunk,
+                    preferred_chunk_frames=short_chunk,
+                    left_context_frames=short_context,
+                ),
+            )
+            compile_stream_candidates(
+                "short_prefix_initial",
+                self._stream_decoder_key_candidates(
+                    context_frames=short_context,
+                    new_frames=short_initial,
+                    preferred_chunk_frames=short_initial,
+                    left_context_frames=short_context,
                 ),
             )
 

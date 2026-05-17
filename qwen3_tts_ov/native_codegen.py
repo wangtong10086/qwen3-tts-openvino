@@ -363,6 +363,135 @@ class NativeCodegenRunner:
             ctypes.POINTER(ctypes.c_char_p),
         ]
         self.lib.qwen3_tts_codegen_run_voice_design_audio_stream.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_run_paged_kv_repeat_batch.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_run_paged_kv_repeat_batch.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_run_paged_kv_sequence_batch.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_run_paged_kv_sequence_batch.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_run_paged_kv_sequence_batch_codes.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_run_paged_kv_sequence_batch_codes.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_online_batch_reset.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_online_batch_reset.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_online_batch_add_sequence.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_online_batch_add_sequence.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_online_batch_step.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_online_batch_step.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_online_batch_cancel.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_online_batch_cancel.restype = ctypes.c_int
+        self.lib.qwen3_tts_codegen_online_batch_get_stats_json.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.qwen3_tts_codegen_online_batch_get_stats_json.restype = ctypes.c_int
         self.lib.qwen3_tts_codegen_get_last_remote_embed_used.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_int64),
@@ -512,6 +641,292 @@ class NativeCodegenRunner:
         self.last_remote_embed = self.last_remote_embed_used()
         self.last_timing_json = self.timing_json()
         return out[: int(out_count.value)].copy(), float(elapsed_ms.value)
+
+    def run_paged_kv_repeat_batch(
+        self,
+        sequence: np.ndarray,
+        tts_pad_embed: np.ndarray,
+        batch_size: int,
+        max_new_tokens: int,
+        min_new_tokens: int,
+        repetition_penalty: float,
+        vocab_size: int,
+        num_code_groups: int,
+        eos_token_id: int,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+        seed: int = 0,
+    ) -> dict:
+        sequence = np.ascontiguousarray(sequence, dtype=np.float32)
+        tts_pad_embed = np.ascontiguousarray(tts_pad_embed, dtype=np.float32)
+        batch_size = int(batch_size)
+        if sequence.ndim != 3 or sequence.shape[0] != 1:
+            raise ValueError("sequence must have shape [1, prompt_len, hidden]")
+        if tts_pad_embed.shape != (1, 1, sequence.shape[-1]):
+            raise ValueError("tts_pad_embed must have shape [1, 1, hidden]")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        out_counts = np.zeros((batch_size,), dtype=np.int64)
+        out_ttft_ms = np.full((batch_size,), -1.0, dtype=np.float64)
+        out_last_token_ms = np.zeros((batch_size,), dtype=np.float64)
+        elapsed_ms = ctypes.c_double(0.0)
+        err = ctypes.c_char_p()
+        self.reset_profile()
+        rc = self.lib.qwen3_tts_codegen_run_paged_kv_repeat_batch(
+            self.handle,
+            sequence.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ctypes.c_int64(sequence.shape[1]),
+            ctypes.c_int64(sequence.shape[2]),
+            tts_pad_embed.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ctypes.c_int64(batch_size),
+            ctypes.c_int64(max_new_tokens),
+            ctypes.c_int64(min_new_tokens),
+            ctypes.c_float(repetition_penalty),
+            ctypes.c_int64(vocab_size),
+            ctypes.c_int64(num_code_groups),
+            ctypes.c_int64(eos_token_id),
+            ctypes.c_int64(1 if do_sample else 0),
+            ctypes.c_int64(top_k),
+            ctypes.c_float(top_p),
+            ctypes.c_float(temperature),
+            ctypes.c_uint64(seed),
+            out_counts.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            out_ttft_ms.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            out_last_token_ms.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            ctypes.byref(elapsed_ms),
+            ctypes.byref(err),
+        )
+        self._check(rc, err)
+        self.last_remote_embed = self.last_remote_embed_used()
+        self.last_profile_json = self.profile_json()
+        self.last_timing_json = self.timing_json()
+        return {
+            "batch_size": batch_size,
+            "counts": out_counts.copy(),
+            "ttft_ms": out_ttft_ms.copy(),
+            "last_token_ms": out_last_token_ms.copy(),
+            "elapsed_ms": float(elapsed_ms.value),
+            "profile": self.last_profile_json,
+            "timing": self.last_timing_json,
+        }
+
+    def run_paged_kv_sequence_batch(
+        self,
+        sequences: list[np.ndarray] | tuple[np.ndarray, ...],
+        tts_pad_embed: np.ndarray,
+        max_new_tokens: int,
+        min_new_tokens: int,
+        repetition_penalty: float,
+        vocab_size: int,
+        num_code_groups: int,
+        eos_token_id: int,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+        seed: int = 0,
+        return_codes: bool = False,
+    ) -> dict:
+        if not sequences:
+            raise ValueError("sequences must not be empty")
+        prepared: list[np.ndarray] = []
+        prompt_lens: list[int] = []
+        hidden_size: int | None = None
+        for sequence in sequences:
+            array = np.ascontiguousarray(sequence, dtype=np.float32)
+            if array.ndim == 3 and array.shape[0] == 1:
+                array = array.reshape(array.shape[1], array.shape[2])
+            if array.ndim != 2:
+                raise ValueError("each sequence must have shape [1, prompt_len, hidden] or [prompt_len, hidden]")
+            if hidden_size is None:
+                hidden_size = int(array.shape[-1])
+            elif int(array.shape[-1]) != hidden_size:
+                raise ValueError("all sequences must have the same hidden size")
+            if int(array.shape[0]) <= 0:
+                raise ValueError("prompt_len must be positive")
+            prepared.append(array)
+            prompt_lens.append(int(array.shape[0]))
+        assert hidden_size is not None
+        tts_pad_embed = np.ascontiguousarray(tts_pad_embed, dtype=np.float32)
+        if tts_pad_embed.shape != (1, 1, hidden_size):
+            raise ValueError("tts_pad_embed must have shape [1, 1, hidden]")
+        flat = np.ascontiguousarray(np.concatenate(prepared, axis=0), dtype=np.float32)
+        prompt_lens_array = np.ascontiguousarray(prompt_lens, dtype=np.int64)
+        batch_size = int(prompt_lens_array.shape[0])
+        out_counts = np.zeros((batch_size,), dtype=np.int64)
+        out_codes = np.full((batch_size, max_new_tokens, num_code_groups), -1, dtype=np.int64)
+        out_ttft_ms = np.full((batch_size,), -1.0, dtype=np.float64)
+        out_last_token_ms = np.zeros((batch_size,), dtype=np.float64)
+        elapsed_ms = ctypes.c_double(0.0)
+        err = ctypes.c_char_p()
+        self.reset_profile()
+        common_args = (
+            self.handle,
+            flat.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ctypes.c_int64(flat.shape[0]),
+            prompt_lens_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            ctypes.c_int64(hidden_size),
+            tts_pad_embed.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ctypes.c_int64(batch_size),
+            ctypes.c_int64(max_new_tokens),
+            ctypes.c_int64(min_new_tokens),
+            ctypes.c_float(repetition_penalty),
+            ctypes.c_int64(vocab_size),
+            ctypes.c_int64(num_code_groups),
+            ctypes.c_int64(eos_token_id),
+            ctypes.c_int64(1 if do_sample else 0),
+            ctypes.c_int64(top_k),
+            ctypes.c_float(top_p),
+            ctypes.c_float(temperature),
+            ctypes.c_uint64(seed),
+            out_counts.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+        )
+        if return_codes:
+            rc = self.lib.qwen3_tts_codegen_run_paged_kv_sequence_batch_codes(
+                *common_args,
+                out_codes.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                out_ttft_ms.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                out_last_token_ms.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                ctypes.byref(elapsed_ms),
+                ctypes.byref(err),
+            )
+        else:
+            rc = self.lib.qwen3_tts_codegen_run_paged_kv_sequence_batch(
+                *common_args,
+                out_ttft_ms.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                out_last_token_ms.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                ctypes.byref(elapsed_ms),
+                ctypes.byref(err),
+            )
+        self._check(rc, err)
+        self.last_remote_embed = self.last_remote_embed_used()
+        self.last_profile_json = self.profile_json()
+        self.last_timing_json = self.timing_json()
+        result = {
+            "batch_size": batch_size,
+            "prompt_lens": prompt_lens_array.copy(),
+            "counts": out_counts.copy(),
+            "ttft_ms": out_ttft_ms.copy(),
+            "last_token_ms": out_last_token_ms.copy(),
+            "elapsed_ms": float(elapsed_ms.value),
+            "profile": self.last_profile_json,
+            "timing": self.last_timing_json,
+        }
+        if return_codes:
+            result["codes"] = out_codes.copy()
+        return result
+
+    def online_batch_reset(self, max_cache_blocks: int) -> None:
+        err = ctypes.c_char_p()
+        rc = self.lib.qwen3_tts_codegen_online_batch_reset(
+            self.handle,
+            ctypes.c_int64(int(max_cache_blocks)),
+            ctypes.byref(err),
+        )
+        self._check(rc, err)
+
+    def online_batch_add_sequence(
+        self,
+        sequence: np.ndarray,
+        tts_pad_embed: np.ndarray,
+        max_new_tokens: int,
+        min_new_tokens: int,
+        repetition_penalty: float,
+        vocab_size: int,
+        num_code_groups: int,
+        eos_token_id: int,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+        seed: int = 0,
+    ) -> int:
+        sequence = np.ascontiguousarray(sequence, dtype=np.float32)
+        if sequence.ndim == 3 and sequence.shape[0] == 1:
+            sequence = sequence.reshape(sequence.shape[1], sequence.shape[2])
+        if sequence.ndim != 2:
+            raise ValueError("sequence must have shape [1, prompt_len, hidden] or [prompt_len, hidden]")
+        tts_pad_embed = np.ascontiguousarray(tts_pad_embed, dtype=np.float32)
+        if tts_pad_embed.shape != (1, 1, sequence.shape[-1]):
+            raise ValueError("tts_pad_embed must have shape [1, 1, hidden]")
+        request_id = ctypes.c_int64(0)
+        err = ctypes.c_char_p()
+        rc = self.lib.qwen3_tts_codegen_online_batch_add_sequence(
+            self.handle,
+            sequence.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ctypes.c_int64(sequence.shape[0]),
+            ctypes.c_int64(sequence.shape[1]),
+            tts_pad_embed.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ctypes.c_int64(max_new_tokens),
+            ctypes.c_int64(min_new_tokens),
+            ctypes.c_float(repetition_penalty),
+            ctypes.c_int64(vocab_size),
+            ctypes.c_int64(num_code_groups),
+            ctypes.c_int64(eos_token_id),
+            ctypes.c_int64(1 if do_sample else 0),
+            ctypes.c_int64(top_k),
+            ctypes.c_float(top_p),
+            ctypes.c_float(temperature),
+            ctypes.c_uint64(seed),
+            ctypes.byref(request_id),
+            ctypes.byref(err),
+        )
+        self._check(rc, err)
+        return int(request_id.value)
+
+    def online_batch_step(self, max_decode_batch: int, max_events: int, num_code_groups: int) -> dict:
+        out_ids = np.zeros((max_events,), dtype=np.int64)
+        out_kinds = np.zeros((max_events,), dtype=np.int64)
+        out_codes = np.full((max_events, num_code_groups), -1, dtype=np.int64)
+        out_count = ctypes.c_int64(0)
+        elapsed_ms = ctypes.c_double(0.0)
+        err = ctypes.c_char_p()
+        rc = self.lib.qwen3_tts_codegen_online_batch_step(
+            self.handle,
+            ctypes.c_int64(int(max_decode_batch)),
+            ctypes.c_int64(int(max_events)),
+            out_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            out_kinds.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            out_codes.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            ctypes.byref(out_count),
+            ctypes.byref(elapsed_ms),
+            ctypes.byref(err),
+        )
+        self._check(rc, err)
+        count = int(out_count.value)
+        self.last_profile_json = self.profile_json()
+        self.last_timing_json = self.timing_json()
+        return {
+            "ids": out_ids[:count].copy(),
+            "kinds": out_kinds[:count].copy(),
+            "codes": out_codes[:count].copy(),
+            "elapsed_ms": float(elapsed_ms.value),
+            "profile": self.last_profile_json,
+            "timing": self.last_timing_json,
+        }
+
+    def online_batch_cancel(self, request_id: int) -> None:
+        err = ctypes.c_char_p()
+        rc = self.lib.qwen3_tts_codegen_online_batch_cancel(
+            self.handle,
+            ctypes.c_int64(int(request_id)),
+            ctypes.byref(err),
+        )
+        self._check(rc, err)
+
+    def online_batch_stats(self) -> dict:
+        out = ctypes.c_char_p()
+        err = ctypes.c_char_p()
+        rc = self.lib.qwen3_tts_codegen_online_batch_get_stats_json(self.handle, ctypes.byref(out), ctypes.byref(err))
+        self._check(rc, err)
+        try:
+            raw = out.value.decode("utf-8") if out.value else "{}"
+            return json.loads(raw)
+        finally:
+            if out:
+                self.lib.qwen3_tts_codegen_free_error(out)
 
     def set_stream_decoders(
         self,

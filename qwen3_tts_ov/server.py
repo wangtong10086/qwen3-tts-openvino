@@ -15,6 +15,7 @@ import numpy as np
 import soundfile as sf
 
 from .fast_path import evaluate_fast_path
+from .default_policy import resolve_generation_defaults, sampled_online_default_passed
 from .manifest import (
     AUTO_IR_DIR,
     DEFAULT_VOICE_DESIGN_IR_DIR,
@@ -72,7 +73,9 @@ from .runtime import (
     build_assistant_text,
     build_instruct_text,
     build_ref_text,
+    custom_voice_default_repetition_penalty,
 )
+from .online_batch import OnlineBatchConfig, OnlineBatchScheduler
 from .web_client import WEB_CLIENT_HTML
 
 
@@ -95,11 +98,27 @@ FASTEST_SHORT_OUTPUT_MAX_NEW_TOKENS = 48
 TEXT_TOKEN_RE = re.compile(r"\s+|[A-Za-z0-9]+|[\u3400-\u9fff]|[^\s]")
 SOFT_SPLIT_PUNCT = set("。！？!?；;，,、")
 HARD_SPLIT_PUNCT = set("。！？!?；;\n")
+FULL_CONTEXT_CODEC_FRAMES_PER_10_TEXT_UNITS = 36
+FULL_CONTEXT_CODEC_FRAME_MARGIN = 48
 CONTINUOUS_LONG_OUTPUT_BUCKET = 384
 CONTINUOUS_LONG_OUTPUT_VARIANT = "int8_sym_fused"
 CONTINUOUS_LONG_OUTPUT_PREFERRED_VARIANTS = ("int8_sym_fused_cachedsub", "int8_sym_fused")
 CONTINUOUS_LONG_OUTPUT_PAGED_QUALITY_VARIANTS = ("int8_sym_paged_kv_seed", "int8_asym_paged_kv_seed", "fp16")
 LONG_TEXT_QUALITY_SUMMARY_PATH = "outputs/long_text_quality/quality_summary.json"
+ONLINE_BATCH_QUALITY_SUMMARY_PATH = "outputs/online_batch_quality/quality_summary.json"
+PREFILL_QUALITY_SUMMARY_PATH = "outputs/prefill_quality/quality_summary.json"
+ONLINE_BATCH_QUALITY_ENV = "QWEN3_TTS_OV_ONLINE_BATCHING_QUALITY"
+PREFILL_QUALITY_ENV = "QWEN3_TTS_OV_PREFILL_QUALITY"
+ONLINE_BATCH_PREFILL_MODES = {"serial", "dynamic_ragged", "bucketed_padded", "auto"}
+ONLINE_BATCH_POLICIES = {
+    "low_latency": {"max_batch_size": 2, "wait_ms": 1.0, "max_concurrent_tts": 2},
+    "balanced": {"max_batch_size": 4, "wait_ms": 2.0, "max_concurrent_tts": 4},
+    "throughput": {"max_batch_size": 8, "wait_ms": 4.0, "max_concurrent_tts": 8},
+}
+PRODUCTION_PROFILE = "minimal-online-paged-kv"
+ONLINE_BATCH_GRAPH_VARIANT = "int8_sym_batch_fused_gqa"
+ONLINE_BATCH_SUBCODE_MODE = "cached"
+VOICE_CLONE_XVECTOR_ONLINE_BATCH_ENV = "QWEN3_TTS_OV_ENABLE_VOICE_CLONE_XVECTOR_ONLINE_BATCHING"
 LONG_TEXT_PROFILE_ENV_MAP = {
     "native_codegen_device": "QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE",
     "native_paged_kv_precision": "QWEN3_TTS_OV_NATIVE_PAGED_KV_PRECISION",
@@ -114,6 +133,16 @@ LONG_TEXT_PROFILE_ENV_MAP = {
     "native_paged_kv": "QWEN3_TTS_OV_NATIVE_PAGED_KV",
     "native_buffer_reuse": "QWEN3_TTS_OV_NATIVE_BUFFER_REUSE",
     "native_dynamic_quantization_group_size": "QWEN3_TTS_OV_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE",
+    "native_subcode_next_embed_graph": "QWEN3_TTS_OV_NATIVE_SUBCODE_NEXT_EMBED_GRAPH",
+    "native_split_subcode_remote_next_embed": "QWEN3_TTS_OV_NATIVE_SPLIT_SUBCODE_REMOTE_NEXT_EMBED",
+    "native_require_split_subcode_remote_next_embed": "QWEN3_TTS_OV_NATIVE_REQUIRE_SPLIT_SUBCODE_REMOTE_NEXT_EMBED",
+    "native_decode_step_prebind": "QWEN3_TTS_OV_NATIVE_DECODE_STEP_PREBIND",
+    "native_require_decode_step_prebind": "QWEN3_TTS_OV_NATIVE_REQUIRE_DECODE_STEP_PREBIND",
+    "native_continuous_batch_policy": "QWEN3_TTS_OV_NATIVE_CONTINUOUS_BATCH_POLICY",
+    "native_batch_decode_unroll": "QWEN3_TTS_OV_NATIVE_BATCH_DECODE_UNROLL",
+    "native_prefill_mode": "QWEN3_TTS_OV_NATIVE_PREFILL_MODE",
+    "native_batch_prefill": "QWEN3_TTS_OV_NATIVE_BATCH_PREFILL",
+    "native_batch_prefill_subcode": "QWEN3_TTS_OV_NATIVE_BATCH_PREFILL_SUBCODE",
 }
 WEB_AUTO_SEGMENT_UNITS = 64
 WEB_AUTO_SEGMENT_MAX_NEW_TOKENS = 240
@@ -125,6 +154,152 @@ DEFAULT_MAX_VRAM_RATIO_GPU = 0.80
 DEFAULT_MAX_VRAM_RATIO_CPU = 1.00
 DEFAULT_NPU_OFFLOAD = "off"
 MIN_AUTO_CONTINUOUS_PROMPT_TOKENS = 256
+
+
+def _graph_ref_exists(ir_dir: Path, graph_ref: object) -> bool:
+    return isinstance(graph_ref, str) and bool(graph_ref) and (ir_dir / graph_ref).exists()
+
+
+def _online_variant_graphs(manifest: dict, graph_variant: str) -> tuple[dict, dict]:
+    graphs = manifest.get("graphs") or {}
+    variant_graphs = ((manifest.get("graph_variants") or {}).get(graph_variant) or {}).get("graphs") or {}
+    return graphs if isinstance(graphs, dict) else {}, variant_graphs if isinstance(variant_graphs, dict) else {}
+
+
+def _select_online_graph(ir_dir: Path, graphs: dict, variant_graphs: dict, *keys: str) -> tuple[str | None, str | None]:
+    for key in keys:
+        graph_ref = variant_graphs.get(key)
+        if _graph_ref_exists(ir_dir, graph_ref):
+            return str(graph_ref), key
+        graph_ref = graphs.get(key)
+        if _graph_ref_exists(ir_dir, graph_ref):
+            return str(graph_ref), key
+    return None, None
+
+
+def online_batch_graph_capability(
+    ir_dir: str | Path,
+    manifest: dict,
+    *,
+    graph_variant: str = ONLINE_BATCH_GRAPH_VARIANT,
+    subcode_mode: str = ONLINE_BATCH_SUBCODE_MODE,
+    sampled_batch_subcode: str = "auto",
+    max_batch_size: int = 1,
+    require_fused_decode: bool = True,
+) -> dict:
+    """Return whether an exported IR can use the native online batch scheduler."""
+
+    ir_dir = Path(ir_dir)
+    graph_variant = str(graph_variant or ONLINE_BATCH_GRAPH_VARIANT)
+    subcode_mode = str(subcode_mode or ONLINE_BATCH_SUBCODE_MODE).strip().replace("-", "_").lower()
+    sampled_batch_subcode = str(sampled_batch_subcode or "off").strip().replace("-", "_").lower()
+    max_batch_size = max(1, int(max_batch_size))
+    graphs, variant_graphs = _online_variant_graphs(manifest, graph_variant)
+    paged_seed_graphs = {}
+    base_paged = graphs.get("paged_kv_seed")
+    variant_paged = variant_graphs.get("paged_kv_seed")
+    if isinstance(base_paged, dict):
+        paged_seed_graphs.update(base_paged)
+    if isinstance(variant_paged, dict):
+        paged_seed_graphs.update(variant_paged)
+
+    seed_key = None
+    for candidate in ("talker_stateful_batch_gqa", "talker_stateful_batch"):
+        if _graph_ref_exists(ir_dir, paged_seed_graphs.get(candidate)):
+            seed_key = candidate
+            break
+    if seed_key is None:
+        return {
+            "ok": False,
+            "reason": "missing:paged_kv_seed.talker_stateful_batch_gqa|talker_stateful_batch",
+            "graph_variant": graph_variant,
+            "subcode_mode": subcode_mode,
+            "sampled_batch_subcode": sampled_batch_subcode,
+        }
+    fused_key = "fused_cache_step_batch_gqa" if seed_key.endswith("_gqa") else "fused_cache_step_batch"
+    fused_available = _graph_ref_exists(ir_dir, paged_seed_graphs.get(fused_key))
+    if require_fused_decode and not fused_available:
+        return {
+            "ok": False,
+            "reason": f"missing:paged_kv_seed.{fused_key}",
+            "graph_variant": graph_variant,
+            "subcode_mode": subcode_mode,
+            "sampled_batch_subcode": sampled_batch_subcode,
+            "seed_key": seed_key,
+            "fused_decode_required": bool(require_fused_decode),
+        }
+
+    if subcode_mode == "cached_exact":
+        subcode_graph, subcode_key = _select_online_graph(ir_dir, graphs, variant_graphs, "subcode_greedy_cached_exact")
+        batch_subcode_graph, batch_subcode_key = _select_online_graph(
+            ir_dir,
+            graphs,
+            variant_graphs,
+            "subcode_greedy_cached_exact_batch",
+        )
+    elif subcode_mode == "recompute_exact":
+        subcode_graph, subcode_key = _select_online_graph(ir_dir, graphs, variant_graphs, "subcode_greedy_exact")
+        batch_subcode_graph, batch_subcode_key = None, None
+    elif subcode_mode == "recompute":
+        subcode_graph, subcode_key = _select_online_graph(ir_dir, graphs, variant_graphs, "subcode_greedy")
+        batch_subcode_graph, batch_subcode_key = None, None
+    else:
+        subcode_graph, subcode_key = _select_online_graph(
+            ir_dir,
+            graphs,
+            variant_graphs,
+            "subcode_greedy_cached",
+            "subcode_greedy",
+        )
+        batch_subcode_graph, batch_subcode_key = _select_online_graph(
+            ir_dir,
+            graphs,
+            variant_graphs,
+            "subcode_greedy_cached_batch",
+        )
+    if not subcode_graph:
+        return {
+            "ok": False,
+            "reason": "missing:subcode_greedy",
+            "graph_variant": graph_variant,
+            "subcode_mode": subcode_mode,
+            "sampled_batch_subcode": sampled_batch_subcode,
+            "seed_key": seed_key,
+            "fused_key": fused_key,
+            "fused_available": bool(fused_available),
+            "fused_decode_required": bool(require_fused_decode),
+        }
+    batch_subcode_required = sampled_batch_subcode in {"on", "verify"} and max_batch_size > 1
+    if batch_subcode_required and not batch_subcode_graph:
+        expected = "subcode_greedy_cached_exact_batch" if subcode_mode == "cached_exact" else "subcode_greedy_cached_batch"
+        return {
+            "ok": False,
+            "reason": f"missing:{expected}",
+            "graph_variant": graph_variant,
+            "subcode_mode": subcode_mode,
+            "sampled_batch_subcode": sampled_batch_subcode,
+            "seed_key": seed_key,
+            "fused_key": fused_key,
+            "fused_available": bool(fused_available),
+            "fused_decode_required": bool(require_fused_decode),
+            "subcode_key": subcode_key,
+            "batch_subcode_required": True,
+        }
+    return {
+        "ok": True,
+        "reason": "ready",
+        "graph_variant": graph_variant,
+        "subcode_mode": subcode_mode,
+        "sampled_batch_subcode": sampled_batch_subcode,
+        "seed_key": seed_key,
+        "fused_key": fused_key,
+        "fused_available": bool(fused_available),
+        "fused_decode_required": bool(require_fused_decode),
+        "subcode_key": subcode_key,
+        "batch_subcode_key": batch_subcode_key,
+        "batch_subcode_available": bool(batch_subcode_graph),
+        "batch_subcode_required": bool(batch_subcode_required),
+    }
 DEFAULT_KV_CACHE_RESERVE_MIN_MB = 1024
 DEFAULT_KV_CACHE_RESERVE_MAX_MB = 4096
 DEFAULT_KV_CACHE_RESERVE_FRACTION = 0.20
@@ -165,6 +340,116 @@ def request_bool(value, default: bool = False) -> bool:
 
 def request_x_vector_only(request: dict) -> bool:
     return request_bool(request.get("x_vector_only_mode", request.get("x_vector_only", False)), False)
+
+
+def request_voice_clone_prompt_is_xvector_only(request: dict) -> bool:
+    if request_x_vector_only(request):
+        return True
+    prompt = request.get("voice_clone_prompt")
+    if prompt is None:
+        return False
+    if isinstance(prompt, dict):
+        def empty_ref_code_item(item) -> bool:
+            if item is None:
+                return True
+            try:
+                return len(item) == 0
+            except TypeError:
+                return False
+
+        ref_code = prompt.get("ref_code")
+        ref_code_missing = ref_code is None
+        if isinstance(ref_code, list):
+            ref_code_missing = len(ref_code) == 0 or any(empty_ref_code_item(item) for item in ref_code)
+        x_vector_flags = prompt.get("x_vector_only_mode")
+        if x_vector_flags is not None:
+            if isinstance(x_vector_flags, list):
+                if any(request_bool(item, False) for item in x_vector_flags):
+                    return True
+            elif request_bool(x_vector_flags, False):
+                return True
+        icl_flags = prompt.get("icl_mode")
+        if icl_flags is not None:
+            if isinstance(icl_flags, list):
+                if not all(request_bool(item, False) for item in icl_flags):
+                    return True
+            elif not request_bool(icl_flags, True):
+                return True
+        if ref_code_missing:
+            return True
+        return False
+    ref_code = getattr(prompt, "ref_code", None)
+    if ref_code is None:
+        return True
+    try:
+        return int(np.asarray(ref_code).shape[0]) == 0
+    except Exception:
+        return False
+
+
+CUSTOM_VOICE_ONLINE_BATCH_VALIDATED_SPEAKERS = {"vivian"}
+CUSTOM_VOICE_ONLINE_BATCH_VALIDATED_LANGUAGES = {"", "auto", "chinese", "zh", "zh-cn", "mandarin"}
+CUSTOM_VOICE_ONLINE_BATCH_RP12_VALIDATED = {("ryan", "english")}
+CUSTOM_VOICE_ONLINE_BATCH_RP12_MIN = 1.2
+
+
+def custom_voice_online_batch_supported(request: dict, gen_kwargs: dict | None = None) -> tuple[bool, str]:
+    speaker = str(request.get("speaker") or "").strip().lower()
+    language = str(request.get("language") or "Auto").strip().lower()
+    if speaker in CUSTOM_VOICE_ONLINE_BATCH_VALIDATED_SPEAKERS:
+        if language not in CUSTOM_VOICE_ONLINE_BATCH_VALIDATED_LANGUAGES:
+            return False, f"custom_voice_online_batch_language_not_validated:{language or 'missing'}"
+        return True, "custom_voice_online_batch_validated"
+    if (speaker, language) in CUSTOM_VOICE_ONLINE_BATCH_RP12_VALIDATED:
+        generation = gen_kwargs if gen_kwargs is not None else request.get("generation")
+        generation = generation if isinstance(generation, dict) else {}
+        try:
+            repetition_penalty = float(
+                generation.get(
+                    "repetition_penalty",
+                    request.get("repetition_penalty", 0.0),
+                )
+            )
+        except (TypeError, ValueError):
+            repetition_penalty = 0.0
+        if repetition_penalty >= CUSTOM_VOICE_ONLINE_BATCH_RP12_MIN:
+            return True, "custom_voice_online_batch_validated_rp12"
+        return False, f"custom_voice_online_batch_requires_repetition_penalty:{speaker}:{language}:1.2"
+    if speaker not in CUSTOM_VOICE_ONLINE_BATCH_VALIDATED_SPEAKERS:
+        return False, f"custom_voice_online_batch_speaker_not_validated:{speaker or 'missing'}"
+    if language not in CUSTOM_VOICE_ONLINE_BATCH_VALIDATED_LANGUAGES:
+        return False, f"custom_voice_online_batch_language_not_validated:{language or 'missing'}"
+    return True, "custom_voice_online_batch_validated"
+
+
+def online_batch_prompt_family_supported(
+    request: dict,
+    mode_name: str,
+    *,
+    long_output: bool = False,
+    voice_clone_xvector_env: str | None = None,
+    gen_kwargs: dict | None = None,
+) -> tuple[bool, str]:
+    """Check whether the public prompt family can enter the vLLM-like scheduler.
+
+    This gate is deliberately capability-scoped, not quality-subset-scoped.
+    Quality evidence is reported separately; production routing should not
+    silently fall back to a non-production runtime based on old subset allow-lists.
+    """
+
+    if request.get("_prefix_codes") is not None:
+        return False, "prefix_codes_not_supported"
+    if mode_name not in {"voice_design", "custom_voice", "voice_clone"}:
+        return False, f"unsupported_mode:{mode_name}"
+    if mode_name == "custom_voice":
+        if not request.get("speaker"):
+            return False, "custom_voice_speaker_required"
+        return True, "vllm_like_custom_voice_supported"
+    if mode_name == "voice_clone":
+        if request_voice_clone_prompt_is_xvector_only(request):
+            return True, "vllm_like_voice_clone_xvector_supported"
+        return True, "vllm_like_voice_clone_supported"
+    return True, "vllm_like_voice_design_supported"
 
 
 def native_paged_kv_requested() -> bool:
@@ -428,6 +713,8 @@ def manifest_supports_mode_payload(manifest: dict, mode_name: str) -> bool:
         return model_type == "custom_voice"
     if mode_name == "voice_clone":
         return model_type in {"base", "voice_clone"}
+    if mode_name == "base":
+        return model_type in {"base", "voice_clone"}
     return False
 
 
@@ -596,16 +883,17 @@ def kv_cache_budget_context(
             "kv_cache_planner_available": False,
             "kv_cache_planner_unavailable_reason": "missing_" + ",".join(missing),
         }
-    heads = int(heads_value)
-    head_dim = int(head_dim_value)
-    layers = int(layers_value)
-    model_context = int(context_value)
+    heads = int(heads_value or 0)
+    head_dim = int(head_dim_value or 0)
+    layers = int(layers_value or 0)
+    model_context = int(context_value or 0)
     bytes_per_element = kv_cache_precision_bytes(kv_cache_precision)
     input_bytes_per_element = kv_cache_precision_bytes(kv_cache_input_precision)
     bytes_per_block = int(2 * layers * heads * head_dim * block_size * bytes_per_element)
     conservative_bytes_per_block = int(2 * layers * heads * head_dim * block_size * max(bytes_per_element, input_bytes_per_element))
     planner_bytes_per_block = conservative_bytes_per_block
-    reserve_bytes, reserve_policy = parse_memory_megabytes(kv_cache_reserve_mb, total_bytes=total_memory)
+    total_memory_bytes = int(total_memory or 0)
+    reserve_bytes, reserve_policy = parse_memory_megabytes(kv_cache_reserve_mb, total_bytes=total_memory_bytes)
     max_blocks, max_blocks_policy = parse_optional_positive_int(kv_cache_max_blocks, name="--kv-cache-max-blocks")
     return {
         "kv_cache_planner_available": True,
@@ -613,7 +901,7 @@ def kv_cache_budget_context(
         "kv_cache_planner_estimated_config": bool(estimated_fields),
         "kv_cache_planner_estimated_fields": estimated_fields,
         "kv_cache_planner_config_source": config_source,
-        "gpu_total_memory_bytes": int(total_memory),
+        "gpu_total_memory_bytes": total_memory_bytes,
         "model_context_tokens": int(model_context),
         "kv_cache_layers": int(layers),
         "kv_cache_heads_for_budget": int(heads),
@@ -797,6 +1085,68 @@ def estimated_codec_frames_for_text(text: str, requested_max_new_tokens: int, *,
     return int(min(max(int(requested_max_new_tokens), estimate), cap))
 
 
+def request_has_generation_value(request: dict, name: str) -> bool:
+    generation_obj = request.get("generation")
+    generation: dict = generation_obj if isinstance(generation_obj, dict) else {}
+    return name in generation or name in request
+
+
+def estimated_full_context_max_new_tokens(text: str) -> int:
+    units = speech_text_unit_count(text)
+    estimate = ((units * FULL_CONTEXT_CODEC_FRAMES_PER_10_TEXT_UNITS + 9) // 10) + FULL_CONTEXT_CODEC_FRAME_MARGIN
+    return int(max(FASTEST_SHORT_OUTPUT_MAX_NEW_TOKENS, estimate))
+
+
+def full_context_generation_budget(
+    request: dict,
+    mode_name: str,
+    requested_max_new_tokens: int,
+    *,
+    max_generation_tokens_available: int | None = None,
+) -> dict:
+    """Resolve full-context generation length without expanding to the full KV capacity."""
+
+    try:
+        requested = max(0, int(requested_max_new_tokens))
+    except Exception:
+        requested = FASTEST_SHORT_OUTPUT_MAX_NEW_TOKENS
+    text = normalize_tts_text(str(request.get("text") or request.get("input") or ""))
+    text_units = speech_text_unit_count(text)
+    estimated = estimated_full_context_max_new_tokens(text)
+    explicit = request_has_generation_value(request, "max_new_tokens")
+    desired = requested if explicit else estimated
+    source = "explicit_request" if explicit else "text_token_estimate"
+
+    cap_raw = os.environ.get("QWEN3_TTS_OV_FULL_CONTEXT_MAX_NEW_TOKENS_CAP", "").strip()
+    cap = None
+    if cap_raw:
+        try:
+            cap = int(cap_raw)
+        except ValueError:
+            cap = None
+        if cap is not None and cap > 0 and desired > cap:
+            desired = int(cap)
+            source = f"{source}_env_cap"
+
+    capacity = None if max_generation_tokens_available is None else max(0, int(max_generation_tokens_available))
+    effective = int(desired if capacity is None else min(int(desired), int(capacity)))
+    return {
+        "requested_max_new_tokens": int(requested),
+        "max_new_tokens": int(effective),
+        "effective_max_new_tokens": int(effective),
+        "generation_stop_condition": "eos_or_effective_max_new_tokens_or_context_limit",
+        "generation_max_new_tokens_source": source,
+        "full_context_mode": str(mode_name),
+        "full_context_text_units": int(text_units),
+        "estimated_full_context_max_new_tokens": int(estimated),
+        "full_context_max_new_tokens_cap": int(cap) if cap is not None and cap > 0 else None,
+        "requested_generation_over_budget": bool(capacity is not None and int(desired) > int(capacity)),
+        "remaining_generation_tokens": (
+            max(0, int(capacity) - int(effective)) if capacity is not None else None
+        ),
+    }
+
+
 ZH_DIGITS = "零一二三四五六七八九"
 
 
@@ -957,15 +1307,15 @@ def continuous_long_output_metadata(enabled: bool) -> dict:
         "long_text_mode": "full_ar" if enabled else "short_ar",
         "segmented": False,
         "continuous_backend": (
-            "native_paged_attention"
+            "vllm_like_online_scheduler_paged_kv"
             if enabled and paged_requested
-            else ("single_prompt_full_ar_reference" if enabled else "fastest_native_bucket")
+            else ("vllm_like_online_scheduler" if enabled else "vllm_like_online_scheduler_short")
         ),
         "continuous_bucket": None if enabled and paged_requested else (CONTINUOUS_LONG_OUTPUT_BUCKET if enabled else None),
         "paged_kv": bool(enabled and paged_requested),
-        "paged_kv_backend": "native_paged_attention" if enabled and paged_requested else "unavailable",
+        "paged_kv_backend": "vllm_like_online_scheduler" if enabled and paged_requested else "unavailable",
         "paged_kv_unavailable_reason": "" if enabled and paged_requested else (
-            f"disabled by default for long full-AR correctness; set {ENABLE_PAGED_LONG_AR_ENV}=1 after parity validation"
+            f"disabled by {ENABLE_PAGED_LONG_AR_ENV}=0"
             if enabled
             else PAGED_KV_UNAVAILABLE_REASON
         ),
@@ -1143,8 +1493,8 @@ def wav_bytes(audio, sample_rate: int) -> bytes:
         return handle.getvalue()
 
 
-def normalize_mode(mode: str) -> str:
-    key = (mode or "").replace("-", "_")
+def normalize_mode(mode: object) -> str:
+    key = str(mode or "").replace("-", "_")
     if key not in {"voice_design", "custom_voice", "voice_clone"}:
         raise ValueError("mode must be voice_design, custom_voice, or voice_clone")
     return key
@@ -1453,34 +1803,77 @@ def profile_int(value, default: int) -> int:
         return int(default)
 
 
-def generation_kwargs(request: dict, default_repetition_penalty: float = 1.05) -> dict:
+def generation_kwargs(
+    request: dict,
+    default_repetition_penalty: float = 1.05,
+    *,
+    allow_sampled_defaults: bool = True,
+) -> dict:
     generation = request.get("generation") or {}
     def value(name: str, default):
         return generation.get(name, request.get(name, default))
+    def has_value(name: str) -> bool:
+        return name in generation or name in request
 
     max_new_tokens = int(value("max_new_tokens", 512))
     mode_name_for_defaults = normalize_mode(request.get("mode"))
     text_for_defaults = normalize_tts_text(str(request.get("text") or ""))
-    long_voice_design = mode_name_for_defaults == "voice_design" and needs_continuous_long_output(
+    long_full_context = mode_name_for_defaults in {"voice_design", "custom_voice", "voice_clone"} and needs_continuous_long_output(
         text_for_defaults,
         max_new_tokens,
     )
     if request_uses_full_context_text(request):
-        long_voice_design = mode_name_for_defaults == "voice_design"
+        long_full_context = mode_name_for_defaults in {"voice_design", "custom_voice", "voice_clone"}
     default_penalty = default_repetition_penalty
     try:
-        if long_voice_design:
+        if long_full_context:
             default_penalty = max(float(default_penalty), 1.05)
+        if long_full_context and mode_name_for_defaults == "custom_voice":
+            default_penalty = max(float(default_penalty), 1.2)
     except Exception:
         pass
-    do_sample_default = bool(long_voice_design)
+    explicit_do_sample = bool(value("do_sample", False)) if has_value("do_sample") else None
+    if mode_name_for_defaults == "voice_clone" and request_x_vector_only(request) and explicit_do_sample is None:
+        explicit_do_sample = False
+    explicit_repetition_penalty = float(value("repetition_penalty", default_penalty)) if has_value("repetition_penalty") else None
+    if allow_sampled_defaults:
+        do_sample, repetition_penalty, default_metadata = resolve_generation_defaults(
+            explicit_do_sample=explicit_do_sample,
+            explicit_repetition_penalty=explicit_repetition_penalty,
+            fallback_do_sample=bool(long_full_context),
+            fallback_repetition_penalty=float(default_penalty),
+            sampled_repetition_penalty=max(float(default_penalty), 1.05),
+        )
+    else:
+        do_sample = bool(explicit_do_sample) if explicit_do_sample is not None else bool(long_full_context)
+        repetition_penalty = (
+            float(explicit_repetition_penalty)
+            if explicit_repetition_penalty is not None
+            else float(default_penalty)
+        )
+        default_metadata = {
+            "default_policy": "sampled_online",
+            "default_policy_passed": False,
+            "default_policy_source": "disabled_for_norepeat_profile",
+            "do_sample_defaulted": explicit_do_sample is None,
+            "repetition_penalty_defaulted": explicit_repetition_penalty is None,
+        }
+    if mode_name_for_defaults == "custom_voice" and explicit_repetition_penalty is None:
+        repetition_penalty = custom_voice_default_repetition_penalty(
+            text_for_defaults,
+            do_sample=bool(do_sample),
+            repetition_penalty=float(repetition_penalty),
+            explicit_repetition_penalty=False,
+        )
+    request["_generation_default_metadata"] = default_metadata
+    request["_generation_seed"] = int(value("seed", 0))
     return {
         "max_new_tokens": max_new_tokens,
         "min_new_tokens": int(value("min_new_tokens", 2)),
-        "repetition_penalty": float(value("repetition_penalty", default_penalty)),
+        "repetition_penalty": float(repetition_penalty),
         "max_prompt_tokens": int(value("max_prompt_tokens", 512)),
         "progress_interval": int(value("progress_interval", 0)),
-        "do_sample": bool(value("do_sample", do_sample_default)),
+        "do_sample": bool(do_sample),
         "top_k": int(value("top_k", 50)),
         "top_p": float(value("top_p", 1.0)),
         "temperature": float(value("temperature", 0.9)),
@@ -1495,12 +1888,37 @@ def normalize_chunk_strategy(strategy: str | None, default: str = "low_latency")
     return normalized
 
 
+def resolve_auto_chunk_strategy(request: dict, strategy: str) -> tuple[str, dict]:
+    normalized = normalize_chunk_strategy(strategy)
+    if normalized != "auto":
+        return normalized, {}
+    text_units = speech_text_unit_count(request.get("text") or "")
+    full_context = request_uses_full_context_text(request)
+    resolved = "stable" if full_context or text_units > 48 else "short_compute"
+    return resolved, {
+        "chunk_strategy_requested": "auto",
+        "auto_chunk_strategy": True,
+        "auto_chunk_text_units": int(text_units),
+    }
+
+
+def effective_forced_stream_strategy(request: dict, forced_strategy: str | None) -> str | None:
+    if not forced_strategy:
+        return None
+    stream_obj = request.get("stream")
+    stream: dict = stream_obj if isinstance(stream_obj, dict) else {}
+    if "chunk_strategy" in stream or "chunk_strategy" in request:
+        return None
+    return forced_strategy
+
+
 def stream_kwargs(
     request: dict,
     default_strategy: str = "low_latency",
     forced_strategy: str | None = None,
 ) -> dict:
-    stream = request.get("stream") if isinstance(request.get("stream"), dict) else {}
+    stream_obj = request.get("stream")
+    stream: dict = stream_obj if isinstance(stream_obj, dict) else {}
     fmt = stream.get("format", "pcm_s16le")
     if fmt != "pcm_s16le":
         raise ValueError("only stream.format=pcm_s16le is supported")
@@ -1513,8 +1931,19 @@ def stream_kwargs(
             "chunk_frames": int(defaults["chunk_frames"]),
             "left_context_frames": int(defaults["left_context_frames"]),
         }
+    requested_strategy = stream.get("chunk_strategy", request.get("chunk_strategy", default_strategy))
+    strategy, auto_meta = resolve_auto_chunk_strategy(request, requested_strategy)
+    explicit_chunk_params = any(name in stream or name in request for name in ("initial_chunk_frames", "chunk_frames", "left_context_frames"))
+    if auto_meta and not explicit_chunk_params:
+        defaults = DEFAULT_STREAM_CHUNK_STRATEGIES[strategy]
+        return {
+            "chunk_strategy": strategy,
+            "initial_chunk_frames": int(defaults["initial_chunk_frames"]),
+            "chunk_frames": int(defaults["chunk_frames"]),
+            "left_context_frames": int(defaults["left_context_frames"]),
+        }
     kwargs = {
-        "chunk_strategy": stream.get("chunk_strategy", request.get("chunk_strategy", default_strategy)),
+        "chunk_strategy": strategy,
     }
     for name in ("initial_chunk_frames", "chunk_frames", "left_context_frames"):
         if name in stream:
@@ -1525,7 +1954,8 @@ def stream_kwargs(
 
 
 def include_chunk_metadata(request: dict) -> bool:
-    stream = request.get("stream") if isinstance(request.get("stream"), dict) else {}
+    stream_obj = request.get("stream")
+    stream: dict = stream_obj if isinstance(stream_obj, dict) else {}
     return bool(stream.get("include_chunk_metadata", request.get("include_chunk_metadata", False)))
 
 
@@ -1601,11 +2031,10 @@ def stream_metadata(
     default_strategy: str = "low_latency",
     forced_strategy: str | None = None,
 ) -> dict:
-    stream = request.get("stream") if isinstance(request.get("stream"), dict) else {}
-    strategy = normalize_chunk_strategy(
-        forced_strategy if forced_strategy else stream.get("chunk_strategy", request.get("chunk_strategy")),
-        default_strategy,
-    )
+    stream_obj = request.get("stream")
+    stream: dict = stream_obj if isinstance(stream_obj, dict) else {}
+    requested_strategy = forced_strategy if forced_strategy else stream.get("chunk_strategy", request.get("chunk_strategy", default_strategy))
+    strategy, auto_meta = resolve_auto_chunk_strategy(request, requested_strategy)
     defaults = DEFAULT_STREAM_CHUNK_STRATEGIES[strategy]
     if forced_strategy:
         return {
@@ -1617,6 +2046,7 @@ def stream_metadata(
         }
     return {
         "chunk_strategy": strategy,
+        **auto_meta,
         "initial_chunk_frames": int(stream.get("initial_chunk_frames", request.get("initial_chunk_frames", defaults["initial_chunk_frames"]))),
         "chunk_frames": int(stream.get("chunk_frames", request.get("chunk_frames", defaults["chunk_frames"]))),
         "left_context_frames": int(stream.get("left_context_frames", request.get("left_context_frames", defaults["left_context_frames"]))),
@@ -1629,6 +2059,8 @@ def playback_buffer_for_stream(metadata: dict, configured_ms: int) -> int:
         "realtime": 1900,
         "smooth": 1900,
         "stable": 1500,
+        "short_compute": 1500,
+        "auto": 1500,
         "balanced": 500,
         "low_latency": 500,
     }.get(strategy, 500)
@@ -1730,10 +2162,33 @@ def create_app(
     preload_modes: str | list[str] = "voice_design",
     preload_buckets: str = "warmup",
     warmup_text: str = "你好，这是一次流式预热。",
+    warmup_speaker: str = "Vivian",
+    warmup_ref_audio: str | Path | None = None,
+    warmup_ref_text: str | None = None,
+    warmup_ref_text_file: str | Path | None = None,
     warmup_strategy: str = "low_latency",
+    runtime_residency: str = "lazy",
     recommended_playback_buffer_ms: int = 250,
     realtime_profile: str = FASTEST_PROFILE_NAME,
-    max_concurrent_tts: int = 1,
+    max_concurrent_tts: int = 0,
+    online_batching: str = "on",
+    online_batch_policy: str = "balanced",
+    online_batch_max_size: int = 0,
+    online_batch_wait_ms: float = -1.0,
+    online_batch_max_queue_delay_ms: float = 0.0,
+    online_batch_scheduler: str = "layered",
+    online_batch_prefill_mode: str = "serial",
+    online_batch_prefill_quality_summary: str | Path | None = None,
+    online_batch_prefill_seq_buckets: str = "128,256,512,1024",
+    online_batch_prefill_batch_buckets: str = "1,2,4,8",
+    online_batch_decode_batch_buckets: str = "1,2,4,8,16",
+    online_batch_max_num_batched_tokens: int = 32,
+    online_batch_fused_decode: str = "off",
+    online_batch_warmup_requests: int = 4,
+    online_batch_warmup_tokens: int = 16,
+    sampled_batch_subcode: str = "off",
+    online_batch_continuous_subcode: str = "auto",
+    online_batch_max_cache_blocks: str | int | None = "auto",
     long_output_memory_policy: str = "stable",
     max_continuous_prompt_tokens: str | int = "auto",
     max_vram_ratio: str | int | float | None = None,
@@ -1752,6 +2207,12 @@ def create_app(
 
     app = FastAPI(title="Qwen3-TTS OpenVINO Engine")
     model_root = Path(model_root)
+    runtime_residency = str(runtime_residency or "lazy").strip().replace("-", "_").lower()
+    if runtime_residency not in {"lazy", "all"}:
+        raise ValueError("--runtime-residency must be lazy or all")
+    resolved_warmup_ref_text = str(warmup_ref_text or "")
+    if warmup_ref_text_file and not resolved_warmup_ref_text:
+        resolved_warmup_ref_text = Path(warmup_ref_text_file).expanduser().read_text(encoding="utf-8").strip()
     requested_encoder_device = encoder_device
     requested_prompt_device = prompt_device
     npu_offload_decision = resolve_npu_offload(
@@ -1800,7 +2261,7 @@ def create_app(
     kv_cache_preallocation = str(kv_cache_preallocation or "auto").strip().lower().replace("_", "-")
     if kv_cache_preallocation not in {"auto", "off", "static"}:
         raise ValueError("kv_cache_preallocation must be auto, off, or static")
-    max_concurrent_tts = max(1, int(max_concurrent_tts))
+    requested_max_concurrent_tts = int(max_concurrent_tts)
     usm_retry_count = max(0, int(usm_retry_count))
     auto_profile = select_auto_realtime_profile() if realtime_profile == "auto" else None
     if auto_profile:
@@ -2025,25 +2486,13 @@ def create_app(
         cache_step,
         graph_variant,
     )
+    allow_sampled_generation_defaults = not str(realtime_profile).strip().lower().endswith("-norepeat")
     effective_unroll = effective_codegen_unroll(mode, graph_variant, codegen_unroll)
     codegen_schedule = normalize_codegen_schedule(codegen_schedule)
     codegen_decode_unroll = str(codegen_decode_unroll or "off").strip().lower().replace("_", "-")
     if codegen_decode_unroll not in {"off", "auto", "on"}:
         raise ValueError("codegen_decode_unroll must be one of off, auto, on")
-    variant_profile_names = {
-        "int8_fused": "int8",
-        "int8_sym_fused": "int8-sym",
-        "fp16_fused_rms": "fp16-fused-rms",
-        "int8_sym_fused_rms": "int8-sym-fused-rms",
-        "fp16_sdpa_fused_rms": "fp16-sdpa-fused-rms",
-        "int8_sym_sdpa_fused_rms": "int8-sym-sdpa-fused-rms",
-        "fp16_fused_cachedsub": "fp16-fused-cachedsub",
-        "int8_sym_fused_cachedsub": "int8-sym-fused-cachedsub",
-        "fp16_sdpa_fused_cachedsub": "fp16-sdpa-fused-cachedsub",
-        "int8_sym_sdpa_fused_cachedsub": "int8-sym-sdpa-fused-cachedsub",
-        "fp16_fused_cachedsub_rms": "fp16-fused-cachedsub-rms",
-        "int8_sym_fused_cachedsub_rms": "int8-sym-fused-cachedsub-rms",
-    }
+    variant_profile_names: dict[str, str] = {}
     reported_realtime_profile = (
         realtime_profile
         if realtime_profile == FASTEST_PROFILE_NAME or is_fastest_or_norepeat_mode(realtime_profile)
@@ -2051,8 +2500,191 @@ def create_app(
     )
     default_stream_strategy = FASTEST_CHUNK_STRATEGY if reported_realtime_profile == FASTEST_PROFILE_NAME else "low_latency"
     forced_stream_strategy = FASTEST_CHUNK_STRATEGY if reported_realtime_profile == FASTEST_PROFILE_NAME else None
+    online_batching = str(online_batching or "on").strip().replace("-", "_").lower()
+    if online_batching not in {"auto", "on"}:
+        raise ValueError("--online-batching must be one of auto, on")
+    online_batch_policy = str(online_batch_policy or "balanced").strip().replace("-", "_").lower()
+    if online_batch_policy not in ONLINE_BATCH_POLICIES:
+        raise ValueError("--online-batch-policy must be one of low_latency, balanced, throughput")
+    online_policy_defaults = ONLINE_BATCH_POLICIES[online_batch_policy]
+    requested_online_batch_max_size = int(online_batch_max_size)
+    requested_online_batch_wait_ms = float(online_batch_wait_ms)
+    online_batch_max_size = (
+        max(1, requested_online_batch_max_size)
+        if requested_online_batch_max_size > 0
+        else int(online_policy_defaults["max_batch_size"])
+    )
+    online_batch_wait_ms = (
+        max(0.0, requested_online_batch_wait_ms)
+        if requested_online_batch_wait_ms >= 0.0
+        else float(online_policy_defaults["wait_ms"])
+    )
+    online_batch_max_queue_delay_ms = max(0.0, float(online_batch_max_queue_delay_ms))
+    sampled_batch_subcode = str(sampled_batch_subcode or "auto").strip().replace("-", "_").lower()
+    if sampled_batch_subcode not in {"auto", "off", "verify", "on"}:
+        raise ValueError("--sampled-batch-subcode must be one of auto, off, verify, on")
+    online_batch_continuous_subcode = str(online_batch_continuous_subcode or "auto").strip().replace("-", "_").lower()
+    if online_batch_continuous_subcode not in {"auto", "off", "on"}:
+        raise ValueError("--online-batch-continuous-subcode must be one of auto, off, on")
+    online_batch_fused_decode = str(online_batch_fused_decode or "auto").strip().replace("-", "_").lower()
+    if online_batch_fused_decode not in {"auto", "on", "off"}:
+        raise ValueError("--online-batch-fused-decode must be one of auto, on, off")
+    effective_online_batch_fused_decode = online_batch_fused_decode != "off"
+    online_batch_warmup_requests = max(0, int(online_batch_warmup_requests))
+    online_batch_warmup_tokens = max(1, int(online_batch_warmup_tokens))
+    online_batch_scheduler = str(online_batch_scheduler or "layered").strip().replace("-", "_").lower()
+    if online_batch_scheduler != "layered":
+        raise ValueError("--online-batch-scheduler is fixed to layered in the production sidecar")
+    requested_online_batch_prefill_mode = str(online_batch_prefill_mode or "serial").strip().replace("-", "_").lower()
+    if requested_online_batch_prefill_mode not in ONLINE_BATCH_PREFILL_MODES:
+        raise ValueError("--online-batch-prefill-mode must be one of serial, dynamic-ragged, bucketed-padded, auto")
+    online_batch_max_num_batched_tokens = max(1, int(online_batch_max_num_batched_tokens))
+
+    def resolve_online_batch_continuous_subcode(
+        effective_sampled_subcode: str,
+        capability: dict | None = None,
+    ) -> tuple[bool, str]:
+        if online_batch_continuous_subcode == "on":
+            return True, "configured:on"
+        if online_batch_continuous_subcode == "off":
+            return False, "configured:off"
+        if str(effective_sampled_subcode or "").strip().lower() == "on":
+            return True, "auto:sampled_batch_subcode_on"
+        if capability and capability.get("batch_subcode_available") and online_batch_max_size > 1:
+            return True, "auto:batch_subcode_available"
+        return False, "auto:batch_subcode_unavailable"
+
+    def prefill_quality_summary_path() -> Path:
+        if online_batch_prefill_quality_summary:
+            return Path(online_batch_prefill_quality_summary)
+        return Path(os.environ.get("QWEN3_TTS_OV_PREFILL_QUALITY_SUMMARY") or PREFILL_QUALITY_SUMMARY_PATH)
+
+    def prefill_quality_mode() -> tuple[str, str]:
+        env_value = os.environ.get(PREFILL_QUALITY_ENV)
+        if env_value is not None:
+            normalized = str(env_value).strip().replace("-", "_").lower()
+            if normalized in {"0", "false", "off", "no", "fail", "failed"}:
+                return "serial", f"env:{PREFILL_QUALITY_ENV}:disabled"
+            if normalized in {"1", "true", "on", "yes", "pass", "passed", "dynamic", "dynamic_ragged"}:
+                return "dynamic_ragged", f"env:{PREFILL_QUALITY_ENV}"
+            if normalized == "bucketed_padded":
+                return "bucketed_padded", f"env:{PREFILL_QUALITY_ENV}"
+        path = prefill_quality_summary_path()
+        if not path.exists():
+            return "serial", f"missing:{path}"
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                summary = json.load(handle)
+        except Exception as exc:
+            return "serial", f"invalid:{path}:{exc}"
+        candidates = []
+        winner = summary.get("winner")
+        if isinstance(winner, dict):
+            candidates.append(winner)
+        results = summary.get("results")
+        if isinstance(results, list):
+            candidates.extend(item for item in results if isinstance(item, dict))
+        for preferred in ("bucketed_padded", "dynamic_ragged"):
+            for item in candidates:
+                mode = str(item.get("prefill_mode") or item.get("mode") or "").strip().replace("-", "_").lower()
+                if mode != preferred:
+                    continue
+                if bool(item.get("passed", item.get("quality_passed", False))):
+                    return preferred, f"summary:{path}:{preferred}"
+        if bool(summary.get("passed", summary.get("quality_passed", False))):
+            mode = str(summary.get("prefill_mode") or "dynamic_ragged").strip().replace("-", "_").lower()
+            if mode in {"bucketed_padded", "dynamic_ragged"}:
+                return mode, f"summary:{path}:{mode}"
+        return "serial", f"summary_not_passed:{path}"
+
+    if requested_online_batch_prefill_mode == "auto":
+        online_batch_prefill_mode, online_batch_prefill_source = prefill_quality_mode()
+        if online_batch_prefill_mode == "bucketed_padded":
+            online_batch_prefill_mode = "serial"
+            online_batch_prefill_source += ":bucketed_padded_graphs_unavailable"
+    else:
+        online_batch_prefill_mode = requested_online_batch_prefill_mode
+        online_batch_prefill_source = "explicit"
+
+    def online_quality_summary_path() -> Path:
+        return Path(os.environ.get("QWEN3_TTS_OV_ONLINE_BATCHING_QUALITY_SUMMARY") or ONLINE_BATCH_QUALITY_SUMMARY_PATH)
+
+    def online_batch_quality_passed() -> tuple[bool, str]:
+        env_value = os.environ.get(ONLINE_BATCH_QUALITY_ENV)
+        if env_value is not None:
+            normalized = str(env_value).strip().lower()
+            if normalized in {"1", "true", "on", "yes", "pass", "passed", "require"}:
+                return True, f"env:{ONLINE_BATCH_QUALITY_ENV}"
+            if normalized in {"0", "false", "off", "no", "fail", "failed"}:
+                return False, f"env:{ONLINE_BATCH_QUALITY_ENV}"
+        path = online_quality_summary_path()
+        if not path.exists():
+            default_ok, default_source = sampled_online_default_passed()
+            if default_ok:
+                return True, default_source
+            return False, f"missing:{path}"
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                summary = json.load(handle)
+        except Exception as exc:
+            return False, f"invalid:{path}:{exc}"
+        if bool(summary.get("passed", summary.get("quality_passed", False))):
+            return True, f"summary:{path}"
+        results = summary.get("results")
+        if isinstance(results, list):
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("feature") or item.get("profile") or item.get("mode") or "").lower()
+                if "online" in name and bool(item.get("passed", item.get("quality_passed", False))):
+                    return True, f"summary:{path}"
+        default_ok, default_source = sampled_online_default_passed()
+        if default_ok:
+            return True, default_source
+        return False, f"summary_not_passed:{path}"
+
+    default_policy_ok, default_policy_source = sampled_online_default_passed()
+    online_quality_ok, online_quality_source = online_batch_quality_passed()
+    online_batching_auto_enabled = True
+    if online_batching == "on":
+        online_batching_enabled = True
+    elif online_batching == "auto":
+        online_batching_enabled = online_batching_auto_enabled
+    else:
+        online_batching_enabled = True
+    if requested_max_concurrent_tts <= 0:
+        max_concurrent_tts = (
+            int(online_policy_defaults["max_concurrent_tts"])
+            if (online_batching == "on" or online_batching_enabled)
+            else 1
+        )
+    else:
+        max_concurrent_tts = max(1, requested_max_concurrent_tts)
+
+    def parse_online_cache_blocks(value) -> int:
+        if value is None or str(value).strip().lower() == "auto":
+            for candidate in (
+                default_budget_metadata.get("preallocated_kv_blocks"),
+                default_budget_metadata.get("kv_cache_max_blocks"),
+                os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_STATIC_BLOCKS"),
+            ):
+                if candidate is None:
+                    continue
+                try:
+                    parsed = int(candidate)
+                except Exception:
+                    continue
+                if parsed > 0:
+                    return parsed
+            return 2048
+        return max(1, int(value))
+
+    effective_online_batch_max_cache_blocks = parse_online_cache_blocks(online_batch_max_cache_blocks)
     runtimes = {}
-    tts_semaphore = threading.BoundedSemaphore(max_concurrent_tts)
+    online_batching_allows_concurrency = (online_batching == "on" or online_batching_enabled) and int(max_concurrent_tts) > 1
+    tts_semaphore = threading.BoundedSemaphore(max(1, int(max_concurrent_tts)))
+    online_schedulers: dict[tuple, OnlineBatchScheduler] = {}
+    runtime_prompt_locks: dict[int, threading.Lock] = {}
     active_tts_requests = 0
     active_tts_lock = threading.Lock()
     model_download_lock = threading.Lock()
@@ -2064,6 +2696,7 @@ def create_app(
         "enabled": bool(warmup),
         "status": "pending" if warmup else "disabled",
         "realtime_profile": reported_realtime_profile,
+        "production_profile": PRODUCTION_PROFILE,
         "auto_profile": auto_profile,
         "mode": mode,
         "cache_kernel": cache_kernel,
@@ -2099,14 +2732,51 @@ def create_app(
         "native_codegen_fusion": os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION") or "split",
         "native_paged_kv_split_subcode_mode": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE_MODE") or "cached",
         "native_paged_kv_score_aggregation": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION") or "on",
+        "native_subcode_next_embed_graph": os.environ.get("QWEN3_TTS_OV_NATIVE_SUBCODE_NEXT_EMBED_GRAPH") or "off",
+        "native_split_subcode_remote_next_embed": (
+            os.environ.get("QWEN3_TTS_OV_NATIVE_SPLIT_SUBCODE_REMOTE_NEXT_EMBED") or "off"
+        ),
+        "native_decode_step_prebind": os.environ.get("QWEN3_TTS_OV_NATIVE_DECODE_STEP_PREBIND") or "off",
         "native_paged_kv_hybrid": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID") or "off",
         "native_paged_kv_hybrid_prefix_frames": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID_PREFIX_FRAMES") or "48",
         "native_codegen_device": os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE") or device,
         "native_subcode_device": os.environ.get("QWEN3_TTS_OV_NATIVE_SUBCODE_DEVICE") or "same",
         "native_ov_profile": os.environ.get("QWEN3_TTS_OV_NATIVE_PERF_COUNT") or "off",
         "warmup_strategy": warmup_strategy,
+        "warmup_speaker": warmup_speaker,
+        "warmup_ref_audio": str(warmup_ref_audio) if warmup_ref_audio else None,
+        "warmup_ref_text_available": bool(resolved_warmup_ref_text),
+        "runtime_residency": runtime_residency,
         "default_stream_strategy": default_stream_strategy,
         "forced_stream_strategy": forced_stream_strategy,
+        "online_batching": online_batching,
+        "online_batch_graph_variant": ONLINE_BATCH_GRAPH_VARIANT,
+        "online_batch_subcode_mode": ONLINE_BATCH_SUBCODE_MODE,
+        "online_batching_enabled": online_batching_enabled,
+        "online_batching_allows_concurrency": online_batching_allows_concurrency,
+        "online_batching_quality_ok": online_quality_ok,
+        "online_batching_quality_source": online_quality_source,
+        "inference_backend": "vllm_like_online_scheduler",
+        "generation_fallback_allowed": False,
+        "generation_fallback_policy": "hard_error",
+        "online_batch_policy": online_batch_policy,
+        "online_batch_max_size": online_batch_max_size,
+        "online_batch_wait_ms": online_batch_wait_ms,
+        "online_batch_max_queue_delay_ms": online_batch_max_queue_delay_ms,
+        "online_batch_scheduler": online_batch_scheduler,
+        "online_batch_prefill_mode": online_batch_prefill_mode,
+        "online_batch_prefill_mode_source": online_batch_prefill_source,
+        "online_batch_prefill_seq_buckets": online_batch_prefill_seq_buckets,
+        "online_batch_prefill_batch_buckets": online_batch_prefill_batch_buckets,
+        "online_batch_decode_batch_buckets": online_batch_decode_batch_buckets,
+        "online_batch_max_num_batched_tokens": online_batch_max_num_batched_tokens,
+        "online_batch_fused_decode": online_batch_fused_decode,
+        "online_batch_fused_decode_enabled": effective_online_batch_fused_decode,
+        "online_batch_warmup_requests": online_batch_warmup_requests,
+        "online_batch_warmup_tokens": online_batch_warmup_tokens,
+        "sampled_batch_subcode": sampled_batch_subcode,
+        "online_batch_continuous_subcode": online_batch_continuous_subcode,
+        "online_batch_max_cache_blocks": effective_online_batch_max_cache_blocks,
         "device": device,
         "decoder_device": decoder_device or device,
         "encoder_device": encoder_device,
@@ -2120,10 +2790,12 @@ def create_app(
         "loaded_modes": [],
         "errors": {},
         "runtimes": {},
+        "online_batch_by_mode": {},
     }
     app.state.model_downloads = model_download_jobs
     app.state.memory = {
         "long_output_memory_policy": long_output_memory_policy,
+        "production_profile": PRODUCTION_PROFILE,
         "kv_cache_profile": effective_kv_cache_profile,
         "requested_kv_cache_profile": kv_cache_profile,
         "native_paged_kv_precision": effective_kv_cache_precision,
@@ -2134,6 +2806,32 @@ def create_app(
         "kv_cache_preallocation": kv_cache_preallocation,
         **default_budget_planner_metadata,
         "max_concurrent_tts": max_concurrent_tts,
+        "max_concurrent_tts_requested": requested_max_concurrent_tts,
+        "online_batching": online_batching,
+        "online_batching_enabled": online_batching_enabled,
+        "online_batching_allows_concurrency": online_batching_allows_concurrency,
+        "inference_backend": "vllm_like_online_scheduler",
+        "generation_fallback_allowed": False,
+        "generation_fallback_policy": "hard_error",
+        "default_policy_passed": default_policy_ok,
+        "default_policy_source": default_policy_source,
+        "online_batch_policy": online_batch_policy,
+        "online_batch_max_size": online_batch_max_size,
+        "online_batch_wait_ms": online_batch_wait_ms,
+        "online_batch_max_queue_delay_ms": online_batch_max_queue_delay_ms,
+        "online_batch_scheduler": online_batch_scheduler,
+        "online_batch_prefill_mode": online_batch_prefill_mode,
+        "online_batch_prefill_mode_source": online_batch_prefill_source,
+        "online_batch_prefill_seq_buckets": online_batch_prefill_seq_buckets,
+        "online_batch_prefill_batch_buckets": online_batch_prefill_batch_buckets,
+        "online_batch_decode_batch_buckets": online_batch_decode_batch_buckets,
+        "online_batch_max_num_batched_tokens": online_batch_max_num_batched_tokens,
+        "online_batch_fused_decode": online_batch_fused_decode,
+        "online_batch_fused_decode_enabled": effective_online_batch_fused_decode,
+        "online_batch_warmup_requests": online_batch_warmup_requests,
+        "online_batch_warmup_tokens": online_batch_warmup_tokens,
+        "sampled_batch_subcode": sampled_batch_subcode,
+        "online_batch_max_cache_blocks": effective_online_batch_max_cache_blocks,
         "active_tts_requests": 0,
         "max_continuous_prompt_tokens": effective_max_continuous_prompt_tokens,
         "max_continuous_prompt_tokens_config": max_continuous_prompt_tokens_config,
@@ -2150,9 +2848,14 @@ def create_app(
         "last_usm_retry_count": 0,
         "last_released_native_runners": 0,
         "last_released_native_buffers": 0,
+        "runtime_residency": runtime_residency,
+        "active_runtime_mode": None,
+        "runtime_eviction_count": 0,
+        "last_runtime_eviction": None,
     }
     runtime_stream_metadata = {
         "realtime_profile": reported_realtime_profile,
+        "production_profile": PRODUCTION_PROFILE,
         "device": device,
         "decoder_device": decoder_device or device,
         "encoder_device": encoder_device,
@@ -2194,6 +2897,11 @@ def create_app(
         "native_codegen_fusion": os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN_FUSION") or "split",
         "native_paged_kv_split_subcode_mode": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE_MODE") or "cached",
         "native_paged_kv_score_aggregation": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION") or "on",
+        "native_subcode_next_embed_graph": os.environ.get("QWEN3_TTS_OV_NATIVE_SUBCODE_NEXT_EMBED_GRAPH") or "off",
+        "native_split_subcode_remote_next_embed": (
+            os.environ.get("QWEN3_TTS_OV_NATIVE_SPLIT_SUBCODE_REMOTE_NEXT_EMBED") or "off"
+        ),
+        "native_decode_step_prebind": os.environ.get("QWEN3_TTS_OV_NATIVE_DECODE_STEP_PREBIND") or "off",
         "native_paged_kv_hybrid": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID") or "off",
         "native_paged_kv_hybrid_prefix_frames": os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_HYBRID_PREFIX_FRAMES") or "48",
         "native_codegen_device": os.environ.get("QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE") or device,
@@ -2205,6 +2913,33 @@ def create_app(
         "long_output_bucket": None if native_paged_kv_requested() else CONTINUOUS_LONG_OUTPUT_BUCKET,
         "long_output_memory_policy": long_output_memory_policy,
         "max_concurrent_tts": max_concurrent_tts,
+        "max_concurrent_tts_requested": requested_max_concurrent_tts,
+        "online_batching": online_batching,
+        "online_batch_graph_variant": ONLINE_BATCH_GRAPH_VARIANT,
+        "online_batch_subcode_mode": ONLINE_BATCH_SUBCODE_MODE,
+        "online_batching_enabled": online_batching_enabled,
+        "online_batching_allows_concurrency": online_batching_allows_concurrency,
+        "online_batching_quality_ok": online_quality_ok,
+        "online_batching_quality_source": online_quality_source,
+        "inference_backend": "vllm_like_online_scheduler",
+        "generation_fallback_allowed": False,
+        "generation_fallback_policy": "hard_error",
+        "online_batch_policy": online_batch_policy,
+        "online_batch_max_size": online_batch_max_size,
+        "online_batch_wait_ms": online_batch_wait_ms,
+        "online_batch_max_queue_delay_ms": online_batch_max_queue_delay_ms,
+        "online_batch_scheduler": online_batch_scheduler,
+        "online_batch_prefill_mode": online_batch_prefill_mode,
+        "online_batch_prefill_mode_source": online_batch_prefill_source,
+        "online_batch_prefill_seq_buckets": online_batch_prefill_seq_buckets,
+        "online_batch_prefill_batch_buckets": online_batch_prefill_batch_buckets,
+        "online_batch_decode_batch_buckets": online_batch_decode_batch_buckets,
+        "online_batch_max_num_batched_tokens": online_batch_max_num_batched_tokens,
+        "online_batch_fused_decode": online_batch_fused_decode,
+        "online_batch_fused_decode_enabled": effective_online_batch_fused_decode,
+        "sampled_batch_subcode": sampled_batch_subcode,
+        "online_batch_continuous_subcode": online_batch_continuous_subcode,
+        "online_batch_max_cache_blocks": effective_online_batch_max_cache_blocks,
         "max_continuous_prompt_tokens": effective_max_continuous_prompt_tokens,
         "max_continuous_prompt_tokens_config": max_continuous_prompt_tokens_config,
         "effective_max_continuous_prompt_tokens": effective_max_continuous_prompt_tokens,
@@ -2230,6 +2965,8 @@ def create_app(
         if mode_name == "custom_voice":
             return model_type == "custom_voice"
         if mode_name == "voice_clone":
+            return model_type in {"base", "voice_clone"}
+        if mode_name == "base":
             return model_type in {"base", "voice_clone"}
         return False
 
@@ -2516,7 +3253,7 @@ def create_app(
         )
         if key not in runtimes:
             runtimes[key] = OpenVINOQwen3TTS(
-                ir_dir,
+                str(ir_dir),
                 device=device,
                 decoder_device=decoder_device,
                 encoder_device=encoder_device,
@@ -2555,6 +3292,322 @@ def create_app(
             continuous_long_output=continuous_long_output,
             prefer_paged_kv=prefer_paged_kv,
         )
+
+    def request_online_batching_mode(request: dict) -> str:
+        raw_batching = request.get("batching")
+        batching = raw_batching if isinstance(raw_batching, dict) else {}
+        explicit = batching.get("enabled", request.get("online_batching"))
+        if explicit is not None:
+            return "on" if request_bool(explicit, False) else "off"
+        return online_batching
+
+    def online_batch_graph_settings() -> tuple[str, str]:
+        return (
+            os.environ.get("QWEN3_TTS_OV_ONLINE_BATCH_GRAPH_VARIANT") or ONLINE_BATCH_GRAPH_VARIANT,
+            os.environ.get("QWEN3_TTS_OV_ONLINE_BATCH_SUBCODE_MODE")
+            or os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SPLIT_SUBCODE_MODE")
+            or ONLINE_BATCH_SUBCODE_MODE,
+        )
+
+    def resolve_runtime_sampled_batch_subcode(runtime: OpenVINOQwen3TTS) -> tuple[str, str]:
+        online_graph_variant, online_subcode_mode = online_batch_graph_settings()
+        configured = sampled_batch_subcode
+        if configured != "auto":
+            return configured, f"configured:{configured}"
+        capability = online_batch_graph_capability(
+            runtime.ir_dir,
+            runtime.manifest,
+            graph_variant=online_graph_variant,
+            subcode_mode=online_subcode_mode,
+            sampled_batch_subcode="on",
+            max_batch_size=online_batch_max_size,
+            require_fused_decode=bool(effective_online_batch_fused_decode),
+        )
+        if capability.get("ok"):
+            return "on", "auto:batch_subcode_available"
+        row_by_row_capability = online_batch_graph_capability(
+            runtime.ir_dir,
+            runtime.manifest,
+            graph_variant=online_graph_variant,
+            subcode_mode=online_subcode_mode,
+            sampled_batch_subcode="off",
+            max_batch_size=online_batch_max_size,
+            require_fused_decode=bool(effective_online_batch_fused_decode),
+        )
+        if row_by_row_capability.get("ok"):
+            return "off", f"auto:batch_subcode_unavailable:{capability.get('reason')}"
+        return "off", f"auto:online_batch_unavailable:{row_by_row_capability.get('reason')}"
+
+    def runtime_online_batch_capability(runtime: OpenVINOQwen3TTS) -> dict:
+        online_graph_variant, online_subcode_mode = online_batch_graph_settings()
+        effective_sampled_subcode, sampled_reason = resolve_runtime_sampled_batch_subcode(runtime)
+        capability = online_batch_graph_capability(
+            runtime.ir_dir,
+            runtime.manifest,
+            graph_variant=online_graph_variant,
+            subcode_mode=online_subcode_mode,
+            sampled_batch_subcode=effective_sampled_subcode,
+            max_batch_size=online_batch_max_size,
+            require_fused_decode=bool(effective_online_batch_fused_decode),
+        )
+        capability["sampled_batch_subcode_config"] = sampled_batch_subcode
+        capability["sampled_batch_subcode_effective"] = effective_sampled_subcode
+        capability["sampled_batch_subcode_reason"] = sampled_reason
+        return capability
+
+    def online_batching_decision(
+        request: dict,
+        mode_name: str,
+        gen_kwargs: dict,
+        long_output: bool,
+        runtime: OpenVINOQwen3TTS,
+    ) -> tuple[bool, str]:
+        requested = request_online_batching_mode(request)
+        if requested == "off":
+            raise ValueError("online batching is the only sidecar generation backend; request-level online_batching=false is not supported")
+        prompt_family_ok, prompt_family_reason = online_batch_prompt_family_supported(
+            request,
+            mode_name,
+            long_output=long_output,
+            gen_kwargs=gen_kwargs,
+        )
+        if not prompt_family_ok:
+            raise ValueError(f"online batching requested but {prompt_family_reason}")
+        capability = runtime_online_batch_capability(runtime)
+        if not capability.get("ok"):
+            reason = f"online_batch_graphs_unavailable:{capability.get('reason')}"
+            raise ValueError(f"online batching requested but {reason}")
+        return True, f"enabled:{capability.get('sampled_batch_subcode_effective')}:{capability.get('reason')}"
+
+    def get_online_scheduler(runtime: OpenVINOQwen3TTS) -> OnlineBatchScheduler:
+        online_graph_variant, online_subcode_mode = online_batch_graph_settings()
+        capability = runtime_online_batch_capability(runtime)
+        if not capability.get("ok"):
+            raise RuntimeError(f"online batching requires compatible graphs: {capability.get('reason')}")
+        effective_sampled_subcode = str(capability.get("sampled_batch_subcode_effective") or "off")
+        effective_continuous_subcode, continuous_subcode_reason = resolve_online_batch_continuous_subcode(
+            effective_sampled_subcode,
+            capability,
+        )
+        key = (
+            str(Path(runtime.ir_dir).resolve()),
+            str(getattr(runtime, "device", device)),
+            str(getattr(runtime, "cache_dir", "")),
+            online_graph_variant,
+            online_subcode_mode,
+            effective_sampled_subcode,
+            int(online_batch_max_size),
+            float(online_batch_wait_ms),
+            float(online_batch_max_queue_delay_ms),
+            int(effective_online_batch_max_cache_blocks),
+            str(effective_kv_cache_precision),
+            int(effective_kv_cache_block_size),
+            online_batch_scheduler,
+            online_batch_prefill_mode,
+            online_batch_prefill_seq_buckets,
+            online_batch_prefill_batch_buckets,
+            online_batch_decode_batch_buckets,
+            int(online_batch_max_num_batched_tokens),
+            bool(effective_online_batch_fused_decode),
+            bool(effective_continuous_subcode),
+        )
+        scheduler = online_schedulers.get(key)
+        if scheduler is None:
+            scheduler = OnlineBatchScheduler(
+                runtime,
+                OnlineBatchConfig(
+                    max_batch_size=online_batch_max_size,
+                    wait_ms=online_batch_wait_ms,
+                    max_queue_delay_ms=online_batch_max_queue_delay_ms,
+                    max_cache_blocks=effective_online_batch_max_cache_blocks,
+                    scheduler=online_batch_scheduler,
+                    max_num_batched_tokens=online_batch_max_num_batched_tokens,
+                    prefill_mode=online_batch_prefill_mode,
+                    prefill_seq_buckets=online_batch_prefill_seq_buckets,
+                    prefill_batch_buckets=online_batch_prefill_batch_buckets,
+                    decode_batch_buckets=online_batch_decode_batch_buckets,
+                    graph_variant=online_graph_variant,
+                    subcode_mode=online_subcode_mode,
+                    sampled_batch_subcode=effective_sampled_subcode,
+                    kv_precision=str(effective_kv_cache_precision),
+                    block_size=int(effective_kv_cache_block_size),
+                    disable_fused_decode=not bool(effective_online_batch_fused_decode),
+                    continuous_batch_subcode=bool(effective_continuous_subcode),
+                ),
+            )
+            scheduler.continuous_batch_subcode_reason = continuous_subcode_reason
+            try:
+                scheduler.ensure_ready()
+            except Exception:
+                scheduler.close()
+                raise
+            online_schedulers[key] = scheduler
+        else:
+            scheduler.continuous_batch_subcode_reason = continuous_subcode_reason
+        return scheduler
+
+    def get_runtime_prompt_lock(runtime: OpenVINOQwen3TTS) -> threading.Lock:
+        key = id(runtime)
+        lock = runtime_prompt_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            runtime_prompt_locks[key] = lock
+        return lock
+
+    def build_online_batch_prompt(request: dict, mode_name: str, runtime: OpenVINOQwen3TTS, kwargs: dict):
+        with get_runtime_prompt_lock(runtime):
+            text = str(request.get("text") or "")
+            language = str(request.get("language") or "Auto")
+            if mode_name == "voice_design":
+                text = normalize_tts_text(text)
+                sequence, tts_pad_embed = runtime.build_prompt(
+                    text=text,
+                    instruct=request.get("instruct", ""),
+                    language=language,
+                    max_prompt_tokens=int(kwargs["max_prompt_tokens"]),
+                )
+                return sequence, tts_pad_embed, None
+            if mode_name == "custom_voice":
+                speaker = request.get("speaker")
+                if not speaker:
+                    raise ValueError("speaker is required for custom_voice")
+                sequence, tts_pad_embed = runtime.build_prompt(
+                    text=text,
+                    instruct=request.get("instruct", ""),
+                    language=language,
+                    speaker=speaker,
+                    max_prompt_tokens=int(kwargs["max_prompt_tokens"]),
+                )
+                return sequence, tts_pad_embed, None
+            if mode_name != "voice_clone":
+                raise ValueError(f"unsupported online batching mode: {mode_name}")
+            if request.get("voice_clone_prompt") is not None:
+                prompt = runtime._normalize_voice_clone_prompt(request.get("voice_clone_prompt"), 1)[0]
+            else:
+                ref_audio = request.get("ref_audio")
+                if ref_audio is None:
+                    raise ValueError("either voice_clone_prompt or ref_audio is required")
+                prompt = runtime.create_voice_clone_prompt(
+                    ref_audio,
+                    ref_text=request.get("ref_text"),
+                    x_vector_only_mode=request_x_vector_only(request),
+                )[0]
+            item_ref_text = prompt.ref_text if prompt.ref_text is not None else request.get("ref_text")
+            sequence, tts_pad_embed = runtime.build_prompt(
+                text=text,
+                instruct="",
+                language=language,
+                max_prompt_tokens=int(kwargs["max_prompt_tokens"]),
+                voice_clone_prompt=prompt,
+                ref_text=item_ref_text,
+            )
+            prefix_codes = np.asarray(prompt.ref_code, dtype=np.int64) if prompt.ref_code is not None else None
+            return sequence, tts_pad_embed, prefix_codes
+
+    def stream_online_batch_chunks(
+        request: dict,
+        mode_name: str,
+        runtime: OpenVINOQwen3TTS,
+        kwargs: dict,
+        decision_reason: str,
+    ):
+        effective_sampled_subcode, sampled_subcode_reason = resolve_runtime_sampled_batch_subcode(runtime)
+        capability = runtime_online_batch_capability(runtime)
+        effective_continuous_subcode, continuous_subcode_reason = resolve_online_batch_continuous_subcode(
+            effective_sampled_subcode,
+            capability,
+        )
+        scheduler = get_online_scheduler(runtime)
+        sequence, tts_pad_embed, prefix_codes = build_online_batch_prompt(request, mode_name, runtime, kwargs)
+        codes = scheduler.submit(
+            sequence,
+            tts_pad_embed,
+            max_new_tokens=int(kwargs["max_new_tokens"]),
+            min_new_tokens=int(kwargs["min_new_tokens"]),
+            repetition_penalty=float(kwargs["repetition_penalty"]),
+            do_sample=bool(kwargs["do_sample"]),
+            top_k=int(kwargs["top_k"]),
+            top_p=float(kwargs["top_p"]),
+            temperature=float(kwargs["temperature"]),
+            seed=int(request.get("_generation_seed", 0)),
+        )
+        decoded = runtime.stream_decode_codes(
+            codes,
+            prefix_codes=prefix_codes,
+            chunk_frames=kwargs.get("chunk_frames"),
+            left_context_frames=kwargs.get("left_context_frames"),
+            initial_chunk_frames=kwargs.get("initial_chunk_frames"),
+            chunk_strategy=kwargs.get("chunk_strategy"),
+        )
+
+        def iterator():
+            for chunk in decoded:
+                timings = dict(chunk.timings or {})
+                stats = scheduler.stats()
+                timings.update(
+                    {
+                        "online_batching": True,
+                        "online_batching_reason": decision_reason,
+                        "online_batch_policy": online_batch_policy,
+                        "online_batch_max_size": online_batch_max_size,
+                        "online_batch_wait_ms": online_batch_wait_ms,
+                        "online_batch_max_queue_delay_ms": online_batch_max_queue_delay_ms,
+                        "online_batch_scheduler": online_batch_scheduler,
+                        "online_batch_prefill_mode": online_batch_prefill_mode,
+                        "online_batch_prefill_mode_source": online_batch_prefill_source,
+                        "online_batch_prefill_seq_buckets": online_batch_prefill_seq_buckets,
+                        "online_batch_prefill_batch_buckets": online_batch_prefill_batch_buckets,
+                        "online_batch_decode_batch_buckets": online_batch_decode_batch_buckets,
+                        "online_batch_max_num_batched_tokens": online_batch_max_num_batched_tokens,
+                        "online_batch_fused_decode": online_batch_fused_decode,
+                        "online_batch_fused_decode_enabled": effective_online_batch_fused_decode,
+                        "online_batch_native_scheduler": stats.get("online_scheduler"),
+                        "online_batch_native_prefill_mode": stats.get("prefill_mode"),
+                        "online_batch_native_max_num_batched_tokens": stats.get("max_num_batched_tokens"),
+                        "online_batch_prefill_seq_bucket": stats.get("last_prefill_seq_bucket"),
+                        "online_batch_prefill_batch_bucket": stats.get("last_prefill_batch_bucket"),
+                        "online_batch_decode_batch_bucket": stats.get("last_decode_batch_bucket"),
+                        "online_batch_fused_decode_step_count": stats.get("batch_fused_decode_step_count"),
+                        "online_batch_fused_decode_token_count": stats.get("batch_fused_decode_token_count"),
+                        "online_batch_single_decode_step_count": stats.get("batch_single_decode_step_count"),
+                        "online_batch_single_decode_token_count": stats.get("batch_single_decode_token_count"),
+                        "online_batch_fused_decode_active1_bypass_count": stats.get(
+                            "batch_fused_decode_active1_bypass_count"
+                        ),
+                        "online_batch_fused_decode_logits_bypass_count": stats.get(
+                            "batch_fused_decode_logits_bypass_count"
+                        ),
+                        "online_batch_cache_block_capacity": stats.get("cache_block_capacity"),
+                        "online_batch_cache_blocks_used": stats.get("cache_blocks_used"),
+                        "online_batch_cache_blocks_active": stats.get("cache_blocks_active"),
+                        "online_batch_cache_blocks_free": stats.get("cache_blocks_free"),
+                        "online_batch_active": stats.get("active"),
+                        "online_batch_pending": stats.get("pending"),
+                        "online_batch_total_requests": stats.get("total_requests"),
+                        "sampled_batch_subcode": effective_sampled_subcode,
+                        "sampled_batch_subcode_config": sampled_batch_subcode,
+                        "sampled_batch_subcode_reason": sampled_subcode_reason,
+                        "online_batch_continuous_subcode": effective_continuous_subcode,
+                        "online_batch_continuous_subcode_config": online_batch_continuous_subcode,
+                        "online_batch_continuous_subcode_reason": continuous_subcode_reason,
+                        "sampled_batch_subcode_used": stats.get("sampled_batch_subcode_used"),
+                        "sampled_batch_subcode_verified": stats.get("sampled_batch_subcode_verified"),
+                        "sampled_batch_subcode_fallback_count": stats.get("sampled_batch_subcode_fallback_count"),
+                        "sampled_batch_subcode_fallback_reason": stats.get("sampled_batch_subcode_fallback_reason"),
+                    }
+                )
+                if hasattr(runtime, "prompt_cache_stats"):
+                    timings.update(runtime.prompt_cache_stats())
+                yield StreamChunk(
+                    index=chunk.index,
+                    audio=chunk.audio,
+                    sample_rate=chunk.sample_rate,
+                    codes=chunk.codes,
+                    is_final=chunk.is_final,
+                    timings=timings,
+                )
+
+        return iterator()
 
     tokenizer_cache: dict[str, Qwen2BPETokenizer] = {}
 
@@ -2616,7 +3669,14 @@ def create_app(
         generation = gen_kwargs or request.get("generation") or {}
         try:
             if request_uses_full_context_text(request):
-                budget_max_new_tokens = 0
+                requested_budget_tokens = int(generation.get("max_new_tokens", FASTEST_SHORT_OUTPUT_MAX_NEW_TOKENS))
+                budget_max_new_tokens = int(
+                    full_context_generation_budget(
+                        request,
+                        normalize_mode(request.get("mode")),
+                        requested_budget_tokens,
+                    )["effective_max_new_tokens"]
+                )
             else:
                 budget_max_new_tokens = int(generation.get("max_new_tokens", FASTEST_SHORT_OUTPUT_MAX_NEW_TOKENS))
         except Exception:
@@ -2669,7 +3729,11 @@ def create_app(
         instruct = str(request.get("instruct") or request.get("instructions") or "")
         language = str(request.get("language") or "Auto")
         speaker = str(request.get("speaker") or "") or None
-        generation = gen_kwargs or generation_kwargs(request, default_repetition_penalty=default_repetition_penalty)
+        generation = gen_kwargs or generation_kwargs(
+            request,
+            default_repetition_penalty=default_repetition_penalty,
+            allow_sampled_defaults=allow_sampled_generation_defaults,
+        )
         try:
             max_new_tokens = int(generation.get("max_new_tokens", FASTEST_SHORT_OUTPUT_MAX_NEW_TOKENS))
         except Exception:
@@ -2683,11 +3747,12 @@ def create_app(
         if mode_name == "voice_design":
             instruct_ids = tokenizer.encode(build_instruct_text(instruct)) if instruct else []
             codec_prefill = language_codec_prefill_from_ids(ids, language, speaker=None)
-            prompt_len = int(len(instruct_ids) + len(text_ids) + len(codec_prefill) - 3)
+            prompt_len = int(len(instruct_ids) + len(text_ids) + len(codec_prefill) - 2)
         elif mode_name == "custom_voice":
             instruct_ids = tokenizer.encode(build_instruct_text(instruct)) if instruct else []
             codec_prefill = language_codec_prefill_from_ids(ids, language, speaker=speaker)
-            prompt_len = int(len(instruct_ids) + len(text_ids) + len(codec_prefill) - 3)
+            speaker_prompt_tokens = 1 if speaker else 0
+            prompt_len = int(len(instruct_ids) + len(text_ids) + len(codec_prefill) - 2 + speaker_prompt_tokens)
         else:
             ref_text = str(request.get("ref_text") or "")
             ref_text_ids = tokenizer.encode(build_ref_text(ref_text)) if ref_text else []
@@ -2699,7 +3764,7 @@ def create_app(
         effective_budget = int(budget["effective_max_continuous_prompt_tokens"])
         effective_total_tokens_raw = budget.get("effective_max_total_tokens")
         max_generation_tokens_available = None
-        initial_context_usage = {
+        initial_context_usage: dict[str, object] = {
             "context_prompt_tokens": int(prompt_len),
             "context_generated_tokens": 0,
             "context_used_tokens": int(prompt_len),
@@ -2717,21 +3782,36 @@ def create_app(
                     ),
                 }
             )
-        effective_max_new_tokens = int(max_new_tokens)
-        if request_uses_full_context_text(request) and max_generation_tokens_available is not None:
-            effective_max_new_tokens = max(0, int(max_generation_tokens_available))
+        if request_uses_full_context_text(request):
+            generation_budget = full_context_generation_budget(
+                request,
+                mode_name,
+                max_new_tokens,
+                max_generation_tokens_available=max_generation_tokens_available,
+            )
+            effective_max_new_tokens = int(generation_budget["effective_max_new_tokens"])
+            generation_stop_condition = str(generation_budget["generation_stop_condition"])
+        else:
+            generation_budget = {
+                "requested_max_new_tokens": int(max_new_tokens),
+                "max_new_tokens": int(max_new_tokens),
+                "effective_max_new_tokens": int(max_new_tokens),
+                "generation_stop_condition": "eos_or_max_new_tokens",
+                "generation_max_new_tokens_source": "explicit_or_default",
+            }
+            effective_max_new_tokens = int(max_new_tokens)
+            generation_stop_condition = "eos_or_max_new_tokens"
         if max_generation_tokens_available is not None:
             initial_context_usage.update(
                 {
-                    "context_generation_limit_tokens": int(max_generation_tokens_available),
-                    "context_generation_remaining_tokens": int(max_generation_tokens_available),
+                    "context_generation_limit_tokens": int(effective_max_new_tokens),
+                    "context_generation_remaining_tokens": int(effective_max_new_tokens),
                     "context_generation_percent": 0.0,
                 }
             )
         requested_generation_over_budget = (
             max_generation_tokens_available is not None
             and int(max_new_tokens) > int(max_generation_tokens_available)
-            and not request_uses_full_context_text(request)
         )
         return {
             "tokenizer_exact": True,
@@ -2742,20 +3822,33 @@ def create_app(
             "ref_text_tokens": int(len(ref_text_ids)),
             "codec_prefill_tokens": int(len(codec_prefill)),
             "prompt_embed_bytes": int(prompt_len * hidden_size * 4),
-            "requested_max_new_tokens": int(max_new_tokens),
-            "max_new_tokens": int(effective_max_new_tokens),
-            "effective_max_new_tokens": int(effective_max_new_tokens),
-            "generation_stop_condition": (
-                "eos_or_context_limit" if request_uses_full_context_text(request) else "eos_or_max_new_tokens"
-            ),
+            "requested_max_new_tokens": int(generation_budget["requested_max_new_tokens"]),
+            "max_new_tokens": int(generation_budget["max_new_tokens"]),
+            "effective_max_new_tokens": int(generation_budget["effective_max_new_tokens"]),
+            "generation_stop_condition": generation_stop_condition,
             "total_requested_tokens": int(prompt_len + effective_max_new_tokens),
             "max_generation_tokens_available": max_generation_tokens_available,
-            "requested_generation_over_budget": bool(requested_generation_over_budget),
+            "requested_generation_over_budget": bool(
+                generation_budget.get("requested_generation_over_budget", requested_generation_over_budget)
+            ),
             "remaining_generation_tokens": (
                 max(0, int(max_generation_tokens_available) - int(effective_max_new_tokens))
                 if max_generation_tokens_available is not None
                 else None
             ),
+            **{
+                key: value
+                for key, value in generation_budget.items()
+                if key
+                not in {
+                    "requested_max_new_tokens",
+                    "max_new_tokens",
+                    "effective_max_new_tokens",
+                    "generation_stop_condition",
+                    "requested_generation_over_budget",
+                    "remaining_generation_tokens",
+                }
+            },
             **initial_context_usage,
             "over_prompt_budget": bool(effective_budget > 0 and prompt_len > effective_budget),
             "remaining_prompt_tokens": int(max(0, effective_budget - prompt_len)) if effective_budget > 0 else None,
@@ -2782,12 +3875,10 @@ def create_app(
         if request_will_auto_segment(request):
             return False
         try:
-            mode_name = normalize_mode(request.get("mode"))
-            if mode_name != "voice_design":
-                return False
             generation = gen_kwargs if gen_kwargs is not None else generation_kwargs(
                 request,
                 default_repetition_penalty=default_repetition_penalty,
+                allow_sampled_defaults=allow_sampled_generation_defaults,
             )
             return needs_continuous_long_output(request.get("text") or "", int(generation["max_new_tokens"]))
         except Exception:
@@ -2829,12 +3920,81 @@ def create_app(
         app.state.memory["last_released_native_runners"] = closed_runners
         return released_buffers, closed_runners
 
+    def public_mode_for_runtime(runtime: OpenVINOQwen3TTS) -> str:
+        model_type = str((getattr(runtime, "manifest", {}) or {}).get("tts_model_type") or "").replace("-", "_").lower()
+        if model_type in {"base", "voice_clone"}:
+            return "voice_clone"
+        if model_type == "custom_voice":
+            return "custom_voice"
+        return "voice_design"
+
+    def release_inactive_runtime_resources(target_mode: str) -> None:
+        if runtime_residency != "lazy":
+            app.state.memory["active_runtime_mode"] = target_mode
+            return
+        with active_tts_lock:
+            active_count = int(active_tts_requests)
+        if active_count > 1:
+            app.state.memory["active_runtime_mode"] = target_mode
+            app.state.memory["runtime_eviction_skipped"] = "active_requests"
+            return
+
+        released_buffers = 0
+        closed_runners = 0
+        evicted_modes: list[str] = []
+        evicted_runtime_keys = set()
+        for key, runtime in list(runtimes.items()):
+            runtime_mode_name = public_mode_for_runtime(runtime)
+            if runtime_mode_name == target_mode:
+                continue
+            release = getattr(runtime, "release_native_audio_runner_buffers", None)
+            if release is not None:
+                try:
+                    released_buffers += int(release())
+                except Exception:
+                    pass
+            close = getattr(runtime, "close_native_audio_runners", None)
+            if close is not None:
+                try:
+                    closed_runners += int(close())
+                except Exception:
+                    pass
+            runtime_prompt_locks.pop(id(runtime), None)
+            evicted_runtime_keys.add(str(Path(runtime.ir_dir).resolve()))
+            evicted_modes.append(runtime_mode_name)
+            runtimes.pop(key, None)
+
+        if evicted_runtime_keys:
+            for scheduler_key, scheduler in list(online_schedulers.items()):
+                if str(scheduler_key[0]) in evicted_runtime_keys:
+                    try:
+                        scheduler.close()
+                    except Exception:
+                        pass
+                    online_schedulers.pop(scheduler_key, None)
+            gc.collect()
+
+        app.state.memory["active_runtime_mode"] = target_mode
+        app.state.memory["last_released_native_buffers"] = released_buffers
+        app.state.memory["last_released_native_runners"] = closed_runners
+        if evicted_modes:
+            app.state.memory["runtime_eviction_count"] = int(app.state.memory.get("runtime_eviction_count") or 0) + len(
+                evicted_modes
+            )
+            app.state.memory["last_runtime_eviction"] = {
+                "target_mode": target_mode,
+                "evicted_modes": sorted(set(evicted_modes)),
+                "released_buffers": released_buffers,
+                "closed_runners": closed_runners,
+                "at": time.time(),
+            }
+
     def exact_voice_design_prompt_metadata(runtime, text: str, instruct: str, language: str) -> dict:
         try:
             input_ids = runtime.tokenizer.encode(build_assistant_text(text))
             instruct_ids = runtime.tokenizer.encode(build_instruct_text(instruct)) if instruct else []
             codec_prefill = runtime.language_codec_prefill(language, speaker=None)
-            prompt_len = int(len(instruct_ids) + len(input_ids) + len(codec_prefill) - 3)
+            prompt_len = int(len(instruct_ids) + len(input_ids) + len(codec_prefill) - 2)
         except Exception:
             return {}
         hidden_size = int(os.environ.get("QWEN3_TTS_OV_PROMPT_HIDDEN_SIZE_ESTIMATE") or 2048)
@@ -2871,21 +4031,22 @@ def create_app(
             max_generation_tokens_available = max(0, int(effective_total_tokens_raw) - prompt_len - 1)
             estimate["max_generation_tokens_available"] = int(max_generation_tokens_available)
             if request_uses_full_context_text(request):
-                estimate["requested_max_new_tokens"] = int(requested_new_tokens)
-                estimate["max_new_tokens"] = int(max_generation_tokens_available)
-                estimate["effective_max_new_tokens"] = int(max_generation_tokens_available)
-                estimate["generation_stop_condition"] = "eos_or_context_limit"
+                estimate.update(
+                    full_context_generation_budget(
+                        request,
+                        mode_name,
+                        requested_new_tokens,
+                        max_generation_tokens_available=max_generation_tokens_available,
+                    )
+                )
             estimate["requested_generation_over_budget"] = bool(
-                requested_new_tokens > int(max_generation_tokens_available)
+                estimate.get("requested_generation_over_budget")
+                or requested_new_tokens > int(max_generation_tokens_available)
             )
+            effective_new_tokens = int(estimate.get("effective_max_new_tokens", requested_new_tokens))
             estimate["remaining_generation_tokens"] = max(
                 0,
-                int(max_generation_tokens_available)
-                - (
-                    int(max_generation_tokens_available)
-                    if request_uses_full_context_text(request)
-                    else requested_new_tokens
-                ),
+                int(max_generation_tokens_available) - effective_new_tokens,
             )
         if (
             effective_budget > 0
@@ -2932,20 +4093,39 @@ def create_app(
             return
         app.state.warmup["status"] = "running"
         app.state.warmup["started_at"] = time.time()
-        for preload_mode in parse_csv(preload_modes):
+        requested_preload_mode_items = parse_csv(preload_modes)
+        lazy_multi_preload = runtime_residency == "lazy" and len(requested_preload_mode_items) > 1
+        preload_mode_items = requested_preload_mode_items[:1] if lazy_multi_preload else requested_preload_mode_items
+        if lazy_multi_preload:
+            app.state.warmup["preload_policy"] = "lazy_first_mode_only"
+            app.state.warmup["requested_preload_modes"] = requested_preload_mode_items
+            app.state.warmup["skipped_preload_modes"] = requested_preload_mode_items[1:]
+        for preload_index, preload_mode in enumerate(preload_mode_items):
             key = preload_mode.replace("-", "_")
             if key not in MODE_DIR:
                 app.state.warmup["errors"][preload_mode] = f"unsupported preload mode: {preload_mode}"
                 continue
             try:
+                mode_key = "voice_clone" if key == "base" else key
+                if lazy_multi_preload:
+                    release_inactive_runtime_resources(mode_key)
                 ir_dir = resolve_mode_ir_dir(key)
-                runtime = runtime_for_ir_dir(ir_dir, do_sample=False)
+                warmup_do_sample = bool(allow_sampled_generation_defaults)
+                runtime = runtime_for_ir_dir(
+                    ir_dir,
+                    do_sample=warmup_do_sample,
+                    continuous_long_output=True,
+                )
+                warmup_stream_strategy = normalize_chunk_strategy(warmup_strategy, default_stream_strategy)
+                warmup_stream_defaults = DEFAULT_STREAM_CHUNK_STRATEGIES[warmup_stream_strategy]
                 status = runtime.prewarm_streaming(
                     text=warmup_text,
                     instruct="用自然、清晰的中文女声朗读。",
                     language="Chinese",
-                    chunk_strategy=warmup_strategy,
-                    left_context_frames=None,
+                    chunk_strategy=warmup_stream_strategy,
+                    initial_chunk_frames=int(warmup_stream_defaults["initial_chunk_frames"]),
+                    chunk_frames=int(warmup_stream_defaults["chunk_frames"]),
+                    left_context_frames=int(warmup_stream_defaults["left_context_frames"]),
                     max_new_tokens=None,
                     repetition_penalty=default_repetition_penalty,
                     preload_buckets=preload_buckets,
@@ -2958,7 +4138,80 @@ def create_app(
                         status.get("warmup_generation_error")
                         or status.get("fallback_decoder_error")
                         or f"prewarm finished with status={status.get('status')}"
+                )
+                if online_batching_enabled and online_batch_warmup_requests > 0:
+                    with get_runtime_prompt_lock(runtime):
+                        warmup_penalty = float(default_repetition_penalty)
+                        prefix_codes = None
+                        if mode_key == "voice_design":
+                            sequence, tts_pad_embed = runtime.build_prompt(
+                                text=warmup_text,
+                                instruct="用自然、清晰的中文女声朗读。",
+                                language="Chinese",
+                                max_prompt_tokens=effective_max_continuous_prompt_tokens,
+                            )
+                        elif mode_key == "custom_voice":
+                            warmup_penalty = custom_voice_default_repetition_penalty(
+                                warmup_text,
+                                do_sample=warmup_do_sample,
+                                repetition_penalty=warmup_penalty,
+                                explicit_repetition_penalty=False,
+                            )
+                            sequence, tts_pad_embed = runtime.build_prompt(
+                                text=warmup_text,
+                                instruct="用自然、清晰的中文女声朗读。",
+                                language="Chinese",
+                                speaker=warmup_speaker,
+                                max_prompt_tokens=effective_max_continuous_prompt_tokens,
+                            )
+                        elif mode_key == "voice_clone":
+                            if not warmup_ref_audio or not resolved_warmup_ref_text:
+                                app.state.warmup["online_batch_by_mode"][preload_mode] = {
+                                    "skipped": "missing_warmup_ref_audio_or_ref_text",
+                                    "requires": "--warmup-ref-audio and --warmup-ref-text-file/--warmup-ref-text",
+                                }
+                                continue
+                            prompt = runtime.create_voice_clone_prompt(
+                                warmup_ref_audio,
+                                ref_text=resolved_warmup_ref_text,
+                                x_vector_only_mode=False,
+                            )[0]
+                            sequence, tts_pad_embed = runtime.build_prompt(
+                                text=warmup_text,
+                                instruct="",
+                                language="Chinese",
+                                max_prompt_tokens=effective_max_continuous_prompt_tokens,
+                                voice_clone_prompt=prompt,
+                                ref_text=resolved_warmup_ref_text,
+                            )
+                            prefix_codes = np.asarray(prompt.ref_code, dtype=np.int64) if prompt.ref_code is not None else None
+                        else:
+                            app.state.warmup["online_batch_by_mode"][preload_mode] = {
+                                "skipped": f"unsupported_online_warmup_mode:{mode_key}",
+                            }
+                            continue
+                    scheduler = get_online_scheduler(runtime)
+                    online_status = scheduler.warmup(
+                        sequence,
+                        tts_pad_embed,
+                        batch_size=online_batch_warmup_requests,
+                        max_new_tokens=online_batch_warmup_tokens,
+                        min_new_tokens=0,
+                        repetition_penalty=warmup_penalty,
+                        do_sample=warmup_do_sample,
+                        reset_after=bool(lazy_multi_preload and preload_index < len(preload_mode_items) - 1),
                     )
+                    online_status.update(
+                        {
+                            "mode": mode_key,
+                            "speaker": warmup_speaker if mode_key == "custom_voice" else None,
+                            "voice_clone_reference_cached": bool(mode_key == "voice_clone"),
+                            "decoder_prefix_frames": int(prefix_codes.shape[0]) if prefix_codes is not None else 0,
+                        }
+                    )
+                    app.state.warmup["online_batch_by_mode"][preload_mode] = online_status
+                    if mode_key == "voice_design":
+                        app.state.warmup["online_batch"] = online_status
             except Exception as exc:
                 app.state.warmup["errors"][preload_mode] = str(exc)
         app.state.warmup["finished_at"] = time.time()
@@ -2980,12 +4233,12 @@ def create_app(
             or timings.get("model_context_tokens")
         )
         generation_limit_raw = (
-            extra_timings.get("max_generation_tokens_available")
-            or timings.get("max_generation_tokens_available")
-            or extra_timings.get("effective_max_new_tokens")
+            extra_timings.get("effective_max_new_tokens")
             or timings.get("effective_max_new_tokens")
             or extra_timings.get("max_new_tokens")
             or timings.get("max_new_tokens")
+            or extra_timings.get("max_generation_tokens_available")
+            or timings.get("max_generation_tokens_available")
         )
         generated_tokens = int(
             timings.get("emitted_frames")
@@ -3051,11 +4304,16 @@ def create_app(
             )
 
     def stream_chunks_once(request: dict, retry_count: int = 0):
-        gen_kwargs = generation_kwargs(request, default_repetition_penalty=default_repetition_penalty)
+        gen_kwargs = generation_kwargs(
+            request,
+            default_repetition_penalty=default_repetition_penalty,
+            allow_sampled_defaults=allow_sampled_generation_defaults,
+        )
         mode_name = normalize_mode(request.get("mode"))
         text = request.get("text")
         long_output = request_uses_continuous_long_output(request, gen_kwargs)
         prefer_paged_long_ar = bool(request.get("use_paged_kv_long_ar", False)) or env_enabled(ENABLE_PAGED_LONG_AR_ENV, False)
+        release_inactive_runtime_resources(mode_name)
         mode_name, runtime = get_runtime(
             mode_name,
             do_sample=bool(gen_kwargs["do_sample"]),
@@ -3063,88 +4321,64 @@ def create_app(
             prefer_paged_kv=bool(long_output and prefer_paged_long_ar and not request.get("force_stateful_long_output", False)),
         )
         memory_meta = validate_continuous_prompt_budget(runtime, request, gen_kwargs, long_output)
-        if request_uses_full_context_text(request) and memory_meta.get("max_generation_tokens_available") is not None:
+        if request_uses_full_context_text(request):
             requested_max_new_tokens = int(gen_kwargs.get("max_new_tokens", FASTEST_SHORT_OUTPUT_MAX_NEW_TOKENS))
-            capacity_max_new_tokens = max(1, int(memory_meta["max_generation_tokens_available"]))
+            effective_max_new_tokens = max(
+                1,
+                int(memory_meta.get("effective_max_new_tokens") or requested_max_new_tokens),
+            )
             gen_kwargs = dict(gen_kwargs)
-            gen_kwargs["max_new_tokens"] = capacity_max_new_tokens
+            gen_kwargs["max_new_tokens"] = effective_max_new_tokens
+            capacity_max_new_tokens = memory_meta.get("max_generation_tokens_available")
             memory_meta.update(
                 {
                     "requested_max_new_tokens": requested_max_new_tokens,
-                    "max_new_tokens": capacity_max_new_tokens,
-                    "effective_max_new_tokens": capacity_max_new_tokens,
-                    "generation_stop_condition": "eos_or_context_limit",
-                    "requested_generation_over_budget": False,
-                    "remaining_generation_tokens": 0,
+                    "max_new_tokens": effective_max_new_tokens,
+                    "effective_max_new_tokens": effective_max_new_tokens,
+                    "generation_stop_condition": memory_meta.get(
+                        "generation_stop_condition",
+                        "eos_or_effective_max_new_tokens_or_context_limit",
+                    ),
+                    "remaining_generation_tokens": (
+                        max(0, int(capacity_max_new_tokens) - int(effective_max_new_tokens))
+                        if capacity_max_new_tokens is not None
+                        else memory_meta.get("remaining_generation_tokens")
+                    ),
                 }
             )
-        kwargs = {**gen_kwargs, **stream_kwargs(request, default_stream_strategy, forced_strategy=forced_stream_strategy)}
+        request_forced_stream_strategy = effective_forced_stream_strategy(request, forced_stream_strategy)
+        kwargs = {**gen_kwargs, **stream_kwargs(request, default_stream_strategy, forced_strategy=request_forced_stream_strategy)}
         text = request.get("text")
-        language = request.get("language", "Auto")
         if not text:
             raise ValueError("text is required")
         common_timings = {
             "retry_count": int(retry_count),
             "long_output_memory_policy": long_output_memory_policy,
             "long_ar_do_sample": bool(gen_kwargs.get("do_sample", False)) if long_output else False,
+            "inference_backend": "vllm_like_online_scheduler",
+            "generation_fallback_allowed": False,
+            "generation_fallback_policy": "hard_error",
+            "fallback": False,
+            **request.get("_generation_default_metadata", {}),
             **memory_meta,
         }
-        if mode_name == "voice_design":
-            text = normalize_tts_text(text)
-            instruct = request.get("instruct", "")
-            if long_output:
-                if request.get("force_stateful_long_output", False):
-                    common_timings.update(
-                        {
-                            "continuous_long_output": True,
-                            "continuous_backend": "single_prompt_full_ar_reference",
-                            "continuous_bucket": None,
-                            "long_text_mode": "full_ar",
-                            "segmented": False,
-                            "paged_kv": False,
-                            "paged_kv_backend": "disabled_for_full_ar_reference",
-                            "paged_kv_unavailable_reason": "",
-                        }
-                    )
-                else:
-                    common_timings.update(continuous_long_output_metadata(True))
+        online_ok, online_reason = online_batching_decision(request, mode_name, gen_kwargs, long_output, runtime)
+        common_timings.update(
+            {
+                "online_batching_requested": request_online_batching_mode(request),
+                "online_batching": bool(online_ok),
+                "online_batching_reason": online_reason,
+                "online_batching_quality_ok": online_quality_ok,
+                "online_batching_quality_source": online_quality_source,
+            }
+        )
+        if online_ok:
             return annotate_stream_chunks(
-                runtime.stream_voice_design(
-                    text=text,
-                    instruct=instruct,
-                    language=language,
-                    prefix_codes=request.get("_prefix_codes"),
-                    append_prefix_codes_to_prompt=bool(request.get("_append_prefix_codes_to_prompt", False)),
-                    **kwargs,
-                ),
+                stream_online_batch_chunks(request, mode_name, runtime, kwargs, online_reason),
                 common_timings,
                 trim_final_silence=request_uses_full_context_text(request),
             )
-        if mode_name == "custom_voice":
-            speaker = request.get("speaker")
-            if not speaker:
-                raise ValueError("speaker is required for custom_voice")
-            return annotate_stream_chunks(
-                runtime.stream_custom_voice(
-                    text=text,
-                    speaker=speaker,
-                    instruct=request.get("instruct", ""),
-                    language=language,
-                    **kwargs,
-                ),
-                common_timings,
-            )
-        return annotate_stream_chunks(
-            runtime.stream_voice_clone(
-                text=text,
-                language=language,
-                ref_audio=request.get("ref_audio"),
-                ref_text=request.get("ref_text"),
-                x_vector_only_mode=request_x_vector_only(request),
-                **kwargs,
-            ),
-            common_timings,
-        )
+        raise RuntimeError(f"vLLM-like online scheduler is required but unavailable: {online_reason}")
 
     def segmented_stream_chunks(request: dict):
         text = str(request.get("text") or "")
@@ -3385,73 +4619,16 @@ def create_app(
                     raise
 
     def full_audio(request: dict):
-        with tts_request_slot():
-            for attempt in range(usm_retry_count + 1):
-                try:
-                    kwargs = generation_kwargs(request, default_repetition_penalty=default_repetition_penalty)
-                    long_output = request_uses_continuous_long_output(request, kwargs)
-                    prefer_paged_long_ar = bool(request.get("use_paged_kv_long_ar", False)) or env_enabled(ENABLE_PAGED_LONG_AR_ENV, False)
-                    mode_name, runtime = get_runtime(
-                        request.get("mode"),
-                        do_sample=bool(kwargs["do_sample"]),
-                        continuous_long_output=long_output,
-                        prefer_paged_kv=bool(long_output and prefer_paged_long_ar),
-                    )
-                    memory_meta = validate_continuous_prompt_budget(runtime, request, kwargs, long_output)
-                    if request_uses_full_context_text(request) and memory_meta.get("max_generation_tokens_available") is not None:
-                        kwargs = dict(kwargs)
-                        kwargs["max_new_tokens"] = max(1, int(memory_meta["max_generation_tokens_available"]))
-                    text = request.get("text")
-                    language = request.get("language", "Auto")
-                    if not text:
-                        raise ValueError("text is required")
-                    if mode_name == "voice_design":
-                        text = normalize_tts_text(text)
-                        wavs, sr = runtime.generate_voice_design(
-                            text=text,
-                            instruct=request.get("instruct", ""),
-                            language=language,
-                            **kwargs,
-                        )
-                    elif mode_name == "custom_voice":
-                        speaker = request.get("speaker")
-                        if not speaker:
-                            raise ValueError("speaker is required for custom_voice")
-                        wavs, sr = runtime.generate_custom_voice(
-                            text=text,
-                            speaker=speaker,
-                            instruct=request.get("instruct", ""),
-                            language=language,
-                            **kwargs,
-                        )
-                    else:
-                        wavs, sr = runtime.generate_voice_clone(
-                            text=text,
-                            language=language,
-                            ref_audio=request.get("ref_audio"),
-                            ref_text=request.get("ref_text"),
-                            x_vector_only_mode=request_x_vector_only(request),
-                            **kwargs,
-                        )
-                    return wavs[0], sr
-                except Exception as exc:
-                    if is_usm_allocation_error(exc) and attempt < usm_retry_count:
-                        released_buffers, closed_runners = release_native_runtime_resources()
-                        app.state.memory["last_usm_error"] = str(exc)
-                        app.state.memory["last_usm_retry_at"] = time.time()
-                        app.state.memory["last_usm_retry_count"] = attempt + 1
-                        app.state.memory["last_released_native_buffers"] = released_buffers
-                        app.state.memory["last_released_native_runners"] = closed_runners
-                        time.sleep(0.25)
-                        continue
-                    if is_usm_allocation_error(exc):
-                        raise RuntimeError(
-                            "OpenVINO GPU USM allocation failed during full TTS generation after retry. "
-                            "The native runner was released; reduce max_new_tokens/text length or restart the sidecar "
-                            "if the GPU driver remains fragmented. Original error: "
-                            f"{exc}"
-                        ) from exc
-                    raise
+        audio_parts: list[np.ndarray] = []
+        sample_rate = 24000
+        for chunk in stream_chunks(request):
+            sample_rate = int(chunk.sample_rate)
+            audio = np.asarray(chunk.audio, dtype=np.float32).reshape(-1)
+            if audio.size:
+                audio_parts.append(audio)
+        if audio_parts:
+            return np.concatenate(audio_parts).astype(np.float32, copy=False), sample_rate
+        return np.zeros(0, dtype=np.float32), sample_rate
 
     def model_downloads_payload() -> dict:
         modes = mode_availability()
@@ -3612,6 +4789,13 @@ def create_app(
                 "native_paged_kv_score_aggregation": (
                     os.environ.get("QWEN3_TTS_OV_NATIVE_PAGED_KV_SCORE_AGGREGATION") or "on"
                 ),
+                "native_subcode_next_embed_graph": (
+                    os.environ.get("QWEN3_TTS_OV_NATIVE_SUBCODE_NEXT_EMBED_GRAPH") or "off"
+                ),
+                "native_split_subcode_remote_next_embed": (
+                    os.environ.get("QWEN3_TTS_OV_NATIVE_SPLIT_SUBCODE_REMOTE_NEXT_EMBED") or "off"
+                ),
+                "native_decode_step_prebind": os.environ.get("QWEN3_TTS_OV_NATIVE_DECODE_STEP_PREBIND") or "off",
                 "native_dynamic_quantization_group_size": (
                     os.environ.get("QWEN3_TTS_OV_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE") or "default"
                 ),
@@ -3647,8 +4831,41 @@ def create_app(
                 "fused_cache_variant_active": fused_variant_active,
                 "compiled_stateful_buckets": sorted(getattr(runtime, "talker_stateful_by_bucket", {})),
             }
+            if hasattr(runtime, "prompt_cache_stats"):
+                status_item.update(runtime.prompt_cache_stats())
+            last_codegen_info = getattr(runtime, "last_codegen_info", None)
+            if isinstance(last_codegen_info, dict):
+                status_item["last_codegen_info"] = {
+                    key: value
+                    for key, value in last_codegen_info.items()
+                    if key
+                    in {
+                        "native_codegen_ms",
+                        "native_pipeline_ms",
+                        "native_emitted_frames",
+                        "native_remote_embed",
+                        "native_ov_profile",
+                        "native_timing",
+                    }
+                }
             status_item.update(evaluate_fast_path(status_item, require_request_metrics=False))
             runtime_status[runtime_id] = status_item
+        online_scheduler_status = {}
+        for key, scheduler in online_schedulers.items():
+            scheduler_id = "|".join(str(item) for item in key[:5])
+            try:
+                scheduler_stats = scheduler.stats()
+                scheduler_stats["continuous_batch_subcode"] = bool(
+                    getattr(scheduler.config, "continuous_batch_subcode", False)
+                )
+                scheduler_stats["continuous_batch_subcode_reason"] = getattr(
+                    scheduler,
+                    "continuous_batch_subcode_reason",
+                    None,
+                )
+                online_scheduler_status[scheduler_id] = scheduler_stats
+            except Exception as exc:
+                online_scheduler_status[scheduler_id] = {"ready": False, "error": str(exc)}
         return {
             "ok": True,
             "model_root": str(model_root),
@@ -3657,6 +4874,41 @@ def create_app(
             "available_modes": mode_availability(),
             "model_downloads": model_downloads_payload()["downloads"],
             "runtimes": runtime_status,
+            "online_batching": {
+                "mode": online_batching,
+                "production_profile": PRODUCTION_PROFILE,
+                "enabled": online_batching_enabled,
+                "allows_concurrency": online_batching_allows_concurrency,
+                "inference_backend": "vllm_like_online_scheduler",
+                "generation_fallback_allowed": False,
+                "generation_fallback_policy": "hard_error",
+                "quality_ok": online_quality_ok,
+                "quality_source": online_quality_source,
+                "default_policy_passed": default_policy_ok,
+                "default_policy_source": default_policy_source,
+                "policy": online_batch_policy,
+                "max_batch_size": online_batch_max_size,
+                "wait_ms": online_batch_wait_ms,
+                "max_queue_delay_ms": online_batch_max_queue_delay_ms,
+                "scheduler": online_batch_scheduler,
+                "prefill_mode": online_batch_prefill_mode,
+                "prefill_mode_source": online_batch_prefill_source,
+                "prefill_quality_summary": str(prefill_quality_summary_path()),
+                "prefill_seq_buckets": online_batch_prefill_seq_buckets,
+                "prefill_batch_buckets": online_batch_prefill_batch_buckets,
+                "decode_batch_buckets": online_batch_decode_batch_buckets,
+                "max_num_batched_tokens": online_batch_max_num_batched_tokens,
+                "fused_decode": online_batch_fused_decode,
+                "fused_decode_enabled": effective_online_batch_fused_decode,
+                "warmup_requests": online_batch_warmup_requests,
+                "warmup_tokens": online_batch_warmup_tokens,
+                "graph_variant": online_batch_graph_settings()[0],
+                "subcode_mode": online_batch_graph_settings()[1],
+                "sampled_batch_subcode": sampled_batch_subcode,
+                "continuous_subcode": online_batch_continuous_subcode,
+                "max_cache_blocks": effective_online_batch_max_cache_blocks,
+                "schedulers": online_scheduler_status,
+            },
         }
 
     @app.get("/v1/models")
@@ -3693,7 +4945,11 @@ def create_app(
     def tts_tokenize(request: dict):
         try:
             ensure_mode_available_for_request(request)
-            gen_kwargs = generation_kwargs(request, default_repetition_penalty=default_repetition_penalty)
+            gen_kwargs = generation_kwargs(
+                request,
+                default_repetition_penalty=default_repetition_penalty,
+                allow_sampled_defaults=allow_sampled_generation_defaults,
+            )
             metadata = request_prompt_metadata(request, gen_kwargs)
             metadata.update(
                 {
@@ -3720,8 +4976,13 @@ def create_app(
             started = time.time()
             try:
                 ensure_mode_available_for_request(request)
-                metadata_gen_kwargs = generation_kwargs(request, default_repetition_penalty=default_repetition_penalty)
-                metadata = stream_metadata(request, default_stream_strategy, forced_strategy=forced_stream_strategy)
+                metadata_gen_kwargs = generation_kwargs(
+                    request,
+                    default_repetition_penalty=default_repetition_penalty,
+                    allow_sampled_defaults=allow_sampled_generation_defaults,
+                )
+                request_forced_stream_strategy = effective_forced_stream_strategy(request, forced_stream_strategy)
+                metadata = stream_metadata(request, default_stream_strategy, forced_strategy=request_forced_stream_strategy)
                 continuity = full_context_metadata(request) or auto_segment_metadata(request) or continuous_long_output_metadata(
                     request_uses_continuous_long_output(request, metadata_gen_kwargs)
                 )
@@ -3735,6 +4996,7 @@ def create_app(
                         **metadata,
                         **runtime_stream_metadata,
                         **request_prompt_metadata(request, metadata_gen_kwargs),
+                        **request.get("_generation_default_metadata", {}),
                         **continuity,
                         "long_ar_do_sample": bool(metadata_gen_kwargs.get("do_sample", False)),
                         "active_tts_requests": app.state.memory["active_tts_requests"],
@@ -3799,7 +5061,9 @@ def create_app(
                     yield payload
                     continue
                 if kind == "error":
-                    raise payload  # type: ignore[misc]
+                    if isinstance(payload, BaseException):
+                        raise payload
+                    raise RuntimeError(str(payload))
                 break
         finally:
             stop_event.set()
@@ -3880,8 +5144,13 @@ def create_app(
             request = await websocket.receive_json()
             started = time.time()
             ensure_mode_available_for_request(request)
-            metadata_gen_kwargs = generation_kwargs(request, default_repetition_penalty=default_repetition_penalty)
-            metadata = stream_metadata(request, default_stream_strategy, forced_strategy=forced_stream_strategy)
+            metadata_gen_kwargs = generation_kwargs(
+                request,
+                default_repetition_penalty=default_repetition_penalty,
+                allow_sampled_defaults=allow_sampled_generation_defaults,
+            )
+            request_forced_stream_strategy = effective_forced_stream_strategy(request, forced_stream_strategy)
+            metadata = stream_metadata(request, default_stream_strategy, forced_strategy=request_forced_stream_strategy)
             continuity = full_context_metadata(request) or auto_segment_metadata(request) or continuous_long_output_metadata(
                 request_uses_continuous_long_output(request, metadata_gen_kwargs)
             )
@@ -3895,6 +5164,7 @@ def create_app(
                     **metadata,
                     **runtime_stream_metadata,
                     **request_prompt_metadata(request, metadata_gen_kwargs),
+                    **request.get("_generation_default_metadata", {}),
                     **continuity,
                     "long_ar_do_sample": bool(metadata_gen_kwargs.get("do_sample", False)),
                     "active_tts_requests": app.state.memory["active_tts_requests"],
@@ -3965,9 +5235,32 @@ def serve(
     preload_modes: str | list[str] = "voice_design",
     preload_buckets: str = "warmup",
     warmup_text: str = "你好，这是一次流式预热。",
+    warmup_speaker: str = "Vivian",
+    warmup_ref_audio: str | Path | None = None,
+    warmup_ref_text: str | None = None,
+    warmup_ref_text_file: str | Path | None = None,
     warmup_strategy: str = "low_latency",
+    runtime_residency: str = "lazy",
     realtime_profile: str = FASTEST_PROFILE_NAME,
-    max_concurrent_tts: int = 1,
+    max_concurrent_tts: int = 0,
+    online_batching: str = "on",
+    online_batch_policy: str = "balanced",
+    online_batch_max_size: int = 0,
+    online_batch_wait_ms: float = -1.0,
+    online_batch_max_queue_delay_ms: float = 0.0,
+    online_batch_scheduler: str = "layered",
+    online_batch_prefill_mode: str = "serial",
+    online_batch_prefill_quality_summary: str | Path | None = None,
+    online_batch_prefill_seq_buckets: str = "128,256,512,1024",
+    online_batch_prefill_batch_buckets: str = "1,2,4,8",
+    online_batch_decode_batch_buckets: str = "1,2,4,8,16",
+    online_batch_max_num_batched_tokens: int = 32,
+    online_batch_fused_decode: str = "off",
+    online_batch_warmup_requests: int = 4,
+    online_batch_warmup_tokens: int = 16,
+    sampled_batch_subcode: str = "off",
+    online_batch_continuous_subcode: str = "auto",
+    online_batch_max_cache_blocks: str | int | None = "auto",
     long_output_memory_policy: str = "stable",
     max_continuous_prompt_tokens: str | int = "auto",
     max_vram_ratio: str | int | float | None = None,
@@ -4006,9 +5299,32 @@ def serve(
         preload_modes=preload_modes,
         preload_buckets=preload_buckets,
         warmup_text=warmup_text,
+        warmup_speaker=warmup_speaker,
+        warmup_ref_audio=warmup_ref_audio,
+        warmup_ref_text=warmup_ref_text,
+        warmup_ref_text_file=warmup_ref_text_file,
         warmup_strategy=warmup_strategy,
+        runtime_residency=runtime_residency,
         realtime_profile=realtime_profile,
         max_concurrent_tts=max_concurrent_tts,
+        online_batching=online_batching,
+        online_batch_policy=online_batch_policy,
+        online_batch_max_size=online_batch_max_size,
+        online_batch_wait_ms=online_batch_wait_ms,
+        online_batch_max_queue_delay_ms=online_batch_max_queue_delay_ms,
+        online_batch_scheduler=online_batch_scheduler,
+        online_batch_prefill_mode=online_batch_prefill_mode,
+        online_batch_prefill_quality_summary=online_batch_prefill_quality_summary,
+        online_batch_prefill_seq_buckets=online_batch_prefill_seq_buckets,
+        online_batch_prefill_batch_buckets=online_batch_prefill_batch_buckets,
+        online_batch_decode_batch_buckets=online_batch_decode_batch_buckets,
+        online_batch_max_num_batched_tokens=online_batch_max_num_batched_tokens,
+        online_batch_fused_decode=online_batch_fused_decode,
+        online_batch_warmup_requests=online_batch_warmup_requests,
+        online_batch_warmup_tokens=online_batch_warmup_tokens,
+        sampled_batch_subcode=sampled_batch_subcode,
+        online_batch_continuous_subcode=online_batch_continuous_subcode,
+        online_batch_max_cache_blocks=online_batch_max_cache_blocks,
         long_output_memory_policy=long_output_memory_policy,
         max_continuous_prompt_tokens=max_continuous_prompt_tokens,
         max_vram_ratio=max_vram_ratio,

@@ -109,6 +109,127 @@ int qwen3_tts_codegen_run_voice_design_audio_stream(
     double* elapsed_ms,
     char** error);
 
+int qwen3_tts_codegen_run_paged_kv_repeat_batch(
+    void* handle,
+    const float* sequence,
+    int64_t prompt_len,
+    int64_t hidden_size,
+    const float* tts_pad_embed,
+    int64_t batch_size,
+    int64_t max_new_tokens,
+    int64_t min_new_tokens,
+    float repetition_penalty,
+    int64_t vocab_size,
+    int64_t num_code_groups,
+    int64_t eos_token_id,
+    int64_t do_sample,
+    int64_t top_k,
+    float top_p,
+    float temperature,
+    uint64_t seed,
+    int64_t* out_counts,
+    double* out_ttft_ms,
+    double* out_last_token_ms,
+    double* elapsed_ms,
+    char** error);
+
+int qwen3_tts_codegen_run_paged_kv_sequence_batch(
+    void* handle,
+    const float* sequences,
+    int64_t total_prompt_tokens,
+    const int64_t* prompt_lens,
+    int64_t hidden_size,
+    const float* tts_pad_embed,
+    int64_t batch_size,
+    int64_t max_new_tokens,
+    int64_t min_new_tokens,
+    float repetition_penalty,
+    int64_t vocab_size,
+    int64_t num_code_groups,
+    int64_t eos_token_id,
+    int64_t do_sample,
+    int64_t top_k,
+    float top_p,
+    float temperature,
+    uint64_t seed,
+    int64_t* out_counts,
+    double* out_ttft_ms,
+    double* out_last_token_ms,
+    double* elapsed_ms,
+    char** error);
+
+int qwen3_tts_codegen_run_paged_kv_sequence_batch_codes(
+    void* handle,
+    const float* sequences,
+    int64_t total_prompt_tokens,
+    const int64_t* prompt_lens,
+    int64_t hidden_size,
+    const float* tts_pad_embed,
+    int64_t batch_size,
+    int64_t max_new_tokens,
+    int64_t min_new_tokens,
+    float repetition_penalty,
+    int64_t vocab_size,
+    int64_t num_code_groups,
+    int64_t eos_token_id,
+    int64_t do_sample,
+    int64_t top_k,
+    float top_p,
+    float temperature,
+    uint64_t seed,
+    int64_t* out_counts,
+    int64_t* out_codes,
+    double* out_ttft_ms,
+    double* out_last_token_ms,
+    double* elapsed_ms,
+    char** error);
+
+int qwen3_tts_codegen_online_batch_reset(
+    void* handle,
+    int64_t max_cache_blocks,
+    char** error);
+
+int qwen3_tts_codegen_online_batch_add_sequence(
+    void* handle,
+    const float* sequence,
+    int64_t prompt_len,
+    int64_t hidden_size,
+    const float* tts_pad_embed,
+    int64_t max_new_tokens,
+    int64_t min_new_tokens,
+    float repetition_penalty,
+    int64_t vocab_size,
+    int64_t num_code_groups,
+    int64_t eos_token_id,
+    int64_t do_sample,
+    int64_t top_k,
+    float top_p,
+    float temperature,
+    uint64_t seed,
+    int64_t* out_request_id,
+    char** error);
+
+int qwen3_tts_codegen_online_batch_step(
+    void* handle,
+    int64_t max_decode_batch,
+    int64_t max_events,
+    int64_t* out_request_ids,
+    int64_t* out_event_kinds,
+    int64_t* out_codes,
+    int64_t* out_event_count,
+    double* elapsed_ms,
+    char** error);
+
+int qwen3_tts_codegen_online_batch_cancel(
+    void* handle,
+    int64_t request_id,
+    char** error);
+
+int qwen3_tts_codegen_online_batch_get_stats_json(
+    void* handle,
+    char** out_json,
+    char** error);
+
 int qwen3_tts_codegen_get_last_remote_embed_used(void* handle, int64_t* out_used, char** error);
 
 int qwen3_tts_codegen_reset_profile(void* handle, char** error);

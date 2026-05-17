@@ -43,6 +43,10 @@ BENCHMARK_PROFILE_ENV_KEYS = {
     "native_async_decode": "QWEN3_TTS_OV_NATIVE_ASYNC_DECODE",
     "native_split_subcode_remote_hidden": "QWEN3_TTS_OV_NATIVE_SPLIT_SUBCODE_REMOTE_HIDDEN",
     "native_require_split_subcode_remote_hidden": "QWEN3_TTS_OV_NATIVE_REQUIRE_SPLIT_SUBCODE_REMOTE_HIDDEN",
+    "native_split_subcode_remote_next_embed": "QWEN3_TTS_OV_NATIVE_SPLIT_SUBCODE_REMOTE_NEXT_EMBED",
+    "native_require_split_subcode_remote_next_embed": "QWEN3_TTS_OV_NATIVE_REQUIRE_SPLIT_SUBCODE_REMOTE_NEXT_EMBED",
+    "native_decode_step_prebind": "QWEN3_TTS_OV_NATIVE_DECODE_STEP_PREBIND",
+    "native_require_decode_step_prebind": "QWEN3_TTS_OV_NATIVE_REQUIRE_DECODE_STEP_PREBIND",
     "native_paged_kv_top1_seed": "QWEN3_TTS_OV_NATIVE_PAGED_KV_TOP1_SEED",
     "native_dynamic_quantization_group_size": "QWEN3_TTS_OV_NATIVE_DYNAMIC_QUANTIZATION_GROUP_SIZE",
     "native_activations_scale_factor": "QWEN3_TTS_OV_NATIVE_ACTIVATIONS_SCALE_FACTOR",
@@ -68,6 +72,11 @@ BENCHMARK_PROFILE_ENV_KEYS = {
     "native_paged_kv_cache_input_precision": "QWEN3_TTS_OV_NATIVE_PAGED_KV_CACHE_INPUT_PRECISION",
     "native_paged_kv_block_size": "QWEN3_TTS_OV_NATIVE_PAGED_KV_BLOCK_SIZE",
     "native_codegen_device": "QWEN3_TTS_OV_NATIVE_CODEGEN_DEVICE",
+    "native_continuous_batch_policy": "QWEN3_TTS_OV_NATIVE_CONTINUOUS_BATCH_POLICY",
+    "native_batch_decode_unroll": "QWEN3_TTS_OV_NATIVE_BATCH_DECODE_UNROLL",
+    "native_prefill_mode": "QWEN3_TTS_OV_NATIVE_PREFILL_MODE",
+    "native_batch_prefill": "QWEN3_TTS_OV_NATIVE_BATCH_PREFILL",
+    "native_batch_prefill_subcode": "QWEN3_TTS_OV_NATIVE_BATCH_PREFILL_SUBCODE",
 }
 
 
@@ -186,7 +195,30 @@ def build_parser() -> argparse.ArgumentParser:
         choices=KV_CACHE_PROFILE_CHOICES,
         help="Paged-KV cache memory profile. Default auto uses the fastest default, currently u8.",
     )
-    parser.add_argument("--max-concurrent-tts", type=int, default=1)
+    parser.add_argument("--max-concurrent-tts", type=int, default=0)
+    parser.add_argument("--online-batching", default="on", choices=["auto", "on"])
+    parser.add_argument("--online-batch-policy", default="balanced", choices=["low_latency", "balanced", "throughput"])
+    parser.add_argument("--online-batch-max-size", type=int, default=0)
+    parser.add_argument("--online-batch-wait-ms", type=float, default=-1.0)
+    parser.add_argument("--online-batch-max-queue-delay-ms", type=float, default=0.0)
+    parser.add_argument("--online-batch-scheduler", default="layered", choices=["layered"])
+    parser.add_argument("--online-batch-prefill-seq-buckets", default="128,256,512,1024")
+    parser.add_argument("--online-batch-prefill-batch-buckets", default="1,2,4,8")
+    parser.add_argument("--online-batch-decode-batch-buckets", default="1,2,4,8,16")
+    parser.add_argument("--online-batch-max-num-batched-tokens", type=int, default=32)
+    parser.add_argument("--online-batch-fused-decode", default="off", choices=["auto", "on", "off"], help=argparse.SUPPRESS)
+    parser.add_argument("--online-batch-warmup-requests", type=int, default=4)
+    parser.add_argument("--online-batch-warmup-tokens", type=int, default=16)
+    parser.add_argument("--online-batch-continuous-subcode", default="off", choices=["auto", "on", "off"], help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--online-batch-prefill-mode",
+        default="serial",
+        choices=["serial", "dynamic-ragged", "bucketed-padded", "auto"],
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--online-batch-prefill-quality-summary", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--online-batch-max-cache-blocks", default="auto")
+    parser.add_argument("--sampled-batch-subcode", default="off", choices=["auto", "off", "verify", "on"], help=argparse.SUPPRESS)
     parser.add_argument("--long-output-memory-policy", default="stable", choices=["stable", "fast"])
     parser.add_argument(
         "--max-continuous-prompt-tokens",
@@ -291,6 +323,24 @@ def main(argv: list[str] | None = None) -> None:
         warmup_text=args.warmup_text,
         warmup_strategy=args.warmup_strategy,
         max_concurrent_tts=args.max_concurrent_tts,
+        online_batching=args.online_batching,
+        online_batch_policy=args.online_batch_policy,
+        online_batch_max_size=args.online_batch_max_size,
+        online_batch_wait_ms=args.online_batch_wait_ms,
+        online_batch_max_queue_delay_ms=args.online_batch_max_queue_delay_ms,
+        online_batch_scheduler=args.online_batch_scheduler,
+        online_batch_prefill_mode=args.online_batch_prefill_mode,
+        online_batch_prefill_quality_summary=args.online_batch_prefill_quality_summary,
+        online_batch_prefill_seq_buckets=args.online_batch_prefill_seq_buckets,
+        online_batch_prefill_batch_buckets=args.online_batch_prefill_batch_buckets,
+        online_batch_decode_batch_buckets=args.online_batch_decode_batch_buckets,
+        online_batch_max_num_batched_tokens=args.online_batch_max_num_batched_tokens,
+        online_batch_fused_decode=args.online_batch_fused_decode,
+        online_batch_warmup_requests=args.online_batch_warmup_requests,
+        online_batch_warmup_tokens=args.online_batch_warmup_tokens,
+        sampled_batch_subcode=args.sampled_batch_subcode,
+        online_batch_continuous_subcode=args.online_batch_continuous_subcode,
+        online_batch_max_cache_blocks=args.online_batch_max_cache_blocks,
         long_output_memory_policy=args.long_output_memory_policy,
         max_continuous_prompt_tokens=args.max_continuous_prompt_tokens,
         max_vram_ratio=args.max_vram_ratio,
