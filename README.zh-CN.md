@@ -104,6 +104,7 @@ models/Qwen3-TTS-12Hz-1.7B-Base        -> openvino/base
 - [Release 使用说明](docs/release_zh.md)
 - [源码 Quick Start](docs/quick_start_zh.md)
 - [运行接口](docs/runtime_zh.md)
+- [模型组件与优化设计](docs/model_components_zh.md)
 - [API Reference](docs/api_reference_zh.md)
 - [导出与构建](docs/export_zh.md)
 - [流式与长文本](docs/streaming_zh.md)

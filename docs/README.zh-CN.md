@@ -12,6 +12,7 @@ English entry: [Documentation](README.md). 示例入口：[examples](../examples
 | 最终用户 | [Release 使用说明](release_zh.md) | 下载预编译 runtime，自动下载 Hugging Face IR，启动 Web Demo |
 | 源码开发者 | [Quick Start](quick_start_zh.md) | 从 PyTorch 模型导出生产 IR，构建 native backend |
 | 集成方 | [API Reference](api_reference_zh.md) | HTTP、WebSocket、OpenAI-compatible Speech API 和 Python API 字段 |
+| 运行时开发者 | [模型组件与优化设计](model_components_zh.md) | 子模型职责、生产 IR 组成、paged-KV / subcode / streaming decoder 优化原因 |
 | 发布维护者 | [开发说明](development_zh.md) | 本地检查、打包、GitHub Actions release |
 | 性能/质量验证 | [流式与长文本](streaming_zh.md) | full-AR 长文本、online batching、benchmark、Omni gate |
 
@@ -23,6 +24,7 @@ English entry: [Documentation](README.md). 示例入口：[examples](../examples
 - [Release Notes](releases/README.zh-CN.md)
 - [Quick Start](quick_start_zh.md)
 - [运行接口](runtime_zh.md)
+- [模型组件与优化设计](model_components_zh.md)
 - [API Reference](api_reference_zh.md)
 - [导出与构建](export_zh.md)
 - [流式与长文本](streaming_zh.md)

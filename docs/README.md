@@ -12,6 +12,7 @@ autoregressive long-text generation.
 | End user | [Release usage](release.md) | Download the prebuilt runtime, auto-download the public OpenVINO IR, and open the Web Demo |
 | Source developer | [Source quick start](quick_start.md) | Export production IR from PyTorch weights and build the native backend |
 | Integrator | [API Reference](api_reference.md) | Use HTTP, WebSocket, OpenAI-compatible Speech, and Python APIs |
+| Runtime developer | [Model components](model_components.md) | Understand the production IR components and optimization rationale |
 | Maintainer | [Contributing](../CONTRIBUTING.md) | Run checks, update docs, and prepare PRs |
 | Performance/quality | [Streaming and long text](streaming_zh.md) | Validate full-AR long text, online batching, benchmarks, and quality gates |
 
@@ -27,6 +28,7 @@ Chinese-first for now and are marked with `_zh`.
 - [Release notes](releases/v0.1.4.md)
 - [Source quick start](quick_start.md) / [Quick Start](quick_start_zh.md)
 - [API Reference](api_reference.md) / [API Reference 中文](api_reference_zh.md)
+- [Model components](model_components.md) / [模型组件与优化设计](model_components_zh.md)
 - [Runtime APIs](runtime_zh.md)
 - [Export and build](export_zh.md)
 - [Streaming and long text](streaming_zh.md)

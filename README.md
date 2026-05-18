@@ -102,6 +102,7 @@ Ignored local artifacts include `models/`, `openvino/`, `openvino_full/`,
 - [Release usage](docs/release.md)
 - [Source quick start](docs/quick_start.md)
 - [API Reference](docs/api_reference.md)
+- [Model components](docs/model_components.md)
 - [Runtime APIs](docs/runtime_zh.md)
 - [Export and build](docs/export_zh.md)
 - [Artifacts policy](docs/artifacts_zh.md)
