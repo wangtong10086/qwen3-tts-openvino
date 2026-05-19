@@ -74,6 +74,17 @@ Symptoms:
 Fix:
 
 - Keep `--npu-offload decoder` for strict validation; it fails when NPU cannot be used.
+- `decoder/audio/all` automatically uses conservative memory defaults on a GPU primary device when cache settings are left at `auto/default`: 128 KV cache blocks, 128 online cache blocks, and 50% VRAM. On older builds, or when you want to confirm the same settings explicitly, add:
+
+```powershell
+.\qwen3-tts-ov-server.exe `
+  --device GPU `
+  --npu-offload decoder `
+  --kv-cache-max-blocks 128 `
+  --online-batch-max-cache-blocks 128 `
+  --max-vram-ratio 50
+```
+
 - Use auto fallback when desired:
 
 ```powershell
@@ -121,6 +132,88 @@ uv sync --extra server --extra native
 - Use `--extra export` only when rebuilding IR from PyTorch weights.
 - Configure a PyPI mirror/proxy and retry; `uv sync -v` can show the slow package.
 - Confirm Python is `>=3.12`.
+
+## Export Fails With `ModuleNotFoundError: qwen_tts`
+
+The source repository contains the OpenVINO exporter/runtime, not the upstream
+Qwen3-TTS PyTorch package. Export requires the official `qwen_tts` sources:
+
+```bash
+git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS .cache/Qwen3-TTS
+export PYTHONPATH="$(pwd)/.cache/Qwen3-TTS"
+uv sync --extra native --extra server --extra export
+uv run python -c "import qwen_tts; print('qwen_tts ok')"
+```
+
+Windows PowerShell:
+
+```powershell
+git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS .cache\Qwen3-TTS
+$env:PYTHONPATH = (Resolve-Path .cache\Qwen3-TTS).Path
+uv sync --extra native --extra server --extra export
+uv run python -c "import qwen_tts; print('qwen_tts ok')"
+```
+
+`PYTHONPATH` is per shell. Set it again in new terminals before running export.
+
+## Export Fails With `ModuleNotFoundError: librosa` or `onnxruntime`
+
+Run:
+
+```bash
+uv sync --extra native --extra server --extra export
+```
+
+The `export` extra includes the upstream `qwen_tts` import-time dependencies
+needed by the exporter. Re-sync if your environment was created from an older
+lock file.
+
+## Windows Compression Fails With a GBK `UnicodeEncodeError`
+
+Use the current source; `build-fastest` now sets UTF-8 for subprocesses. If you
+run compression manually, set:
+
+```powershell
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+uv run python scripts\compress_openvino_weights.py --ir-dir openvino\voice_design --preset fastest
+```
+
+## Windows Native Runtime Build Fails
+
+Symptoms include MSVC `C4819`, `C2001: newline in constant`, or repeated native
+rebuilds because the Windows DLL is not detected.
+
+Fix:
+
+```powershell
+cmake --version
+where.exe cl
+uv run python scripts\build_native_codegen.py --backend cmake --config Release
+```
+
+Use the current source; MSVC targets are compiled with `/utf-8`, and
+`build-fastest` detects `native/build/qwen3_tts_ov_genai.dll`.
+
+## Windows GPU Logs Show `onednn_verbose ... primitive,error`
+
+Symptoms:
+
+- The server starts, `/health` returns `ok: true`, and TTS requests succeed.
+- `outputs/server.stdout.log` or the terminal still shows lines similar to
+  `onednn_verbose ... primitive,error ... convolution ... jit.cpp`.
+
+Fix:
+
+- Trust the runtime state first: if Uvicorn stays up, `/health` is healthy, and
+  TTS generates audio, this is usually an OpenVINO/oneDNN verbose message from
+  GPU kernel probing or fallback, not a failed run.
+- If you explicitly set `ONEDNN_VERBOSE` or `DNNL_VERBOSE`, unset those
+  variables or set them to `0`, then restart the server.
+- If the server exits, `/health` fails, or TTS fails, treat the real error as
+  actionable: update the Intel Graphics Driver, clear the OpenVINO cache and
+  restart, or run a short `--device CPU` smoke test to separate driver issues
+  from export issues.
 
 ## IR Directory or Manifest Fails
 

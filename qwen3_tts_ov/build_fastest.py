@@ -25,6 +25,8 @@ DEFAULT_OUT_DIR_BY_TYPE = {
     "base": "openvino/base",
 }
 
+MODEL_TYPES = tuple(DEFAULT_MODEL_BY_TYPE)
+
 FASTEST_EXPORT_ARGS_PRODUCTION = (
     "--skip-fixed-cache-graphs",
     "--cache-buckets",
@@ -73,7 +75,66 @@ def build_subprocess_env() -> dict[str, str]:
     env.setdefault("OMP_NUM_THREADS", "4")
     env.setdefault("MKL_NUM_THREADS", "4")
     env.setdefault("OPENBLAS_NUM_THREADS", "4")
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     return env
+
+
+def native_library_name() -> str:
+    if os.name == "nt":
+        return "qwen3_tts_ov_genai.dll"
+    if sys.platform == "darwin":
+        return "libqwen3_tts_ov_genai.dylib"
+    return "libqwen3_tts_ov_genai.so"
+
+
+def command_path(path: Path) -> str:
+    if path.is_absolute():
+        return str(path)
+    return path.as_posix()
+
+
+def _model_type_from_path_hint(path: str | Path | None) -> str | None:
+    if not path:
+        return None
+    normalized = Path(path).as_posix().lower()
+    hints = {
+        "custom_voice": ("custom_voice", "customvoice"),
+        "voice_design": ("voice_design", "voicedesign"),
+        "base": ("base", "voice_clone", "voiceclone"),
+    }
+    for model_type, tokens in hints.items():
+        if any(token in normalized for token in tokens):
+            return model_type
+    return None
+
+
+def _model_type_from_config(model: str | Path | None) -> str | None:
+    if not model:
+        return None
+    config_path = Path(model) / "config.json"
+    if not config_path.exists():
+        return None
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    model_type = config.get("tts_model_type")
+    if model_type in MODEL_TYPES:
+        return str(model_type)
+    return None
+
+
+def resolve_model_type(args: argparse.Namespace) -> str:
+    requested = getattr(args, "model_type", "auto")
+    if requested != "auto":
+        return requested
+    return (
+        _model_type_from_config(getattr(args, "model", None))
+        or _model_type_from_path_hint(getattr(args, "model", None))
+        or _model_type_from_path_hint(getattr(args, "out_dir", None))
+        or "voice_design"
+    )
 
 
 def _read_manifest(ir_dir: Path) -> dict | None:
@@ -135,7 +196,7 @@ def manifest_has_online_batch_variant(manifest: dict | None) -> bool:
 
 
 def build_fastest_steps(args: argparse.Namespace) -> list[BuildStep]:
-    model_type = args.model_type
+    model_type = resolve_model_type(args)
     model = args.model or DEFAULT_MODEL_BY_TYPE[model_type]
     out_dir = Path(args.out_dir or DEFAULT_OUT_DIR_BY_TYPE[model_type])
     manifest = None if args.clean else _read_manifest(out_dir)
@@ -154,7 +215,7 @@ def build_fastest_steps(args: argparse.Namespace) -> list[BuildStep]:
             steps.append(BuildStep(name="submodule", command=[], skip_reason=".gitmodules not found"))
 
     if not args.skip_native:
-        native_library = REPO_ROOT / "native" / "build" / "libqwen3_tts_ov_genai.so"
+        native_library = REPO_ROOT / "native" / "build" / native_library_name()
         if native_library.exists() and not args.force_native and not args.clean_native:
             steps.append(BuildStep(name="native", command=[], skip_reason=f"{native_library} already exists"))
         else:
@@ -183,7 +244,7 @@ def build_fastest_steps(args: argparse.Namespace) -> list[BuildStep]:
                         "--model-type",
                         model_type,
                         "--out-dir",
-                        str(out_dir),
+                        command_path(out_dir),
                         "--paged-kv-batch-seed-only",
                     ],
                 )
@@ -199,7 +260,7 @@ def build_fastest_steps(args: argparse.Namespace) -> list[BuildStep]:
             "--model-type",
             model_type,
             "--out-dir",
-            str(out_dir),
+            command_path(out_dir),
             *FASTEST_EXPORT_ARGS_PRODUCTION,
         ]
         if model_type == "base":
@@ -221,7 +282,7 @@ def build_fastest_steps(args: argparse.Namespace) -> list[BuildStep]:
                     python,
                     "scripts/compress_openvino_weights.py",
                     "--ir-dir",
-                    str(out_dir),
+                    command_path(out_dir),
                     "--preset",
                     "fastest",
                     *(["--force"] if args.force_compress else []),
@@ -240,7 +301,7 @@ def build_fastest_steps(args: argparse.Namespace) -> list[BuildStep]:
                     python,
                     "scripts/compress_openvino_weights.py",
                     "--ir-dir",
-                    str(out_dir),
+                    command_path(out_dir),
                     "--preset",
                     "minimal-online-gqa",
                     *(["--force"] if args.force_compress else []),
@@ -257,7 +318,7 @@ def build_fastest_steps(args: argparse.Namespace) -> list[BuildStep]:
             "qwen3_tts_ov",
             "cache-warmup",
             "--ir-dir",
-            str(out_dir),
+            command_path(out_dir),
             "--device",
             args.device,
             "--realtime-profile",
@@ -294,7 +355,7 @@ def print_step(step: BuildStep) -> None:
 
 
 def run_build_fastest(args: argparse.Namespace) -> dict:
-    model_type = args.model_type
+    model_type = resolve_model_type(args)
     out_dir = Path(args.out_dir or DEFAULT_OUT_DIR_BY_TYPE[model_type])
     clean_actions = []
     if args.clean:

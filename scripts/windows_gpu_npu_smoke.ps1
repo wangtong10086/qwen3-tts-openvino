@@ -78,6 +78,12 @@ if (-not $Strict) {
 if ($RequireZeroCopy) {
   $probeArgs += "--require-zero-copy"
 }
+if ($NpuOffload -eq "audio" -or $NpuOffload -eq "all") {
+  $probeArgs += "--check-audio-encoders"
+}
+if ($NpuOffload -eq "all") {
+  $probeArgs += "--check-prompt-graphs"
+}
 
 Invoke-Checked "uv" (@("run", "python") + $probeArgs)
 $probe = Get-Content "$WorkDir/probe.json" -Raw | ConvertFrom-Json

@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -272,7 +273,7 @@ def test_health_reports_voice_clone_unavailable_when_base_ir_missing(monkeypatch
 
     assert modes["voice_design"]["available"] is True
     assert modes["voice_clone"]["available"] is False
-    assert modes["voice_clone"]["required_manifest"].endswith("openvino/base/manifest.json")
+    assert Path(modes["voice_clone"]["required_manifest"]).parts[-3:] == ("openvino", "base", "manifest.json")
 
 
 def test_voice_clone_request_fails_before_runtime_when_base_ir_missing(monkeypatch, tmp_path):
@@ -296,7 +297,7 @@ def test_voice_clone_request_fails_before_runtime_when_base_ir_missing(monkeypat
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "VoiceClone is not available" in detail
-    assert "openvino/base/manifest.json" in detail
+    assert "openvino/base/manifest.json" in detail.replace("\\", "/")
 
 
 def test_model_download_endpoint_installs_missing_voice_clone_ir(monkeypatch, tmp_path):

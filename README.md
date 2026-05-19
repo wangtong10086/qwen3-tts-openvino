@@ -69,6 +69,9 @@ Use this path only when rebuilding IR from local PyTorch weights.
 ```bash
 uv sync --extra native --extra server --extra export
 
+git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS .cache/Qwen3-TTS
+export PYTHONPATH="$(pwd)/.cache/Qwen3-TTS"
+
 uv run python -m qwen3_tts_ov build-fastest \
   --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
   --out-dir openvino/voice_design \
@@ -78,6 +81,19 @@ uv run python -m qwen3_tts_ov serve \
   --model-root openvino \
   --device GPU \
   --realtime-profile fastest
+```
+
+On Windows source builds, run the equivalent PowerShell setup before exporting:
+
+```powershell
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+uv sync --extra native --extra server --extra export
+cmake --version
+where.exe cl
+git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS .cache\Qwen3-TTS
+$env:PYTHONPATH = (Resolve-Path .cache\Qwen3-TTS).Path
+uv run python -c "import qwen_tts; print('qwen_tts ok')"
 ```
 
 ## Repository Layout

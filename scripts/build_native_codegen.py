@@ -245,10 +245,22 @@ def run_cmake_build(args, paths: dict[str, pathlib.Path], output_dir: pathlib.Pa
     subprocess.run(build_cmd, check=True)
 
     output = output_dir / shared_library_name()
-    if not output.exists() and os.name == "nt":
-        matches = sorted(output_dir.rglob("qwen3_tts_ov_genai.dll"))
+    if os.name == "nt":
+        preferred = output_dir / args.config / shared_library_name()
+        matches = [preferred] if preferred.exists() else []
+        matches.extend(
+            match
+            for match in sorted(output_dir.rglob("qwen3_tts_ov_genai.dll"))
+            if match.resolve() != output.resolve() and match not in matches
+        )
         if matches:
-            shutil.copy2(matches[0], output)
+            built = matches[0]
+            if (
+                not output.exists()
+                or built.stat().st_mtime_ns > output.stat().st_mtime_ns
+                or built.stat().st_size != output.stat().st_size
+            ):
+                shutil.copy2(built, output)
     if not output.exists():
         raise FileNotFoundError(f"native library was not produced: {output}")
     print(output, flush=True)

@@ -20,10 +20,12 @@ dependencies = [
 export = [
   "accelerate",
   "einops",
+  "librosa",
   "torch",
   "transformers",
   "nncf",
   "modelscope",
+  "onnxruntime",
   "openvino-tokenizers",
   "sox",
   "torchaudio",

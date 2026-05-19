@@ -99,13 +99,26 @@ def compile_named_graphs(
                 "graph": graph,
                 "device": device,
                 "compile_ms": round((time.time() - started) * 1000.0, 3),
-                "inputs": [str(item.get_any_name()) for item in model.inputs],
+                "inputs": [_port_name(item, index, "input") for index, item in enumerate(model.inputs)],
                 "input_shapes": [str(getattr(item, "partial_shape", "")) for item in model.inputs],
-                "outputs": [str(item.get_any_name()) for item in model.outputs],
+                "outputs": [_port_name(item, index, "output") for index, item in enumerate(model.outputs)],
                 "request_created": request is not None,
             }
         )
     return compiled
+
+
+def _port_name(port, index: int, prefix: str) -> str:
+    try:
+        names = sorted(str(name) for name in port.get_names() if str(name))
+    except Exception:
+        names = []
+    if names:
+        return names[0]
+    try:
+        return str(port.get_any_name())
+    except Exception:
+        return f"{prefix}_{index}"
 
 
 def compile_decoder_graphs(core, ir_dir: Path, graphs: list[str], decoder_device: str, cache_dir: Path | None) -> list[dict]:
@@ -165,6 +178,8 @@ def main() -> None:
     parser.add_argument("--model-root", required=True)
     parser.add_argument("--device", default="GPU")
     parser.add_argument("--decoder-device", default="NPU")
+    parser.add_argument("--check-prompt-graphs", action="store_true")
+    parser.add_argument("--check-audio-encoders", action="store_true")
     parser.add_argument("--skip-prompt-graphs", action="store_true")
     parser.add_argument("--skip-audio-encoders", action="store_true")
     parser.add_argument("--skip-if-missing-devices", action="store_true")
@@ -218,8 +233,11 @@ def main() -> None:
                 write_summary(summary, args.output_json)
                 raise SystemExit(0)
             raise
-        if args.skip_prompt_graphs:
-            summary["prompt_compile"] = {"status": "skipped", "reason": "disabled", "graphs": []}
+        check_prompt_graphs = bool(args.check_prompt_graphs and not args.skip_prompt_graphs)
+        check_audio_encoders = bool(args.check_audio_encoders and not args.skip_audio_encoders)
+        if not check_prompt_graphs:
+            reason = "disabled" if args.skip_prompt_graphs else "not_requested"
+            summary["prompt_compile"] = {"status": "skipped", "reason": reason, "graphs": []}
         else:
             prompt_graphs = select_prompt_graphs(manifest)
             if not prompt_graphs:
@@ -249,8 +267,9 @@ def main() -> None:
                         }
                     else:
                         raise
-        if args.skip_audio_encoders:
-            summary["audio_encoder_compile"] = {"status": "skipped", "reason": "disabled", "graphs": []}
+        if not check_audio_encoders:
+            reason = "disabled" if args.skip_audio_encoders else "not_requested"
+            summary["audio_encoder_compile"] = {"status": "skipped", "reason": reason, "graphs": []}
         else:
             base_manifest = load_optional_manifest(Path(args.model_root).resolve(), "base")
             if base_manifest is None:

@@ -9,12 +9,95 @@ NPU: streaming speech decoder
 
 WSL 当前不作为 NPU 验证环境。测试需要 Windows 原生 Intel GPU/NPU 驱动，并且 OpenVINO `Core().available_devices` 能看到 `GPU` 和 `NPU`。
 
+## Windows 原生源码完整流程
+
+先用 GPU-only 路径跑通下载、native runtime 构建、导出和服务，再验证 NPU offload。下面命令假设在仓库根目录执行。
+
+1. 准备 PowerShell 环境：
+
+```powershell
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+uv --version
+cmake --version
+where.exe cl
+```
+
+`where.exe cl` 找不到时，安装 Visual Studio 2022 Build Tools，并勾选 C++ build tools / Windows SDK。
+
+2. 安装依赖并准备官方 Qwen3-TTS 源码：
+
+```powershell
+uv sync --extra native --extra server --extra export
+git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS .cache\Qwen3-TTS
+$env:PYTHONPATH = (Resolve-Path .cache\Qwen3-TTS).Path
+uv run python -c "import qwen_tts; print('qwen_tts ok')"
+```
+
+3. 下载 VoiceDesign PyTorch 模型：
+
+```powershell
+uv run modelscope download `
+  --model Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign `
+  --local_dir .\models\Qwen3-TTS-12Hz-1.7B-VoiceDesign
+```
+
+4. 构建 native runtime：
+
+```powershell
+uv run python scripts\build_native_codegen.py --backend cmake --config Release
+```
+
+成功产物是：
+
+```text
+native/build/qwen3_tts_ov_genai.dll
+```
+
+5. 导出并预热 OpenVINO IR：
+
+```powershell
+uv run python -m qwen3_tts_ov build-fastest `
+  --model-type voice_design `
+  --model models\Qwen3-TTS-12Hz-1.7B-VoiceDesign `
+  --out-dir openvino\voice_design `
+  --device GPU
+```
+
+6. 启动服务并 smoke：
+
+```powershell
+uv run python -m qwen3_tts_ov serve `
+  --model-root openvino `
+  --device GPU `
+  --realtime-profile fastest `
+  --host 127.0.0.1 `
+  --port 17860
+```
+
+另开一个 PowerShell：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:17860/health
+uv run python examples\python\http_tts_wav.py `
+  --server http://127.0.0.1:17860 `
+  --output outputs\windows_smoke.wav `
+  --max-new-tokens 24
+```
+
+确认 `outputs/windows_smoke.wav` 非空后，再继续下面的 GPU+NPU 验证。
+
 ## WSL 导出 NPU 静态 IR
 
-Windows NPU 编译要求 streaming decoder 使用固定输入 shape。可以在 WSL 中导出 IR，再复制到 Windows 原生 runtime 验证。下面用 `D:\qwen3-tts-ov-npu-build` 作为临时构建目录示例：
+Windows NPU 编译要求 streaming decoder 使用固定输入 shape。可以在 WSL 中导出 IR，再复制到 Windows 原生 runtime 验证。下面用 `D:\qwen3-tts-ov-npu-build` 作为临时构建目录示例。WSL 中同样需要先准备官方 Qwen3-TTS 源码，并把它加入当前 shell 的 `PYTHONPATH`：
 
 ```bash
-PYTHONPATH=/home/wt/Qwen3-TTS uv run python -m qwen3_tts_ov export \
+uv sync --extra native --extra server --extra export
+git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS .cache/Qwen3-TTS
+export PYTHONPATH="$(pwd)/.cache/Qwen3-TTS"
+uv run python -c "import qwen_tts; print('qwen_tts ok')"
+
+uv run python -m qwen3_tts_ov export \
   --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
   --model-type voice_design \
   --out-dir /mnt/d/qwen3-tts-ov-npu-build/ir/openvino/voice_design \
@@ -104,6 +187,8 @@ cd D:\qwen3-tts-ov-clean-test\runtime
   --npu-offload decoder `
   --ov-cache-dir D:\qwen3-tts-ov-clean-test\ov-cache
 ```
+
+`--npu-offload decoder/audio/all` 在主设备为 GPU 且缓存参数保持 `auto/default` 时，会自动使用更保守的内存默认值：`kv_cache_max_blocks=128`、`online_batch_max_cache_blocks=128`、`max_vram_ratio=50%`。这是为了避免部分 Windows Intel GPU+NPU 组合在 decoder 放到 NPU 后仍因 GPU 侧 paged-KV/online batching 预留过大而出现 USM allocation 或 output memory 错误。显式传入的 `--kv-cache-max-blocks`、`--online-batch-max-cache-blocks`、`--max-vram-ratio` 会覆盖这些默认值。
 
 打开 Web Demo：
 
@@ -203,7 +288,18 @@ uv run python -m qwen3_tts_ov serve --device GPU --npu-offload auto
 - `all`: 在 `audio` 基础上，把 prompt/text embedding 也放到 NPU，用于测试更激进的 GPU 卸载路径。
 - `require`: 当前等价于 `decoder` 的严格模式，用于 CI 或部署验收。
 
-`/health` 和流式 metadata 会返回 `decoder_device`、`encoder_device`、`prompt_device`、`speech_encoder_device`、`speaker_encoder_device`、`npu_offload_requested`、`npu_offload_effective`、`npu_offload_reason`，用于确认实际是否命中 GPU codegen + NPU audio/prompt path。
+`decoder/audio/all` 会在缓存参数保持 `auto/default` 时自动收紧内存预算。`/health` 和流式 metadata 会返回 `decoder_device`、`encoder_device`、`prompt_device`、`speech_encoder_device`、`speaker_encoder_device`、`npu_offload_requested`、`npu_offload_effective`、`npu_offload_reason`、`npu_decoder_memory_defaults_applied`、`npu_decoder_memory_defaults`，用于确认实际是否命中 GPU codegen + NPU audio/prompt path，以及是否应用了保守内存默认值。
+
+如果要手动复现同一套保守配置，可以显式传入：
+
+```powershell
+uv run python -m qwen3_tts_ov serve `
+  --device GPU `
+  --npu-offload decoder `
+  --kv-cache-max-blocks 128 `
+  --online-batch-max-cache-blocks 128 `
+  --max-vram-ratio 50
+```
 
 ## GPU-only 与 GPU+NPU 对比
 
@@ -400,7 +496,7 @@ GitHub Actions 不下载模型 IR、不探测 NPU、不运行真实 TTS、不做
 
 ## 零拷贝 Probe
 
-`probe_windows_gpu_npu.py` 会先编译 VoiceDesign streaming decoder 到 NPU，并额外尝试把 VoiceDesign prompt 相关的 `text_embedding`、`codec_embedding` 编译到 NPU，用于判断 `--npu-offload all` 是否可行。如果模型根目录还包含 `base/manifest.json`，它也会尝试把 VoiceClone 需要的 `speech_encoder` 和 `speaker_encoder` 编译到 NPU。最后会记录 OpenVINO Python remote-context API 的可见性：
+`probe_windows_gpu_npu.py` 默认只编译 VoiceDesign streaming decoder 到 NPU，这是 `--npu-offload decoder` 的必要图。最后还会记录 OpenVINO Python remote-context API 的可见性：
 
 ```bash
 uv run python scripts/probe_windows_gpu_npu.py \
@@ -413,4 +509,6 @@ uv run python scripts/probe_windows_gpu_npu.py \
 
 当前零拷贝 probe 只作为诊断信息。真正的 GPU/NPU shared-handle zero-copy 需要 native handle 和 RemoteTensor 集成，未作为默认推理路径启用。需要把 remote-context 可用性作为硬性要求时，传入 `--require-zero-copy`。
 
-只想验证 streaming decoder、不验证 prompt 或 Base/VoiceClone 音频 encoder 时，传入 `--skip-prompt-graphs` 或 `--skip-audio-encoders`。
+需要额外判断 `--npu-offload all` 是否可行时，加 `--check-prompt-graphs`，它会尝试把 VoiceDesign prompt 相关的 `text_embedding`、`codec_embedding` 编译到 NPU。需要额外判断 `--npu-offload audio` 是否可行时，加 `--check-audio-encoders`，它会在模型根目录包含 `base/manifest.json` 时尝试把 VoiceClone 需要的 `speech_encoder` 和 `speaker_encoder` 编译到 NPU。
+
+这些额外图不是 decoder offload 的必要条件。部分 OpenVINO/NPU driver 组合会因为 prompt 或 audio encoder 的动态 shape 上界缺失而拒绝编译，甚至在底层 NPU compiler 中断；此时保持生产路径使用 `--npu-offload decoder` 或 `auto`，不要把 `audio/all` 作为该机器的部署配置。

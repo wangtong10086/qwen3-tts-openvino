@@ -8,6 +8,7 @@
 
 - Python `>=3.12`，与 `pyproject.toml` 保持一致。
 - `uv`，用于创建环境、安装 extras 和运行脚本。官方安装说明见 <https://docs.astral.sh/uv/getting-started/installation/>。
+- 从源码构建 native runtime 时需要 C++ 编译器和 CMake。Windows 使用 Visual Studio 2022 Build Tools / MSVC；Linux/macOS 使用系统 C++ 工具链。
 - 可访问 GitHub Release 和 Hugging Face，或已提前准备好本地 IR。
 
 普通 release 用户需要：
@@ -46,6 +47,32 @@ uv sync --extra native --extra server --extra export
 
 release 包会携带运行所需的 Python/OpenVINO 运行时组件；最终用户只需要安装系统 GPU/NPU 驱动和解压 release 包。
 
+## Windows 源码构建工具链
+
+Windows 源码路径需要：
+
+- Visual Studio 2022 Build Tools，勾选 C++ build tools 和 Windows SDK。
+- CMake。Visual Studio Build Tools 自带的 CMake 或单独安装的 CMake 都可以。
+- PowerShell 中可直接找到 `cl.exe`。
+
+检查：
+
+```powershell
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+uv --version
+cmake --version
+where.exe cl
+```
+
+构建 native runtime：
+
+```powershell
+uv run python scripts\build_native_codegen.py --backend cmake --config Release
+```
+
+成功后应看到 `native/build/qwen3_tts_ov_genai.dll`。如果 MSVC 报中文字符串、代码页或 `C4819/C2001` 相关问题，先确认使用的是当前源码；当前 CMake 配置会给 MSVC 加 `/utf-8`。PowerShell UTF-8 环境变量也能避免某些 Python 进度条库在中文 Windows 控制台编码下输出失败。
+
 ## 设备选择
 
 服务端 `--device` 传给 OpenVINO。常用值：
@@ -69,6 +96,12 @@ print(core.available_devices)
 for name in core.available_devices:
     print(name, core.get_property(name, "FULL_DEVICE_NAME"))
 PY
+```
+
+Windows PowerShell 不支持上面的 heredoc 写法时，使用：
+
+```powershell
+uv run python -c "import openvino as ov; core=ov.Core(); print(core.available_devices); [print(d, core.get_property(d, 'FULL_DEVICE_NAME')) for d in core.available_devices]"
 ```
 
 release 包里没有 `uv` 时，可用系统 Python 临时检查；也可以启动服务后看 `/health` 的 `device`、`runtime` 和 `available_modes` 字段。

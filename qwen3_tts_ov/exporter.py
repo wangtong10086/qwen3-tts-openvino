@@ -17,14 +17,30 @@ import torch
 import transformers.models.mimi.modeling_mimi as mimi_modeling
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
-import qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 as tokenizer_v2
-from qwen_tts.core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration
-from qwen_tts.core.models.modeling_qwen3_tts import (
-    apply_multimodal_rotary_pos_emb,
-    apply_rotary_pos_emb,
-    repeat_kv,
-)
-from qwen_tts.inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
+try:
+    import qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 as tokenizer_v2
+    from qwen_tts.core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration
+    from qwen_tts.core.models.modeling_qwen3_tts import (
+        apply_multimodal_rotary_pos_emb,
+        apply_rotary_pos_emb,
+        repeat_kv,
+    )
+    from qwen_tts.inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
+except ModuleNotFoundError as exc:
+    if exc.name == "qwen_tts":
+        raise ModuleNotFoundError(
+            "Export requires the official Qwen3-TTS Python sources. Clone "
+            "https://github.com/QwenLM/Qwen3-TTS and add it to PYTHONPATH, for example on Windows: "
+            "`git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS .cache\\Qwen3-TTS` then "
+            "`$env:PYTHONPATH=(Resolve-Path .cache\\Qwen3-TTS).Path`. "
+            "Then run `uv sync --extra native --extra server --extra export` and retry."
+        ) from exc
+    if exc.name in {"librosa", "onnxruntime"}:
+        raise ModuleNotFoundError(
+            f"Export imported qwen_tts but dependency `{exc.name}` is missing. "
+            "Run `uv sync --extra native --extra server --extra export` and retry."
+        ) from exc
+    raise
 
 
 NEG_INF = -3.4028234663852886e38
@@ -2789,7 +2805,7 @@ def export_openvino_tokenizer(model_dir: str, out_dir: Path, force: bool = False
         ) from exc
 
     started = time.time()
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True, fix_mistral_regex=True)
     converted = convert_tokenizer(tokenizer, with_detokenizer=True)
     if not isinstance(converted, tuple) or len(converted) != 2:
         raise RuntimeError("openvino_tokenizers.convert_tokenizer did not return tokenizer/detokenizer models")

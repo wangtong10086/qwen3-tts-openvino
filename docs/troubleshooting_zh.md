@@ -74,6 +74,17 @@ uv run --with huggingface_hub huggingface-cli download \
 处理：
 
 - 严格验证 NPU 时继续使用 `--npu-offload decoder`；这会在 NPU 不可用时失败。
+- `decoder/audio/all` 会在 GPU 主设备下自动把默认内存预算收紧到 128 个 KV/online cache blocks 和 50% VRAM，避免常见的 GPU USM allocation 失败。若使用旧版本或需要手动确认，可显式加：
+
+```powershell
+.\qwen3-tts-ov-server.exe `
+  --device GPU `
+  --npu-offload decoder `
+  --kv-cache-max-blocks 128 `
+  --online-batch-max-cache-blocks 128 `
+  --max-vram-ratio 50
+```
+
 - 希望自动回退 GPU 时使用：
 
 ```powershell
@@ -121,6 +132,100 @@ uv sync --extra server --extra native
 - 只有重新导出 IR 时才需要 `--extra export`。
 - 配置公司 PyPI 镜像或代理后重试；必要时用 `uv sync -v` 看具体卡在哪个包。
 - 确认 Python 是 `>=3.12`，否则依赖解析可能失败。
+
+## 导出时报 `ModuleNotFoundError: qwen_tts`
+
+现象：
+
+- `uv run python -m qwen3_tts_ov build-fastest ...` 在 export 阶段失败。
+- 错误包含 `No module named 'qwen_tts'`。
+
+原因：
+
+- 本仓库只包含 OpenVINO exporter/runtime，不内置官方 Qwen3-TTS PyTorch 源码。
+- exporter 需要 import 官方源码中的 `qwen_tts` 包。
+
+处理：
+
+```powershell
+git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS .cache\Qwen3-TTS
+$env:PYTHONPATH = (Resolve-Path .cache\Qwen3-TTS).Path
+uv sync --extra native --extra server --extra export
+uv run python -c "import qwen_tts; print('qwen_tts ok')"
+```
+
+Linux/macOS：
+
+```bash
+git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS .cache/Qwen3-TTS
+export PYTHONPATH="$(pwd)/.cache/Qwen3-TTS"
+uv sync --extra native --extra server --extra export
+uv run python -c "import qwen_tts; print('qwen_tts ok')"
+```
+
+`PYTHONPATH` 只对当前 shell 生效；打开新终端后需要重新设置，或把它写入自己的本地环境脚本。
+
+## 导出时报 `ModuleNotFoundError: librosa` 或 `onnxruntime`
+
+现象：
+
+- 已经设置了 `PYTHONPATH`，但 import `qwen_tts` 时继续缺 `librosa` 或 `onnxruntime`。
+
+处理：
+
+```bash
+uv sync --extra native --extra server --extra export
+```
+
+当前 `export` extra 已包含官方 `qwen_tts` 导出路径会 import 到的 `librosa` 和 `onnxruntime`。如果本地锁文件或环境来自旧版本，重新同步后再试。
+
+## Windows 压缩时报 `UnicodeEncodeError: 'gbk' codec can't encode character`
+
+现象：
+
+- OpenVINO IR 已导出，但 `scripts/compress_openvino_weights.py` 在 NNCF/rich 进度条退出时报 `UnicodeEncodeError`。
+
+处理：
+
+- 使用当前源码；`build-fastest` 的子进程已默认设置 UTF-8。
+- 如果直接运行压缩脚本，先在 PowerShell 设置：
+
+```powershell
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+uv run python scripts\compress_openvino_weights.py --ir-dir openvino\voice_design --preset fastest
+```
+
+## Windows native runtime 编译失败
+
+现象：
+
+- MSVC 报 `C4819`、`C2001: 常量中有换行符`，或 native CLI 编译中文字符串失败。
+- `build-fastest` 每次都重建 native，或者找不到 Windows DLL。
+
+处理：
+
+- 使用当前源码；CMake 已给 MSVC target 加 `/utf-8`，`build-fastest` 也会识别 `native/build/qwen3_tts_ov_genai.dll`。
+- 单独验证 runtime 构建：
+
+```powershell
+uv run python scripts\build_native_codegen.py --backend cmake --config Release
+```
+
+- 确认 `where.exe cl` 能找到 Visual Studio 2022 Build Tools 的 `cl.exe`。
+
+## Windows GPU 日志出现 `onednn_verbose ... primitive,error`
+
+现象：
+
+- 服务已启动，`/health` 返回 `ok: true`，TTS 请求也能成功。
+- `outputs/server.stdout.log` 或终端里仍出现类似 `onednn_verbose ... primitive,error ... convolution ... jit.cpp` 的日志。
+
+处理：
+
+- 先以服务状态为准：如果 Uvicorn 没退出、`/health` 正常并且 TTS 能生成音频，这通常是 OpenVINO/oneDNN 在 GPU kernel 探测或回退时打印的 verbose 日志，不代表本次运行失败。
+- 如果本机显式设置过 `ONEDNN_VERBOSE` 或 `DNNL_VERBOSE`，在 PowerShell 中执行 `Remove-Item Env:ONEDNN_VERBOSE` / `Remove-Item Env:DNNL_VERBOSE`，或把它们设为 `0` 后重启服务。
+- 如果服务退出、`/health` 失败或 TTS 请求失败，再按真实错误处理：更新 Intel Graphics Driver，清理 OpenVINO cache 后重启，或先用 `--device CPU` 做 smoke，把驱动问题和模型导出问题分开排查。
 
 ## IR 目录或 manifest 解析失败
 

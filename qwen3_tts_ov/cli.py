@@ -839,9 +839,9 @@ def add_cache_warmup_args(parser):
 def add_build_fastest_args(parser):
     parser.add_argument(
         "--model-type",
-        default="voice_design",
-        choices=["voice_design", "custom_voice", "base"],
-        help="Model family to prepare. Defaults to the validated VoiceDesign fastest path.",
+        default="auto",
+        choices=["auto", "voice_design", "custom_voice", "base"],
+        help="Model family to prepare. Defaults to auto, which reads the model config and falls back to VoiceDesign.",
     )
     parser.add_argument(
         "--model",

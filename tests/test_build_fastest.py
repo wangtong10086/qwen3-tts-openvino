@@ -11,7 +11,7 @@ from qwen3_tts_ov.build_fastest import (
 
 def make_args(**overrides):
     values = {
-        "model_type": "voice_design",
+        "model_type": "auto",
         "model": None,
         "out_dir": None,
         "device": "GPU",
@@ -135,6 +135,34 @@ def test_build_fastest_plans_default_voice_design_steps(tmp_path, monkeypatch):
     warmup = commands_by_name["warmup"]
     assert warmup[warmup.index("--realtime-profile") + 1] == "fastest"
     assert warmup[warmup.index("--warmup-strategy") + 1] == "smooth"
+
+
+def test_build_fastest_auto_detects_custom_voice_from_model_config(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    model_dir = tmp_path / "models" / "Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(json.dumps({"tts_model_type": "custom_voice"}), encoding="utf-8")
+    args = make_args(model=str(model_dir), out_dir=None, skip_native=True, skip_compress=True, skip_warmup=True)
+
+    steps = build_fastest_steps(args)
+    export = next(step.command for step in steps if step.name == "export")
+
+    assert export[export.index("--model-type") + 1] == "custom_voice"
+    assert export[export.index("--out-dir") + 1] == "openvino/custom_voice"
+
+
+def test_build_fastest_auto_detects_base_from_model_path_when_config_missing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    model_dir = tmp_path / "models" / "Qwen3-TTS-12Hz-1.7B-Base"
+    model_dir.mkdir(parents=True)
+    args = make_args(model=str(model_dir), out_dir=None, skip_native=True, skip_compress=True, skip_warmup=True)
+
+    steps = build_fastest_steps(args)
+    export = next(step.command for step in steps if step.name == "export")
+
+    assert export[export.index("--model-type") + 1] == "base"
+    assert export[export.index("--out-dir") + 1] == "openvino/base"
+    assert "--export-clone-graphs" in export
 
 
 def test_build_fastest_can_warm_gpu_npu_cache(tmp_path, monkeypatch):

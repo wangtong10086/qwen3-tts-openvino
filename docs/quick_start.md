@@ -13,6 +13,18 @@ uv sync --extra native --extra server --extra export
 uv run python -m qwen3_tts_ov --help
 ```
 
+On Windows source builds, use MSVC/CMake and enable UTF-8 output in PowerShell:
+
+```powershell
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+cmake --version
+where.exe cl
+```
+
+If `cl.exe` is not found, install Visual Studio 2022 Build Tools with the C++
+toolchain and Windows SDK.
+
 If `third_party/openvino.genai` has not been initialized, `build-fastest` will
 initialize it. You may also run:
 
@@ -20,7 +32,29 @@ initialize it. You may also run:
 git submodule update --init --recursive
 ```
 
-## 2. Prepare PyTorch Models
+## 2. Prepare Official Qwen3-TTS Sources
+
+The exporter imports the upstream `qwen_tts` Python package. Clone the official
+Qwen3-TTS sources into ignored local cache space and add them to `PYTHONPATH`:
+
+```bash
+git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS .cache/Qwen3-TTS
+export PYTHONPATH="$(pwd)/.cache/Qwen3-TTS"
+uv run python -c "import qwen_tts; print('qwen_tts ok')"
+```
+
+Windows PowerShell:
+
+```powershell
+git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS .cache\Qwen3-TTS
+$env:PYTHONPATH = (Resolve-Path .cache\Qwen3-TTS).Path
+uv run python -c "import qwen_tts; print('qwen_tts ok')"
+```
+
+An import-time `SoX could not be found` warning from upstream Qwen3-TTS is not
+fatal for OpenVINO IR export if the command still prints `qwen_tts ok`.
+
+## 3. Prepare PyTorch Models
 
 VoiceDesign:
 
@@ -44,13 +78,35 @@ uv run modelscope download \
 
 `models/` is intentionally ignored by git.
 
-## 3. Build Production IR
+## 4. Build Native Runtime
+
+`build-fastest` builds the native runtime automatically. To verify the Windows
+MSVC/CMake path before export:
+
+```powershell
+uv run python scripts\build_native_codegen.py --backend cmake --config Release
+```
+
+The expected runtime library is `native/build/qwen3_tts_ov_genai.dll`.
+
+## 5. Build Production IR
 
 ```bash
 uv run python -m qwen3_tts_ov build-fastest \
   --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
   --out-dir openvino/voice_design \
   --device GPU
+```
+
+To rebuild from stale or partially generated outputs:
+
+```bash
+uv run python -m qwen3_tts_ov build-fastest \
+  --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --out-dir openvino/voice_design \
+  --device GPU \
+  --clean \
+  --clean-native
 ```
 
 For CustomVoice and VoiceClone:
@@ -77,7 +133,7 @@ uv run python -m qwen3_tts_ov build-fastest \
   --dry-run
 ```
 
-## 4. Start the Development Sidecar
+## 6. Start the Development Sidecar
 
 ```bash
 uv run python -m qwen3_tts_ov serve \
@@ -90,7 +146,13 @@ uv run python -m qwen3_tts_ov serve \
 
 Open `http://127.0.0.1:17860/`.
 
-## 5. Verify
+Quick HTTP smoke:
+
+```bash
+uv run python examples/python/http_tts_wav.py --output outputs/example_http.wav --max-new-tokens 24
+```
+
+## 7. Verify
 
 ```bash
 uv run python -m qwen3_tts_ov build-fastest --help

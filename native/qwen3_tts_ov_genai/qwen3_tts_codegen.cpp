@@ -486,6 +486,13 @@ bool is_gpu_device(const char* device) {
     return lower_text(std::string(device)).find("gpu") != std::string::npos;
 }
 
+bool is_npu_device(const char* device) {
+    if (!device) {
+        return false;
+    }
+    return lower_text(std::string(device)).find("npu") != std::string::npos;
+}
+
 ov::AnyMap compile_config_for_device(const char* cache_dir, const char* cache_mode, const char* device) {
     ov::AnyMap config = compile_config(cache_dir, cache_mode);
     if (!is_gpu_device(device)) {
@@ -493,6 +500,10 @@ ov::AnyMap compile_config_for_device(const char* cache_dir, const char* cache_mo
         config.erase("GPU_QUEUE_PRIORITY");
         config.erase("GPU_HOST_TASK_PRIORITY");
         config.erase("GPU_QUEUE_THROTTLE");
+    }
+    if (is_npu_device(device)) {
+        config.erase("DYNAMIC_QUANTIZATION_GROUP_SIZE");
+        config.erase("ACTIVATIONS_SCALE_FACTOR");
     }
     return config;
 }

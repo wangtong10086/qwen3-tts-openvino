@@ -153,6 +153,9 @@ AUTO_CONTINUOUS_PROMPT_TOKENS_CPU = 4096
 DEFAULT_MAX_VRAM_RATIO_GPU = 0.80
 DEFAULT_MAX_VRAM_RATIO_CPU = 1.00
 DEFAULT_NPU_OFFLOAD = "off"
+NPU_DECODER_DEFAULT_KV_CACHE_MAX_BLOCKS = 128
+NPU_DECODER_DEFAULT_ONLINE_CACHE_MAX_BLOCKS = 128
+NPU_DECODER_DEFAULT_MAX_VRAM_RATIO = 0.50
 MIN_AUTO_CONTINUOUS_PROMPT_TOKENS = 256
 
 
@@ -485,8 +488,12 @@ def parse_max_vram_ratio(
     return float(fraction), float(round(fraction * 100.0, 4))
 
 
+def is_auto_config_value(value: object) -> bool:
+    return value is None or str(value).strip().lower() in {"", "auto", "default"}
+
+
 def parse_memory_megabytes(value: str | int | float | None, *, total_bytes: int | None = None) -> tuple[int, str]:
-    if value is None or str(value).strip().lower() in {"", "auto", "default"}:
+    if is_auto_config_value(value):
         if total_bytes and total_bytes > 0:
             reserve = int(float(total_bytes) * DEFAULT_KV_CACHE_RESERVE_FRACTION)
             min_bytes = DEFAULT_KV_CACHE_RESERVE_MIN_MB * 1024 * 1024
@@ -504,7 +511,7 @@ def parse_memory_megabytes(value: str | int | float | None, *, total_bytes: int 
 
 
 def parse_optional_positive_int(value: str | int | None, *, name: str) -> tuple[int | None, str]:
-    if value is None or str(value).strip().lower() in {"", "auto", "default"}:
+    if is_auto_config_value(value):
         return None, "auto"
     try:
         parsed = int(value)
@@ -2400,6 +2407,29 @@ def create_app(
                     "npu_offload_reason": npu_offload_decision["npu_offload_reason"],
                 }
             )
+    npu_memory_defaults_applied: dict[str, int | float] = {}
+    if (
+        npu_offload_decision.get("effective_npu_offload") != "off"
+        and is_npu_device(decoder_device)
+        and uses_gpu_device
+    ):
+        if is_auto_config_value(kv_cache_max_blocks):
+            kv_cache_max_blocks = NPU_DECODER_DEFAULT_KV_CACHE_MAX_BLOCKS
+            npu_memory_defaults_applied["kv_cache_max_blocks"] = NPU_DECODER_DEFAULT_KV_CACHE_MAX_BLOCKS
+        if is_auto_config_value(online_batch_max_cache_blocks):
+            online_batch_max_cache_blocks = NPU_DECODER_DEFAULT_ONLINE_CACHE_MAX_BLOCKS
+            npu_memory_defaults_applied["online_batch_max_cache_blocks"] = (
+                NPU_DECODER_DEFAULT_ONLINE_CACHE_MAX_BLOCKS
+            )
+        if is_auto_config_value(max_vram_ratio):
+            max_vram_ratio = NPU_DECODER_DEFAULT_MAX_VRAM_RATIO
+            npu_memory_defaults_applied["max_vram_ratio"] = NPU_DECODER_DEFAULT_MAX_VRAM_RATIO
+    npu_offload_metadata.update(
+        {
+            "npu_decoder_memory_defaults_applied": bool(npu_memory_defaults_applied),
+            "npu_decoder_memory_defaults": npu_memory_defaults_applied,
+        }
+    )
     default_kv_budget_context = kv_cache_budget_context(
         ir_dir=default_budget_ir_dir,
         manifest=default_budget_manifest,

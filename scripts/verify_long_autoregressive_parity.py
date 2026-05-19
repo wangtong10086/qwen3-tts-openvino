@@ -339,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ov-graph-variant", default="fp16")
     parser.add_argument("--ov-preferred-cache-bucket", default="0")
     parser.add_argument("--allow-cpu-fallback", action="store_true")
-    parser.add_argument("--qwen3-tts-repo", default="/home/wt/Qwen3-TTS")
+    parser.add_argument("--qwen3-tts-repo", default=".cache/Qwen3-TTS")
     parser.add_argument("--torch-model-dir", default="models/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
     parser.add_argument(
         "--torch-device",

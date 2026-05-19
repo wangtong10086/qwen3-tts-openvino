@@ -50,6 +50,8 @@ Windows Intel GPU+NPU 机器可尝试：
 .\qwen3-tts-ov-server.exe --device GPU --npu-offload decoder
 ```
 
+`decoder/audio/all` 会在缓存参数保持自动时使用保守内存默认值，减少 Windows GPU+NPU 首次运行时的 USM allocation 失败；详情见 [Windows GPU+NPU 测试路径](docs/windows_gpu_npu_zh.md)。
+
 ## 当前生产架构
 
 仓库已收敛为单一生产推理架构：
@@ -70,6 +72,9 @@ VoiceDesign、CustomVoice、VoiceClone 都通过同一 sidecar 暴露。VoiceClo
 ```bash
 uv sync --extra native --extra server --extra export
 
+git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS .cache/Qwen3-TTS
+export PYTHONPATH="$(pwd)/.cache/Qwen3-TTS"
+
 uv run python -m qwen3_tts_ov build-fastest \
   --model models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
   --out-dir openvino/voice_design \
@@ -79,6 +84,19 @@ uv run python -m qwen3_tts_ov serve \
   --model-root openvino \
   --device GPU \
   --realtime-profile fastest
+```
+
+Windows PowerShell 源码构建请按下面顺序准备环境：
+
+```powershell
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+uv sync --extra native --extra server --extra export
+cmake --version
+where.exe cl
+git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS .cache\Qwen3-TTS
+$env:PYTHONPATH = (Resolve-Path .cache\Qwen3-TTS).Path
+uv run python -c "import qwen_tts; print('qwen_tts ok')"
 ```
 
 CustomVoice 和 Base/VoiceClone 分别使用：

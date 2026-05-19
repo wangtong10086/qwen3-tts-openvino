@@ -2,6 +2,28 @@
 
 推荐使用 `build-fastest`，不要手动拼接旧 profile 或诊断图。
 
+导出前必须准备官方 Qwen3-TTS PyTorch 源码，因为 exporter 会 import `qwen_tts`：
+
+```bash
+git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS .cache/Qwen3-TTS
+export PYTHONPATH="$(pwd)/.cache/Qwen3-TTS"
+uv sync --extra native --extra server --extra export
+uv run python -c "import qwen_tts; print('qwen_tts ok')"
+```
+
+Windows PowerShell：
+
+```powershell
+git clone --depth 1 https://github.com/QwenLM/Qwen3-TTS .cache\Qwen3-TTS
+$env:PYTHONPATH = (Resolve-Path .cache\Qwen3-TTS).Path
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+uv sync --extra native --extra server --extra export
+uv run python -c "import qwen_tts; print('qwen_tts ok')"
+```
+
+如果官方包打印 `SoX could not be found` 但仍输出 `qwen_tts ok`，可以继续导出。`ModuleNotFoundError: qwen_tts/librosa/onnxruntime` 的处理见 [Troubleshooting](troubleshooting_zh.md)。
+
 ## 一键构建
 
 ```bash

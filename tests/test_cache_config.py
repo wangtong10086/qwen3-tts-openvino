@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import qwen3_tts_ov.cache as cache_module
 from qwen3_tts_ov.cache import build_ov_cache_config, default_ov_cache_root, normalize_ov_cache_mode, resolve_ov_cache_dir
 from qwen3_tts_ov.cache_warmup import collect_warmup_tasks, select_buckets, subprocess_base_args
 from qwen3_tts_ov.cli import apply_native_env, apply_profile_defaults
@@ -21,6 +22,7 @@ from qwen3_tts_ov.runtime import OpenVINOQwen3TTS
 
 
 def test_default_ov_cache_root_uses_xdg_cache_home(monkeypatch, tmp_path):
+    monkeypatch.setattr(cache_module.sys, "platform", "linux")
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg-cache"))
     monkeypatch.delenv("QWEN3_TTS_OV_CACHE_DIR", raising=False)
 

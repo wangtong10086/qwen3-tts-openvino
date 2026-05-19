@@ -183,6 +183,19 @@ def test_probe_zero_copy_reports_api_visibility_without_requiring_it():
     assert result["contexts"]["NPU"]["status"] == "unavailable"
 
 
+def test_probe_port_name_falls_back_when_tensor_has_no_names():
+    probe = load_script("probe_windows_gpu_npu.py")
+
+    class NamelessPort:
+        def get_names(self):
+            return set()
+
+        def get_any_name(self):
+            raise RuntimeError("Attempt to get a name for a Tensor without names")
+
+    assert probe._port_name(NamelessPort(), 2, "input") == "input_2"
+
+
 def test_windows_gpu_npu_benchmark_builds_scenario_commands(tmp_path):
     benchmark = load_script("benchmark_windows_gpu_npu_release.py")
 
@@ -883,6 +896,59 @@ def test_server_auto_npu_offload_selects_npu_decoder(monkeypatch, tmp_path):
     assert health["warmup"]["npu_offload_requested"] == "auto"
     assert health["warmup"]["npu_offload_effective"] == "decoder"
     assert health["warmup"]["npu_offload_reason"] == "auto_selected_npu_decoder"
+
+
+def test_server_npu_decoder_uses_conservative_memory_defaults(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+
+    monkeypatch.setattr(server, "openvino_available_devices", lambda: (["CPU", "GPU.0", "NPU"], None))
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        realtime_profile="fastest",
+        device="GPU",
+        npu_offload="decoder",
+    )
+    client = fastapi_testclient.TestClient(app)
+
+    health = client.get("/health").json()
+
+    assert health["warmup"]["decoder_device"] == "NPU"
+    assert health["warmup"]["npu_offload_effective"] == "decoder"
+    assert health["warmup"]["npu_decoder_memory_defaults_applied"] is True
+    assert health["warmup"]["npu_decoder_memory_defaults"] == {
+        "kv_cache_max_blocks": 128,
+        "online_batch_max_cache_blocks": 128,
+        "max_vram_ratio": 0.5,
+    }
+    assert health["warmup"]["online_batch_max_cache_blocks"] == 128
+    assert health["memory"]["online_batch_max_cache_blocks"] == 128
+    assert health["memory"]["max_vram_percent"] == 50.0
+
+
+def test_server_npu_decoder_keeps_explicit_memory_overrides(monkeypatch, tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+
+    monkeypatch.setattr(server, "openvino_available_devices", lambda: (["CPU", "GPU.0", "NPU"], None))
+    app = server.create_app(
+        model_root=tmp_path / "openvino",
+        warmup=False,
+        realtime_profile="fastest",
+        device="GPU",
+        npu_offload="decoder",
+        online_batch_max_cache_blocks=64,
+        kv_cache_max_blocks=256,
+        max_vram_ratio=70,
+    )
+    client = fastapi_testclient.TestClient(app)
+
+    health = client.get("/health").json()
+
+    assert health["warmup"]["npu_decoder_memory_defaults_applied"] is False
+    assert health["warmup"]["npu_decoder_memory_defaults"] == {}
+    assert health["warmup"]["online_batch_max_cache_blocks"] == 64
+    assert health["memory"]["online_batch_max_cache_blocks"] == 64
+    assert health["memory"]["max_vram_percent"] == 70.0
 
 
 def test_server_audio_npu_offload_selects_npu_audio_devices(monkeypatch, tmp_path):

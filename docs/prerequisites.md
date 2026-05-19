@@ -11,6 +11,8 @@ Source development requires:
 - Python `>=3.12`, matching `pyproject.toml`.
 - `uv` for dependency management and script execution. Official installation
   docs: <https://docs.astral.sh/uv/getting-started/installation/>.
+- A C++ compiler and CMake when building the native runtime from source.
+  Windows source builds use Visual Studio 2022 Build Tools / MSVC.
 - Network access to GitHub Releases and Hugging Face, unless IR has already
   been downloaded locally.
 
@@ -56,6 +58,30 @@ installation entry point is <https://docs.openvino.ai/install>.
 Release packages bundle the runtime dependencies needed by the app. End users
 still need the system GPU/NPU drivers for their machine.
 
+## Windows Source Toolchain
+
+Windows source builds require Visual Studio 2022 Build Tools with the C++
+toolchain and Windows SDK, plus CMake. Check:
+
+```powershell
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+uv --version
+cmake --version
+where.exe cl
+```
+
+Build the native runtime:
+
+```powershell
+uv run python scripts\build_native_codegen.py --backend cmake --config Release
+```
+
+The expected output is `native/build/qwen3_tts_ov_genai.dll`. Use the current
+source if MSVC reports code-page issues such as `C4819` or `C2001`; the CMake
+targets compile with `/utf-8`. The PowerShell UTF-8 environment variables avoid
+Python progress/output failures on some non-English Windows consoles.
+
 ## Device Selection
 
 The server passes `--device` to OpenVINO:
@@ -86,6 +112,12 @@ PY
 
 For a release package without `uv`, use a local Python environment for this
 probe, or start the server and inspect `/health`.
+
+PowerShell alternative:
+
+```powershell
+uv run python -c "import openvino as ov; core=ov.Core(); print(core.available_devices); [print(d, core.get_property(d, 'FULL_DEVICE_NAME')) for d in core.available_devices]"
+```
 
 ## Intel GPU Requirements
 

@@ -880,7 +880,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate native online prefill modes against the original Python Qwen3-TTS output."
     )
-    parser.add_argument("--qwen3-tts-repo", default="/home/wt/Qwen3-TTS")
+    parser.add_argument("--qwen3-tts-repo", default=".cache/Qwen3-TTS")
     parser.add_argument("--python-model", default="models/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
     parser.add_argument(
         "--python-device",
@@ -895,7 +895,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--python-executable",
         default="auto",
-        help="Python used for original Qwen3-TTS reference. auto prefers /home/wt/Qwen3-TTS/.venv/bin/python.",
+        help="Python used for original Qwen3-TTS reference. auto prefers <qwen3-tts-repo>/.venv/bin/python.",
     )
     parser.add_argument("--python-timeout-sec", type=float, default=1800.0)
     parser.add_argument("--reference-dir", default=None)
